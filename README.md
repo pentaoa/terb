@@ -32,4 +32,8 @@ On first capture, macOS may ask for Screen & System Audio Recording permission. 
 
 Refresh rate is adjustable in Settings: 24, 30, 45, 60, 90, or 120 Hz.
 
+Spectrum processing is also adjustable from the sidebar or settings panel:
+FFT size, high-shelf compensation, shelf gain, height curve, curve power, and limiter ceiling.
+The limiter ceiling controls analysis headroom; the meter still maps that ceiling to full height.
+
 Config is stored at `~/.config/terb/config.json`.

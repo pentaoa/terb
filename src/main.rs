@@ -42,9 +42,11 @@ const MENU_ITEMS: &[&str] = &[
 const REFRESH_RATES: &[u16] = &[24, 30, 45, 60, 90, 120];
 const MIN_FREQUENCY: f32 = 35.0;
 const MAX_FREQUENCY: f32 = 18_000.0;
-const HIGH_SHELF_DB: f32 = 12.0;
-const VISUAL_HEIGHT_CURVE: f32 = 0.72;
-const MAX_VISUAL_VALUE: f32 = 0.96;
+const DEFAULT_HIGH_SHELF_DB: f32 = 6.0;
+const DEFAULT_VISUAL_CURVE: f32 = 0.88;
+const DEFAULT_CEILING: f32 = 0.88;
+const FFT_SIZES: &[usize] = &[1024, 2048, 4096, 8192];
+const SILENCE_GATE: f32 = 0.000_12;
 const TITLE_ART: &[&str] = &[
     " _            _     ",
     "| |_ ___ _ __| |__  ",
@@ -220,12 +222,48 @@ struct Settings {
     theme: ThemeId,
     smoothing: f32,
     bar_count: usize,
+    #[serde(default = "default_fft_size")]
+    fft_size: usize,
     #[serde(default = "default_refresh_hz")]
     refresh_hz: u16,
+    #[serde(default = "default_high_shelf_enabled")]
+    high_shelf_enabled: bool,
+    #[serde(default = "default_high_shelf_db")]
+    high_shelf_db: f32,
+    #[serde(default = "default_visual_curve_enabled")]
+    visual_curve_enabled: bool,
+    #[serde(default = "default_visual_curve")]
+    visual_curve: f32,
+    #[serde(default = "default_ceiling")]
+    ceiling: f32,
 }
 
 fn default_refresh_hz() -> u16 {
     45
+}
+
+fn default_fft_size() -> usize {
+    2048
+}
+
+fn default_high_shelf_enabled() -> bool {
+    false
+}
+
+fn default_high_shelf_db() -> f32 {
+    DEFAULT_HIGH_SHELF_DB
+}
+
+fn default_visual_curve_enabled() -> bool {
+    true
+}
+
+fn default_visual_curve() -> f32 {
+    DEFAULT_VISUAL_CURVE
+}
+
+fn default_ceiling() -> f32 {
+    DEFAULT_CEILING
 }
 
 impl Default for Config {
@@ -237,7 +275,13 @@ impl Default for Config {
                 theme: ThemeId::System,
                 smoothing: 0.72,
                 bar_count: 72,
+                fft_size: default_fft_size(),
                 refresh_hz: default_refresh_hz(),
+                high_shelf_enabled: default_high_shelf_enabled(),
+                high_shelf_db: default_high_shelf_db(),
+                visual_curve_enabled: default_visual_curve_enabled(),
+                visual_curve: default_visual_curve(),
+                ceiling: default_ceiling(),
             },
         }
     }
@@ -261,6 +305,14 @@ impl Config {
             let _ = fs::write(path, data);
         }
     }
+}
+
+fn nearest_fft_size(value: usize) -> usize {
+    FFT_SIZES
+        .iter()
+        .copied()
+        .min_by_key(|size| size.abs_diff(value))
+        .unwrap_or(default_fft_size())
 }
 
 fn config_path() -> PathBuf {
@@ -304,10 +356,13 @@ struct App {
 }
 
 impl App {
-    fn new(config: Config) -> Self {
+    fn new(mut config: Config) -> Self {
         let lang = Lang::from_code(&config.settings.language);
         let theme_id = config.settings.theme;
         let bar_count = config.settings.bar_count.clamp(32, 120);
+        let fft_size = nearest_fft_size(config.settings.fft_size);
+        config.settings.bar_count = bar_count;
+        config.settings.fft_size = fft_size;
         let (tx, rx) = mpsc::channel();
 
         Self {
@@ -319,9 +374,9 @@ impl App {
             setting_index: 0,
             capture_state: CaptureState::Idle,
             status: tr(lang, "ready").to_string(),
-            spectrum: vec![0.02; bar_count],
+            spectrum: vec![0.0; bar_count],
             level: 0.0,
-            analyzer: SpectrumAnalyzer::new(2048, 48_000.0, bar_count),
+            analyzer: SpectrumAnalyzer::new(fft_size, 48_000.0, bar_count),
             audio: None,
             rx,
             tx,
@@ -359,9 +414,10 @@ impl App {
                     self.capture_state = CaptureState::Running;
                     self.last_samples_at = Some(Instant::now());
                     self.level = audio_level(&samples);
-                    if let Some(bars) = self
-                        .analyzer
-                        .consume(&samples, self.config.settings.smoothing)
+                    let pipeline = SpectrumPipeline::from_settings(&self.config.settings);
+                    if let Some(bars) =
+                        self.analyzer
+                            .consume(&samples, self.config.settings.smoothing, pipeline)
                     {
                         self.spectrum = bars;
                     }
@@ -430,7 +486,7 @@ impl App {
         self.capture_state = CaptureState::Idle;
         self.status = self.t("stopped").to_string();
         self.level = 0.0;
-        self.spectrum.fill(0.02);
+        self.spectrum.fill(0.0);
     }
 
     fn toggle_capture(&mut self) {
@@ -455,7 +511,7 @@ impl App {
     }
 
     fn next_setting(&mut self) {
-        self.setting_index = (self.setting_index + 1).min(4);
+        self.setting_index = (self.setting_index + 1).min(10);
     }
 
     fn adjust_setting(&mut self, direction: i32) {
@@ -478,11 +534,34 @@ impl App {
                 let next = (current + direction * 8).clamp(32, 120) as usize;
                 if next != self.config.settings.bar_count {
                     self.config.settings.bar_count = next;
-                    self.spectrum = vec![0.02; next];
-                    self.analyzer = SpectrumAnalyzer::new(2048, 48_000.0, next);
+                    self.spectrum = vec![0.0; next];
+                    self.rebuild_analyzer();
                 }
             }
-            4 => self.cycle_refresh_rate(direction),
+            4 => {
+                self.cycle_fft_size(direction);
+                self.rebuild_analyzer();
+            }
+            5 => self.cycle_refresh_rate(direction),
+            6 => self.config.settings.high_shelf_enabled = !self.config.settings.high_shelf_enabled,
+            7 => {
+                self.config.settings.high_shelf_db =
+                    (self.config.settings.high_shelf_db + direction as f32).clamp(0.0, 18.0);
+            }
+            8 => {
+                self.config.settings.visual_curve_enabled =
+                    !self.config.settings.visual_curve_enabled;
+            }
+            9 => {
+                let delta = if direction < 0 { -0.04 } else { 0.04 };
+                self.config.settings.visual_curve =
+                    (self.config.settings.visual_curve + delta).clamp(0.55, 1.35);
+            }
+            10 => {
+                let delta = if direction < 0 { -0.02 } else { 0.02 };
+                self.config.settings.ceiling =
+                    (self.config.settings.ceiling + delta).clamp(0.70, 0.98);
+            }
             _ => {}
         }
         self.save_config();
@@ -544,6 +623,26 @@ impl App {
         let len = REFRESH_RATES.len() as i32;
         let next = (index as i32 + direction).rem_euclid(len) as usize;
         self.config.settings.refresh_hz = REFRESH_RATES[next];
+    }
+
+    fn cycle_fft_size(&mut self, direction: i32) {
+        let current = nearest_fft_size(self.config.settings.fft_size);
+        let index = FFT_SIZES
+            .iter()
+            .position(|value| *value == current)
+            .unwrap_or(1);
+        let len = FFT_SIZES.len() as i32;
+        let next = (index as i32 + direction).rem_euclid(len) as usize;
+        self.config.settings.fft_size = FFT_SIZES[next];
+    }
+
+    fn rebuild_analyzer(&mut self) {
+        let fft_size = nearest_fft_size(self.config.settings.fft_size);
+        let bar_count = self.config.settings.bar_count.clamp(32, 120);
+        self.config.settings.fft_size = fft_size;
+        self.config.settings.bar_count = bar_count;
+        self.analyzer = SpectrumAnalyzer::new(fft_size, 48_000.0, bar_count);
+        self.spectrum = vec![0.0; bar_count];
     }
 
     fn save_config(&self) {
@@ -660,6 +759,23 @@ struct SpectrumAnalyzer {
     smoothed: Vec<f32>,
 }
 
+#[derive(Clone, Copy)]
+struct SpectrumPipeline {
+    high_shelf_enabled: bool,
+    high_shelf_db: f32,
+    ceiling: f32,
+}
+
+impl SpectrumPipeline {
+    fn from_settings(settings: &Settings) -> Self {
+        Self {
+            high_shelf_enabled: settings.high_shelf_enabled,
+            high_shelf_db: settings.high_shelf_db,
+            ceiling: settings.ceiling,
+        }
+    }
+}
+
 impl SpectrumAnalyzer {
     fn new(fft_size: usize, sample_rate: f32, bar_count: usize) -> Self {
         let mut planner = FftPlanner::<f32>::new();
@@ -680,11 +796,16 @@ impl SpectrumAnalyzer {
             window,
             window_sum,
             sample_buffer: Vec::new(),
-            smoothed: vec![0.02; bar_count],
+            smoothed: vec![0.0; bar_count],
         }
     }
 
-    fn consume(&mut self, samples: &[f32], smoothing: f32) -> Option<Vec<f32>> {
+    fn consume(
+        &mut self,
+        samples: &[f32],
+        smoothing: f32,
+        pipeline: SpectrumPipeline,
+    ) -> Option<Vec<f32>> {
         if samples.is_empty() {
             return None;
         }
@@ -701,6 +822,13 @@ impl SpectrumAnalyzer {
         }
 
         let source = &self.sample_buffer[self.sample_buffer.len() - self.fft_size..];
+        let source_rms =
+            (source.iter().map(|sample| sample * sample).sum::<f32>() / source.len() as f32).sqrt();
+        if source_rms < SILENCE_GATE {
+            self.smoothed.fill(0.0);
+            return Some(self.smoothed.clone());
+        }
+
         let mean = source.iter().sum::<f32>() / source.len() as f32;
         let mut buffer: Vec<Complex<f32>> = source
             .iter()
@@ -717,7 +845,7 @@ impl SpectrumAnalyzer {
             magnitudes[index] = buffer[index].norm() * amplitude_scale;
         }
 
-        let bars = self.make_bars(&magnitudes);
+        let bars = self.make_bars(&magnitudes, pipeline);
         let decay = smoothing.clamp(0.20, 0.92);
         let attack = 0.62;
 
@@ -727,13 +855,17 @@ impl SpectrumAnalyzer {
             } else {
                 *smoothed = *smoothed * decay + target * (1.0 - decay);
             }
-            *smoothed = smoothed.clamp(0.015, 0.96);
+            if *smoothed < 0.002 {
+                *smoothed = 0.0;
+            } else {
+                *smoothed = smoothed.clamp(0.0, pipeline.ceiling);
+            }
         }
 
         Some(self.smoothed.clone())
     }
 
-    fn make_bars(&self, magnitudes: &[f32]) -> Vec<f32> {
+    fn make_bars(&self, magnitudes: &[f32], pipeline: SpectrumPipeline) -> Vec<f32> {
         let max_frequency = (self.sample_rate / 2.0).min(MAX_FREQUENCY);
         let ratio = max_frequency / MIN_FREQUENCY;
         let mut bars = vec![0.0; self.bar_count];
@@ -773,11 +905,15 @@ impl SpectrumAnalyzer {
             let average = total / weight_total.max(1.0);
             let rms = (squared_total / weight_total.max(1.0)).sqrt();
             let energy = (rms * 0.72 + peak * 0.28).max(average);
-            let high_shelf = HIGH_SHELF_DB * center_t.powf(1.35);
+            let high_shelf = if pipeline.high_shelf_enabled {
+                pipeline.high_shelf_db * center_t.powf(1.35)
+            } else {
+                0.0
+            };
             let low_trim = 2.5 * (1.0 - center_t / 0.18).clamp(0.0, 1.0);
             let db = 20.0 * energy.max(0.000_000_1).log10() + high_shelf - low_trim;
-            let normalized = ((db + 82.0) / 70.0).clamp(0.0, 1.0);
-            *value = (normalized * MAX_VISUAL_VALUE).min(MAX_VISUAL_VALUE);
+            let normalized = ((db + 82.0) / 72.0).clamp(0.0, 1.0);
+            *value = (normalized * pipeline.ceiling).min(pipeline.ceiling);
         }
 
         bars
@@ -940,10 +1076,11 @@ fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
 
     let status = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled(app.t("status"), Style::default().fg(theme.muted)),
+            Span::styled(
+                capture_control_label(app),
+                Style::default().fg(theme.accent),
+            ),
             Span::raw(" "),
-            Span::styled(state_label(app), Style::default().fg(theme.accent)),
-            Span::raw("  "),
             Span::styled(
                 format!("{} {:>3}%", app.t("level"), (app.level * 100.0) as u16),
                 Style::default().fg(theme.text),
@@ -958,7 +1095,7 @@ fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(theme.muted),
             ),
         ]),
-        Line::from(Span::styled(&app.status, Style::default().fg(theme.text))),
+        Line::from(Span::styled(&app.status, Style::default().fg(theme.muted))),
     ])
     .wrap(Wrap { trim: true })
     .block(panel_block(app.t("overview"), theme));
@@ -1100,11 +1237,11 @@ fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_spectrum_screen(frame: &mut Frame, app: &App, area: Rect) {
-    let show_sidebar = area.width >= 82 && area.height >= 18;
+    let show_sidebar = area.width >= 90 && area.height >= 22;
     if show_sidebar {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(31), Constraint::Min(24)])
+            .constraints([Constraint::Length(35), Constraint::Min(24)])
             .split(area);
         draw_sidebar(frame, app, chunks[0]);
         draw_spectrum(frame, app, chunks[1], app.t("spectrum"));
@@ -1123,9 +1260,10 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),
-            Constraint::Length(9),
-            Constraint::Min(4),
+            Constraint::Length(7),
+            Constraint::Length(13),
+            Constraint::Length(6),
+            Constraint::Min(7),
         ])
         .split(area);
 
@@ -1162,11 +1300,13 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
     draw_settings_list(frame, app, rows[1], app.t("settings"));
 
+    draw_pipeline(frame, app, rows[2]);
+
     let hint = Paragraph::new(app.t("sidebar_hint"))
         .wrap(Wrap { trim: true })
         .style(Style::default().fg(theme.muted))
         .block(panel_block(app.t("controls"), theme));
-    frame.render_widget(hint, rows[2]);
+    frame.render_widget(hint, rows[3]);
 }
 
 fn draw_spectrum(frame: &mut Frame, app: &App, area: Rect, title: &'static str) {
@@ -1187,7 +1327,7 @@ fn draw_spectrum(frame: &mut Frame, app: &App, area: Rect, title: &'static str) 
         let threshold = 1.0 - (row as f32 + 0.5) / chart_height as f32;
         let mut spans = Vec::with_capacity(bars.len());
         for (index, value) in bars.iter().enumerate() {
-            let value = apply_visual_height_curve(*value);
+            let value = render_bar_value(*value, &app.config.settings);
             let filled = value >= threshold;
             let symbol = if filled { "█" } else { " " };
             let color = if filled {
@@ -1206,7 +1346,10 @@ fn draw_spectrum(frame: &mut Frame, app: &App, area: Rect, title: &'static str) 
 fn draw_compact_footer(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
     let text = Paragraph::new(Line::from(vec![
-        Span::styled(state_label(app), Style::default().fg(theme.accent)),
+        Span::styled(
+            capture_control_label(app),
+            Style::default().fg(theme.accent),
+        ),
         Span::raw("  "),
         Span::styled(
             format!("{} {:>3}%", app.t("level"), (app.level * 100.0) as u16),
@@ -1260,8 +1403,14 @@ fn display_bars(source: &[f32], width: usize) -> Vec<f32> {
     bars
 }
 
-fn apply_visual_height_curve(value: f32) -> f32 {
-    value.clamp(0.0, 1.0).powf(VISUAL_HEIGHT_CURVE)
+fn render_bar_value(value: f32, settings: &Settings) -> f32 {
+    let ceiling = settings.ceiling.max(0.01);
+    let value = (value.clamp(0.0, ceiling) / ceiling).clamp(0.0, 1.0);
+    if settings.visual_curve_enabled {
+        value.powf(settings.visual_curve)
+    } else {
+        value
+    }
 }
 
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
@@ -1285,10 +1434,36 @@ fn draw_settings_list(frame: &mut Frame, app: &App, area: Rect, title: &'static 
             format!("{:>3}%", (app.config.settings.smoothing * 100.0) as u16),
         ),
         setting_line(app, "bars", app.config.settings.bar_count.to_string()),
+        setting_line(app, "fft_size", app.config.settings.fft_size.to_string()),
         setting_line(
             app,
             "refresh_rate",
             format!("{}Hz", app.config.settings.refresh_hz),
+        ),
+        setting_line(
+            app,
+            "high_shelf",
+            on_off_label(app, app.config.settings.high_shelf_enabled),
+        ),
+        setting_line(
+            app,
+            "high_shelf_db",
+            format!("{:.0}dB", app.config.settings.high_shelf_db),
+        ),
+        setting_line(
+            app,
+            "visual_curve",
+            on_off_label(app, app.config.settings.visual_curve_enabled),
+        ),
+        setting_line(
+            app,
+            "curve_power",
+            format!("{:.2}", app.config.settings.visual_curve),
+        ),
+        setting_line(
+            app,
+            "ceiling",
+            format!("{:>3}%", (app.config.settings.ceiling * 100.0) as u16),
         ),
     ];
 
@@ -1307,11 +1482,82 @@ fn draw_settings_list(frame: &mut Frame, app: &App, area: Rect, title: &'static 
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let settings = &app.config.settings;
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("IN", Style::default().fg(theme.text)),
+            Span::styled(" > ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("GATE {:.0}e-5", SILENCE_GATE * 100_000.0),
+                Style::default().fg(theme.text),
+            ),
+            Span::styled(" > ", Style::default().fg(theme.muted)),
+            Span::styled("WIN", Style::default().fg(theme.text)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("FFT{}", settings.fft_size),
+                Style::default().fg(theme.text),
+            ),
+            Span::styled(" > ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("BAND{}", settings.bar_count),
+                Style::default().fg(theme.text),
+            ),
+            Span::styled(" > ", Style::default().fg(theme.muted)),
+            Span::styled("DET", Style::default().fg(theme.text)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                if settings.high_shelf_enabled {
+                    format!("EQ +{:.0}dB", settings.high_shelf_db)
+                } else {
+                    "EQ bypass".to_string()
+                },
+                Style::default().fg(if settings.high_shelf_enabled {
+                    theme.accent
+                } else {
+                    theme.muted
+                }),
+            ),
+            Span::styled(" > ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("LIM {}%", (settings.ceiling * 100.0) as u16),
+                Style::default().fg(theme.text),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                if settings.visual_curve_enabled {
+                    format!("MTR pow {:.2}", settings.visual_curve)
+                } else {
+                    "MTR linear".to_string()
+                },
+                Style::default().fg(if settings.visual_curve_enabled {
+                    theme.accent
+                } else {
+                    theme.muted
+                }),
+            ),
+            Span::styled(" > OUT", Style::default().fg(theme.muted)),
+        ]),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(panel_block(app.t("pipeline"), theme)),
+        area,
+    );
+}
+
 fn setting_line(app: &App, key: &'static str, value: impl Into<String>) -> Line<'static> {
     let theme = app.theme();
     Line::from(vec![
         Span::styled(
-            format!("{:<16}", app.t(key)),
+            format!("{:<12}", app.t(key)),
             Style::default().fg(theme.text),
         ),
         Span::styled(value.into(), Style::default().fg(theme.muted)),
@@ -1390,6 +1636,24 @@ fn theme_label(app: &App) -> &'static str {
     app.t(app.theme().title_key)
 }
 
+fn on_off_label(app: &App, enabled: bool) -> &'static str {
+    if enabled {
+        app.t("on")
+    } else {
+        app.t("off")
+    }
+}
+
+fn capture_control_label(app: &App) -> String {
+    match app.capture_state {
+        CaptureState::Idle => format!("Space {}", app.t("transport_idle")),
+        CaptureState::Starting => format!("Space {}", app.t("transport_starting")),
+        CaptureState::Running => format!("Space {}", app.t("transport_running")),
+        CaptureState::PermissionNeeded => format!("Space {}", app.t("transport_permission")),
+        CaptureState::Failed => format!("Space {}", app.t("transport_failed")),
+    }
+}
+
 fn state_label(app: &App) -> &'static str {
     match app.capture_state {
         CaptureState::Idle => app.t("state_idle"),
@@ -1422,7 +1686,21 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "theme") => "主题",
         (Lang::Zh, "smoothing") => "平滑",
         (Lang::Zh, "bars") => "频段",
+        (Lang::Zh, "fft_size") => "FFT",
         (Lang::Zh, "refresh_rate") => "刷新率",
+        (Lang::Zh, "high_shelf") => "高频补偿",
+        (Lang::Zh, "high_shelf_db") => "补偿强度",
+        (Lang::Zh, "visual_curve") => "高度曲线",
+        (Lang::Zh, "curve_power") => "曲线指数",
+        (Lang::Zh, "ceiling") => "上限",
+        (Lang::Zh, "pipeline") => "音频链路",
+        (Lang::Zh, "on") => "开",
+        (Lang::Zh, "off") => "关",
+        (Lang::Zh, "transport_idle") => "○ 待机",
+        (Lang::Zh, "transport_starting") => "◐ 启动",
+        (Lang::Zh, "transport_running") => "● 运行",
+        (Lang::Zh, "transport_permission") => "! 授权",
+        (Lang::Zh, "transport_failed") => "× 错误",
         (Lang::Zh, "controls") => "控制",
         (Lang::Zh, "help") => "帮助",
         (Lang::Zh, "help_title") => "Terb 终端频谱",
@@ -1476,7 +1754,21 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "theme") => "Theme",
         (Lang::En, "smoothing") => "Smoothing",
         (Lang::En, "bars") => "Bands",
+        (Lang::En, "fft_size") => "FFT",
         (Lang::En, "refresh_rate") => "Refresh",
+        (Lang::En, "high_shelf") => "High-shelf",
+        (Lang::En, "high_shelf_db") => "Shelf Gain",
+        (Lang::En, "visual_curve") => "Height Curve",
+        (Lang::En, "curve_power") => "Curve Power",
+        (Lang::En, "ceiling") => "Ceiling",
+        (Lang::En, "pipeline") => "Pipeline",
+        (Lang::En, "on") => "On",
+        (Lang::En, "off") => "Off",
+        (Lang::En, "transport_idle") => "○ Idle",
+        (Lang::En, "transport_starting") => "◐ Start",
+        (Lang::En, "transport_running") => "● Run",
+        (Lang::En, "transport_permission") => "! Permission",
+        (Lang::En, "transport_failed") => "× Error",
         (Lang::En, "controls") => "Controls",
         (Lang::En, "help") => "Help",
         (Lang::En, "help_title") => "Terb terminal spectrum",
@@ -1530,7 +1822,21 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "theme") => "テーマ",
         (Lang::Ja, "smoothing") => "平滑化",
         (Lang::Ja, "bars") => "バンド",
+        (Lang::Ja, "fft_size") => "FFT",
         (Lang::Ja, "refresh_rate") => "更新率",
+        (Lang::Ja, "high_shelf") => "高域補正",
+        (Lang::Ja, "high_shelf_db") => "補正量",
+        (Lang::Ja, "visual_curve") => "高さ曲線",
+        (Lang::Ja, "curve_power") => "曲線指数",
+        (Lang::Ja, "ceiling") => "上限",
+        (Lang::Ja, "pipeline") => "音声チェーン",
+        (Lang::Ja, "on") => "オン",
+        (Lang::Ja, "off") => "オフ",
+        (Lang::Ja, "transport_idle") => "○ 待機",
+        (Lang::Ja, "transport_starting") => "◐ 起動",
+        (Lang::Ja, "transport_running") => "● 実行",
+        (Lang::Ja, "transport_permission") => "! 権限",
+        (Lang::Ja, "transport_failed") => "× エラー",
         (Lang::Ja, "controls") => "操作",
         (Lang::Ja, "help") => "ヘルプ",
         (Lang::Ja, "help_title") => "Terb ターミナルスペクトラム",
@@ -1586,5 +1892,27 @@ mod tests {
         let bars = display_bars(&[0.10, 0.95, 0.20, 0.30], 2);
 
         assert_eq!(bars, vec![0.95, 0.30]);
+    }
+
+    #[test]
+    fn render_bar_value_maps_ceiling_to_full_height() {
+        let settings = Settings {
+            ceiling: 0.88,
+            ..Config::default().settings
+        };
+
+        assert!((render_bar_value(0.88, &settings) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn analyzer_gates_silence_to_zero() {
+        let settings = Config::default().settings;
+        let pipeline = SpectrumPipeline::from_settings(&settings);
+        let mut analyzer = SpectrumAnalyzer::new(1024, 48_000.0, 32);
+        let bars = analyzer
+            .consume(&vec![0.0; 2048], settings.smoothing, pipeline)
+            .expect("enough samples");
+
+        assert!(bars.iter().all(|bar| *bar == 0.0));
     }
 }
