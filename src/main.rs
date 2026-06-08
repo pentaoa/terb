@@ -12,14 +12,18 @@ use std::{
 use crossterm::{
     event::{self, Event as CEvent, KeyCode, KeyEvent},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+        EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
 use ratatui::{
+    buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     prelude::{CrosstermBackend, Frame, Terminal},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Clear, List, ListItem, ListState, Paragraph, Widget, Wrap},
 };
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use serde::{Deserialize, Serialize};
@@ -40,18 +44,25 @@ const MENU_ITEMS: &[&str] = &[
     "menu_help",
     "menu_quit",
 ];
-const REFRESH_RATES: &[u16] = &[24, 30, 45, 60, 90, 120];
+const SETTING_COUNT: usize = 15;
+const REFRESH_RATES: &[u16] = &[24, 30, 45, 60, 90, 120, 144];
+const ANALYSIS_HOPS: &[usize] = &[128, 256, 512, 1024, 2048];
 const MIN_FREQUENCY: f32 = 35.0;
 const MAX_FREQUENCY: f32 = 18_000.0;
 const DEFAULT_HIGH_SHELF_DB: f32 = 6.0;
 const DEFAULT_VISUAL_CURVE: f32 = 0.88;
 const DEFAULT_CEILING: f32 = 0.88;
 const DEFAULT_AUDIO_DELAY_MS: u16 = 0;
+const DEFAULT_ATTACK: f32 = 0.82;
+const DEFAULT_RELEASE: f32 = 0.48;
+const DEFAULT_ANALYSIS_HOP: usize = 256;
 const AUDIO_DELAY_STEP_MS: i32 = 10;
 const MAX_AUDIO_DELAY_MS: i32 = 500;
 const FFT_SIZES: &[usize] = &[1024, 2048, 4096, 8192];
+const AUDIO_READ_FRAMES: usize = 512;
 const SILENCE_GATE: f32 = 0.000_12;
 const WAVEFORM_SAMPLES: usize = 1024;
+const WAVEFORM_TARGET_PEAK: f32 = 0.72;
 const TITLE_ART: &[&str] = &[
     " _            _     ",
     "| |_ ___ _ __| |__  ",
@@ -85,7 +96,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
 
     loop {
         app.drain_audio_events();
-        terminal.draw(|frame| draw(frame, app))?;
+        execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        let draw_result = terminal.draw(|frame| draw(frame, app)).map(|_| ());
+        let sync_result = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+        draw_result?;
+        sync_result?;
 
         let tick_rate = app.frame_duration();
         let timeout = tick_rate
@@ -224,6 +239,68 @@ enum ThemeId {
     Mono,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum AnalysisPreset {
+    LowLatency,
+    Balanced,
+    Precision,
+    Custom,
+}
+
+#[derive(Clone, Copy)]
+struct AnalysisPresetSpec {
+    fft_size: usize,
+    hop_size: usize,
+    refresh_hz: u16,
+    attack: f32,
+    release: f32,
+}
+
+impl AnalysisPreset {
+    fn title_key(self) -> &'static str {
+        match self {
+            AnalysisPreset::LowLatency => "preset_low_latency",
+            AnalysisPreset::Balanced => "preset_balanced",
+            AnalysisPreset::Precision => "preset_precision",
+            AnalysisPreset::Custom => "preset_custom",
+        }
+    }
+
+    fn spec(self) -> Option<AnalysisPresetSpec> {
+        match self {
+            AnalysisPreset::LowLatency => Some(AnalysisPresetSpec {
+                fft_size: 1024,
+                hop_size: 256,
+                refresh_hz: 90,
+                attack: DEFAULT_ATTACK,
+                release: DEFAULT_RELEASE,
+            }),
+            AnalysisPreset::Balanced => Some(AnalysisPresetSpec {
+                fft_size: 2048,
+                hop_size: 512,
+                refresh_hz: 60,
+                attack: 0.72,
+                release: 0.62,
+            }),
+            AnalysisPreset::Precision => Some(AnalysisPresetSpec {
+                fft_size: 4096,
+                hop_size: 1024,
+                refresh_hz: 45,
+                attack: 0.64,
+                release: 0.76,
+            }),
+            AnalysisPreset::Custom => None,
+        }
+    }
+}
+
+const ANALYSIS_PRESETS: &[AnalysisPreset] = &[
+    AnalysisPreset::LowLatency,
+    AnalysisPreset::Balanced,
+    AnalysisPreset::Precision,
+    AnalysisPreset::Custom,
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
     version: u8,
@@ -234,10 +311,19 @@ struct Config {
 struct Settings {
     language: String,
     theme: ThemeId,
+    #[serde(default = "default_smoothing")]
     smoothing: f32,
+    #[serde(default = "default_analysis_preset")]
+    analysis_preset: AnalysisPreset,
+    #[serde(default = "default_attack")]
+    attack: f32,
+    #[serde(default = "default_release")]
+    release: f32,
     bar_count: usize,
     #[serde(default = "default_fft_size")]
     fft_size: usize,
+    #[serde(default = "default_analysis_hop")]
+    analysis_hop: usize,
     #[serde(default = "default_refresh_hz")]
     refresh_hz: u16,
     #[serde(default = "default_audio_delay_ms")]
@@ -265,7 +351,7 @@ struct Settings {
 }
 
 fn default_refresh_hz() -> u16 {
-    45
+    90
 }
 
 fn default_audio_delay_ms() -> u16 {
@@ -273,7 +359,27 @@ fn default_audio_delay_ms() -> u16 {
 }
 
 fn default_fft_size() -> usize {
-    2048
+    1024
+}
+
+fn default_smoothing() -> f32 {
+    0.72
+}
+
+fn default_analysis_preset() -> AnalysisPreset {
+    AnalysisPreset::LowLatency
+}
+
+fn default_attack() -> f32 {
+    DEFAULT_ATTACK
+}
+
+fn default_release() -> f32 {
+    DEFAULT_RELEASE
+}
+
+fn default_analysis_hop() -> usize {
+    DEFAULT_ANALYSIS_HOP
 }
 
 fn default_high_shelf_enabled() -> bool {
@@ -323,9 +429,13 @@ impl Default for Config {
             settings: Settings {
                 language: "zh".to_string(),
                 theme: ThemeId::System,
-                smoothing: 0.72,
+                smoothing: default_smoothing(),
+                analysis_preset: default_analysis_preset(),
+                attack: default_attack(),
+                release: default_release(),
                 bar_count: 72,
                 fft_size: default_fft_size(),
+                analysis_hop: default_analysis_hop(),
                 refresh_hz: default_refresh_hz(),
                 audio_delay_ms: default_audio_delay_ms(),
                 high_shelf_enabled: default_high_shelf_enabled(),
@@ -363,12 +473,61 @@ impl Config {
     }
 }
 
+impl Settings {
+    fn normalize(&mut self) {
+        self.bar_count = self.bar_count.clamp(32, 120);
+        self.fft_size = nearest_fft_size(self.fft_size);
+        self.analysis_hop = nearest_hop_size(self.analysis_hop, self.fft_size);
+        self.refresh_hz = nearest_refresh_rate(self.refresh_hz);
+        self.attack = self.attack.clamp(0.10, 0.98);
+        self.release = self.release.clamp(0.05, 0.95);
+        self.smoothing = self.smoothing.clamp(0.20, 0.92);
+        self.audio_delay_ms = (self.audio_delay_ms as i32).clamp(0, MAX_AUDIO_DELAY_MS) as u16;
+        self.high_shelf_db = self.high_shelf_db.clamp(0.0, 18.0);
+        self.visual_curve = self.visual_curve.clamp(0.55, 1.35);
+        self.ceiling = self.ceiling.clamp(0.70, 0.98);
+    }
+
+    fn apply_analysis_preset(&mut self, preset: AnalysisPreset) {
+        self.analysis_preset = preset;
+        if let Some(spec) = preset.spec() {
+            self.fft_size = spec.fft_size;
+            self.analysis_hop = spec.hop_size;
+            self.refresh_hz = spec.refresh_hz;
+            self.attack = spec.attack;
+            self.release = spec.release;
+        }
+        self.normalize();
+    }
+
+    fn mark_custom_analysis(&mut self) {
+        self.analysis_preset = AnalysisPreset::Custom;
+    }
+}
+
 fn nearest_fft_size(value: usize) -> usize {
     FFT_SIZES
         .iter()
         .copied()
         .min_by_key(|size| size.abs_diff(value))
         .unwrap_or(default_fft_size())
+}
+
+fn nearest_hop_size(value: usize, fft_size: usize) -> usize {
+    ANALYSIS_HOPS
+        .iter()
+        .copied()
+        .filter(|hop| *hop <= fft_size)
+        .min_by_key(|hop| hop.abs_diff(value))
+        .unwrap_or(default_analysis_hop().min(fft_size))
+}
+
+fn nearest_refresh_rate(value: u16) -> u16 {
+    REFRESH_RATES
+        .iter()
+        .copied()
+        .min_by_key(|rate| rate.abs_diff(value))
+        .unwrap_or(default_refresh_hz())
 }
 
 fn config_path() -> PathBuf {
@@ -417,12 +576,17 @@ struct App {
 
 impl App {
     fn new(mut config: Config) -> Self {
+        if config.settings.analysis_preset != AnalysisPreset::Custom {
+            let preset = config.settings.analysis_preset;
+            config.settings.apply_analysis_preset(preset);
+        } else {
+            config.settings.normalize();
+        }
         let lang = Lang::from_code(&config.settings.language);
         let theme_id = config.settings.theme;
-        let bar_count = config.settings.bar_count.clamp(32, 120);
-        let fft_size = nearest_fft_size(config.settings.fft_size);
-        config.settings.bar_count = bar_count;
-        config.settings.fft_size = fft_size;
+        let bar_count = config.settings.bar_count;
+        let fft_size = config.settings.fft_size;
+        let hop_size = config.settings.analysis_hop;
         let (tx, rx) = mpsc::channel();
 
         Self {
@@ -439,7 +603,7 @@ impl App {
             master_left: 0.0,
             master_right: 0.0,
             waveform: vec![0.0; WAVEFORM_SAMPLES],
-            analyzer: SpectrumAnalyzer::new(fft_size, 48_000.0, bar_count),
+            analyzer: SpectrumAnalyzer::new(fft_size, 48_000.0, bar_count, hop_size),
             audio: None,
             rx,
             tx,
@@ -457,8 +621,8 @@ impl App {
     }
 
     fn frame_duration(&self) -> Duration {
-        let refresh_hz = self.config.settings.refresh_hz.clamp(12, 120);
-        Duration::from_millis((1000 / refresh_hz as u64).max(1))
+        let refresh_hz = self.config.settings.refresh_hz.clamp(12, 144);
+        Duration::from_secs_f64(1.0 / refresh_hz as f64)
     }
 
     fn tick(&mut self) {
@@ -555,10 +719,12 @@ impl App {
         self.master_right = samples.right_level;
         self.update_waveform(&samples.mono);
         let pipeline = SpectrumPipeline::from_settings(&self.config.settings);
-        if let Some(bars) =
-            self.analyzer
-                .consume(&samples.mono, self.config.settings.smoothing, pipeline)
-        {
+        if let Some(bars) = self.analyzer.consume(
+            &samples.mono,
+            self.config.settings.attack,
+            self.config.settings.release,
+            pipeline,
+        ) {
             self.spectrum = bars;
         }
         self.status = self.t("running").to_string();
@@ -623,7 +789,7 @@ impl App {
     }
 
     fn next_setting(&mut self) {
-        self.setting_index = (self.setting_index + 1).min(11);
+        self.setting_index = (self.setting_index + 1).min(SETTING_COUNT - 1);
     }
 
     fn adjust_setting(&mut self, direction: i32) {
@@ -636,12 +802,20 @@ impl App {
                     self.next_theme();
                 }
             }
-            2 => {
-                let delta = if direction < 0 { -0.04 } else { 0.04 };
-                self.config.settings.smoothing =
-                    (self.config.settings.smoothing + delta).clamp(0.20, 0.92);
-            }
+            2 => self.cycle_analysis_preset(direction),
             3 => {
+                let delta = if direction < 0 { -0.05 } else { 0.05 };
+                self.config.settings.attack =
+                    (self.config.settings.attack + delta).clamp(0.10, 0.98);
+                self.config.settings.mark_custom_analysis();
+            }
+            4 => {
+                let delta = if direction < 0 { -0.05 } else { 0.05 };
+                self.config.settings.release =
+                    (self.config.settings.release + delta).clamp(0.05, 0.95);
+                self.config.settings.mark_custom_analysis();
+            }
+            5 => {
                 let current = self.config.settings.bar_count as i32;
                 let next = (current + direction * 8).clamp(32, 120) as usize;
                 if next != self.config.settings.bar_count {
@@ -650,27 +824,38 @@ impl App {
                     self.rebuild_analyzer();
                 }
             }
-            4 => {
+            6 => {
                 self.cycle_fft_size(direction);
+                self.config.settings.mark_custom_analysis();
                 self.rebuild_analyzer();
             }
-            5 => self.cycle_refresh_rate(direction),
-            6 => self.adjust_audio_delay_unsaved(direction),
-            7 => self.config.settings.high_shelf_enabled = !self.config.settings.high_shelf_enabled,
+            7 => {
+                self.cycle_analysis_hop(direction);
+                self.config.settings.mark_custom_analysis();
+                self.rebuild_analyzer();
+            }
             8 => {
+                self.cycle_refresh_rate(direction);
+                self.config.settings.mark_custom_analysis();
+            }
+            9 => self.adjust_audio_delay_unsaved(direction),
+            10 => {
+                self.config.settings.high_shelf_enabled = !self.config.settings.high_shelf_enabled
+            }
+            11 => {
                 self.config.settings.high_shelf_db =
                     (self.config.settings.high_shelf_db + direction as f32).clamp(0.0, 18.0);
             }
-            9 => {
+            12 => {
                 self.config.settings.visual_curve_enabled =
                     !self.config.settings.visual_curve_enabled;
             }
-            10 => {
+            13 => {
                 let delta = if direction < 0 { -0.04 } else { 0.04 };
                 self.config.settings.visual_curve =
                     (self.config.settings.visual_curve + delta).clamp(0.55, 1.35);
             }
-            11 => {
+            14 => {
                 let delta = if direction < 0 { -0.02 } else { 0.02 };
                 self.config.settings.ceiling =
                     (self.config.settings.ceiling + delta).clamp(0.70, 0.98);
@@ -736,6 +921,20 @@ impl App {
         self.save_config();
     }
 
+    fn cycle_analysis_preset(&mut self, direction: i32) {
+        let current = self.config.settings.analysis_preset;
+        let index = ANALYSIS_PRESETS
+            .iter()
+            .position(|preset| *preset == current)
+            .unwrap_or(0);
+        let len = ANALYSIS_PRESETS.len() as i32;
+        let next = (index as i32 + direction).rem_euclid(len) as usize;
+        self.config
+            .settings
+            .apply_analysis_preset(ANALYSIS_PRESETS[next]);
+        self.rebuild_analyzer();
+    }
+
     fn cycle_refresh_rate(&mut self, direction: i32) {
         let current = self.config.settings.refresh_hz;
         let index = REFRESH_RATES
@@ -761,14 +960,32 @@ impl App {
         let len = FFT_SIZES.len() as i32;
         let next = (index as i32 + direction).rem_euclid(len) as usize;
         self.config.settings.fft_size = FFT_SIZES[next];
+        self.config.settings.analysis_hop = nearest_hop_size(
+            self.config.settings.analysis_hop,
+            self.config.settings.fft_size,
+        );
+    }
+
+    fn cycle_analysis_hop(&mut self, direction: i32) {
+        let fft_size = nearest_fft_size(self.config.settings.fft_size);
+        let hops: Vec<usize> = ANALYSIS_HOPS
+            .iter()
+            .copied()
+            .filter(|hop| *hop <= fft_size)
+            .collect();
+        let current = nearest_hop_size(self.config.settings.analysis_hop, fft_size);
+        let index = hops.iter().position(|value| *value == current).unwrap_or(1);
+        let len = hops.len() as i32;
+        let next = (index as i32 + direction).rem_euclid(len) as usize;
+        self.config.settings.analysis_hop = hops[next];
     }
 
     fn rebuild_analyzer(&mut self) {
-        let fft_size = nearest_fft_size(self.config.settings.fft_size);
-        let bar_count = self.config.settings.bar_count.clamp(32, 120);
-        self.config.settings.fft_size = fft_size;
-        self.config.settings.bar_count = bar_count;
-        self.analyzer = SpectrumAnalyzer::new(fft_size, 48_000.0, bar_count);
+        self.config.settings.normalize();
+        let fft_size = self.config.settings.fft_size;
+        let hop_size = self.config.settings.analysis_hop;
+        let bar_count = self.config.settings.bar_count;
+        self.analyzer = SpectrumAnalyzer::new(fft_size, 48_000.0, bar_count, hop_size);
         self.spectrum = vec![0.0; bar_count];
     }
 
@@ -806,13 +1023,16 @@ impl App {
             return;
         }
 
-        let stride = (samples.len() / 128).max(1);
+        let stride = (samples.len() / 256).max(1);
         for chunk in samples.chunks(stride) {
-            let peak = chunk
-                .iter()
-                .copied()
-                .fold(0.0_f32, |current, sample| current.max(sample.abs()));
-            self.waveform.push(peak.min(1.0));
+            let sample = chunk.iter().copied().fold(0.0_f32, |current, sample| {
+                if sample.abs() > current.abs() {
+                    sample
+                } else {
+                    current
+                }
+            });
+            self.waveform.push(sample.clamp(-1.0, 1.0));
         }
 
         if self.waveform.len() > WAVEFORM_SAMPLES {
@@ -896,7 +1116,7 @@ fn helper_path() -> io::Result<PathBuf> {
 }
 
 fn read_audio_stdout(mut stdout: impl Read, tx: Sender<AudioEvent>) {
-    let mut buffer = vec![0_u8; 4096 * 4];
+    let mut buffer = vec![0_u8; AUDIO_READ_FRAMES * 8];
     let mut pending = Vec::new();
     loop {
         match stdout.read(&mut buffer) {
@@ -950,6 +1170,7 @@ fn read_helper_stderr(stderr: impl Read, tx: Sender<AudioEvent>) {
 
 struct SpectrumAnalyzer {
     fft_size: usize,
+    hop_size: usize,
     sample_rate: f32,
     bar_count: usize,
     fft: Arc<dyn Fft<f32>>,
@@ -957,6 +1178,8 @@ struct SpectrumAnalyzer {
     window_sum: f32,
     sample_buffer: Vec<f32>,
     smoothed: Vec<f32>,
+    samples_since_analysis: usize,
+    has_analysis: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -977,9 +1200,10 @@ impl SpectrumPipeline {
 }
 
 impl SpectrumAnalyzer {
-    fn new(fft_size: usize, sample_rate: f32, bar_count: usize) -> Self {
+    fn new(fft_size: usize, sample_rate: f32, bar_count: usize, hop_size: usize) -> Self {
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(fft_size);
+        let hop_size = nearest_hop_size(hop_size, fft_size);
         let window: Vec<f32> = (0..fft_size)
             .map(|index| {
                 let position = index as f32 / (fft_size - 1) as f32;
@@ -990,6 +1214,7 @@ impl SpectrumAnalyzer {
 
         Self {
             fft_size,
+            hop_size,
             sample_rate,
             bar_count,
             fft,
@@ -997,13 +1222,16 @@ impl SpectrumAnalyzer {
             window_sum,
             sample_buffer: Vec::new(),
             smoothed: vec![0.0; bar_count],
+            samples_since_analysis: 0,
+            has_analysis: false,
         }
     }
 
     fn consume(
         &mut self,
         samples: &[f32],
-        smoothing: f32,
+        attack: f32,
+        release: f32,
         pipeline: SpectrumPipeline,
     ) -> Option<Vec<f32>> {
         if samples.is_empty() {
@@ -1011,7 +1239,11 @@ impl SpectrumAnalyzer {
         }
 
         self.sample_buffer.extend_from_slice(samples);
-        let max_samples = self.fft_size * 3;
+        self.samples_since_analysis = self.samples_since_analysis.saturating_add(samples.len());
+        let max_samples = self
+            .fft_size
+            .saturating_add(self.hop_size)
+            .max(self.fft_size * 2);
         if self.sample_buffer.len() > max_samples {
             let excess = self.sample_buffer.len() - max_samples;
             self.sample_buffer.drain(0..excess);
@@ -1020,6 +1252,12 @@ impl SpectrumAnalyzer {
         if self.sample_buffer.len() < self.fft_size {
             return None;
         }
+
+        if self.has_analysis && self.samples_since_analysis < self.hop_size {
+            return None;
+        }
+        self.samples_since_analysis %= self.hop_size;
+        self.has_analysis = true;
 
         let source = &self.sample_buffer[self.sample_buffer.len() - self.fft_size..];
         let source_rms =
@@ -1046,14 +1284,14 @@ impl SpectrumAnalyzer {
         }
 
         let bars = self.make_bars(&magnitudes, pipeline);
-        let decay = smoothing.clamp(0.20, 0.92);
-        let attack = 0.62;
+        let attack = attack.clamp(0.10, 0.98);
+        let release = release.clamp(0.05, 0.95);
 
         for (smoothed, target) in self.smoothed.iter_mut().zip(bars.into_iter()) {
             if target > *smoothed {
                 *smoothed = *smoothed * (1.0 - attack) + target * attack;
             } else {
-                *smoothed = *smoothed * decay + target * (1.0 - decay);
+                *smoothed = *smoothed * release + target * (1.0 - release);
             }
             if *smoothed < 0.002 {
                 *smoothed = 0.0;
@@ -1263,15 +1501,20 @@ fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
             ))
         })
         .collect();
+    let art_inner = draw_panel(frame, rows[0], theme, Some(panel_title("terb", theme)));
     frame.render_widget(
-        Paragraph::new(art_lines)
-            .alignment(Alignment::Center)
-            .block(panel_block("terb", theme)),
-        rows[0],
+        Paragraph::new(art_lines).alignment(Alignment::Center),
+        art_inner,
     );
 
     draw_main_menu(frame, app, rows[1]);
 
+    let status_inner = draw_panel(
+        frame,
+        rows[2],
+        theme,
+        Some(panel_title(app.t("overview"), theme)),
+    );
     let status = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -1295,9 +1538,8 @@ fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(Span::styled(&app.status, Style::default().fg(theme.muted))),
     ])
-    .wrap(Wrap { trim: true })
-    .block(panel_block(app.t("overview"), theme));
-    frame.render_widget(status, rows[2]);
+    .wrap(Wrap { trim: true });
+    frame.render_widget(status, status_inner);
 
     let footer = Paragraph::new(app.t("menu_hint"))
         .alignment(Alignment::Center)
@@ -1366,12 +1608,17 @@ fn draw_compact_menu(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
 
+    let inner = draw_panel(
+        frame,
+        panel,
+        theme,
+        Some(panel_title(app.t("main_menu"), theme)),
+    );
     frame.render_widget(
         Paragraph::new(lines)
             .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true })
-            .block(panel_block(app.t("main_menu"), theme)),
-        panel,
+            .wrap(Wrap { trim: true }),
+        inner,
     );
 }
 
@@ -1408,6 +1655,12 @@ fn compact_menu_label(app: &App, key: &'static str) -> &'static str {
 
 fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
+    let inner = draw_panel(
+        frame,
+        area,
+        theme,
+        Some(panel_title(app.t("main_menu"), theme)),
+    );
     let items: Vec<ListItem> = MENU_ITEMS
         .iter()
         .map(|key| {
@@ -1422,16 +1675,13 @@ fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(app.menu_index));
 
-    let list = List::new(items)
-        .block(panel_block(app.t("main_menu"), theme))
-        .highlight_symbol("  ")
-        .highlight_style(
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        );
+    let list = List::new(items).highlight_symbol("  ").highlight_style(
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    );
 
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, inner, &mut state);
 }
 
 fn draw_spectrum_screen(frame: &mut Frame, app: &App, area: Rect) {
@@ -1453,7 +1703,7 @@ fn draw_spectrum_screen(frame: &mut Frame, app: &App, area: Rect) {
         settings.show_master_panel && content_area.width >= 63 && content_area.height >= 14;
     let mut visual_area = content_area;
     if show_master {
-        let meter_width = if content_area.width >= 120 { 14 } else { 13 };
+        let meter_width = 16;
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(24), Constraint::Length(meter_width)])
@@ -1492,7 +1742,7 @@ fn left_module_height(settings: &Settings) -> u16 {
         height += 7;
     }
     if settings.show_settings_panel {
-        height += 14;
+        height += 17;
     }
     if settings.show_pipeline_panel {
         height += 8;
@@ -1508,7 +1758,7 @@ fn draw_left_modules(frame: &mut Frame, app: &App, area: Rect) {
         constraints.push(Constraint::Length(7));
     }
     if settings.show_settings_panel {
-        constraints.push(Constraint::Length(14));
+        constraints.push(Constraint::Length(17));
     }
     if settings.show_pipeline_panel {
         constraints.push(Constraint::Length(8));
@@ -1533,7 +1783,7 @@ fn draw_left_modules(frame: &mut Frame, app: &App, area: Rect) {
             frame,
             app,
             chunks[index],
-            module_block(app, 's', "settings"),
+            module_title_line(app, 's', "settings"),
         );
         index += 1;
     }
@@ -1544,6 +1794,12 @@ fn draw_left_modules(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_toolbar(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
+    let inner = draw_panel(
+        frame,
+        area,
+        theme,
+        Some(module_title_line(app, 't', "toolbar")),
+    );
     let lines = vec![
         Line::from(vec![
             Span::styled(
@@ -1603,12 +1859,7 @@ fn draw_toolbar(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled(&app.status, Style::default().fg(theme.muted))),
     ];
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(module_block(app, 't', "toolbar")),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 fn module_toggle_line(app: &App) -> Line<'static> {
@@ -1637,9 +1888,12 @@ fn module_toggle_keys(app: &App) -> String {
 
 fn draw_master_meter(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
-    let block = module_block(app, 'm', "master");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = draw_panel(
+        frame,
+        area,
+        theme,
+        Some(module_title_line(app, 'm', "master")),
+    );
 
     if inner.width < 5 || inner.height < 5 {
         return;
@@ -1714,30 +1968,41 @@ fn meter_color(theme: Theme, value: f32) -> Color {
 
 fn draw_waveform(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
-    let block = module_block(app, 'w', "waveform");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = draw_panel(
+        frame,
+        area,
+        theme,
+        Some(module_title_line(app, 'w', "waveform")),
+    );
 
     if inner.width < 8 || inner.height < 3 {
         return;
     }
 
-    let samples = display_bars(&app.waveform, inner.width as usize);
+    let samples = display_waveform(&app.waveform, inner.width as usize);
     let height = inner.height as usize;
     let center = (height.saturating_sub(1)) as f32 * 0.5;
     let center_row = center.round() as usize;
+    let peak = samples
+        .iter()
+        .fold(0.0_f32, |current, sample| {
+            current.max(sample.min.abs()).max(sample.max.abs())
+        })
+        .max(0.000_1);
+    let gain = (WAVEFORM_TARGET_PEAK / peak).clamp(1.0, 10.0);
     let mut lines = Vec::with_capacity(height);
 
     for row in 0..height {
-        let distance = if center <= 0.0 {
+        let position = if center <= 0.0 {
             0.0
         } else {
-            ((row as f32 - center).abs() / center).clamp(0.0, 1.0)
+            ((center - row as f32) / center).clamp(-1.0, 1.0)
         };
         let mut spans = Vec::with_capacity(samples.len());
         for sample in &samples {
-            let value = sample.clamp(0.0, 1.0);
-            let filled = value > 0.002 && value >= distance;
+            let min = (sample.min * gain).clamp(-1.0, 1.0);
+            let max = (sample.max * gain).clamp(-1.0, 1.0);
+            let filled = max.abs().max(min.abs()) > 0.002 && position >= min && position <= max;
             let symbol = if filled {
                 "█"
             } else if row == center_row {
@@ -1756,9 +2021,7 @@ fn draw_waveform(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_spectrum(frame: &mut Frame, app: &App, area: Rect, title: &'static str) {
     let theme = app.theme();
-    let block = panel_block(title, theme);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = draw_panel(frame, area, theme, Some(panel_title(title, theme)));
 
     if inner.width < 10 || inner.height < 4 {
         return;
@@ -1807,9 +2070,9 @@ fn draw_compact_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw("  "),
         Span::styled(app.t("compact_hint"), Style::default().fg(theme.muted)),
     ]))
-    .wrap(Wrap { trim: true })
-    .block(panel_block("", theme));
-    frame.render_widget(text, area);
+    .wrap(Wrap { trim: true });
+    let inner = draw_panel(frame, area, theme, None);
+    frame.render_widget(text, inner);
 }
 
 fn display_bars(source: &[f32], width: usize) -> Vec<f32> {
@@ -1852,6 +2115,57 @@ fn display_bars(source: &[f32], width: usize) -> Vec<f32> {
     bars
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WaveformColumn {
+    min: f32,
+    max: f32,
+}
+
+fn display_waveform(source: &[f32], width: usize) -> Vec<WaveformColumn> {
+    if width == 0 || source.is_empty() {
+        return Vec::new();
+    }
+
+    if width < source.len() {
+        let mut columns = Vec::with_capacity(width);
+        for index in 0..width {
+            let start = index * source.len() / width;
+            let end = ((index + 1) * source.len() / width)
+                .max(start + 1)
+                .min(source.len());
+            columns.push(waveform_column(&source[start..end]));
+        }
+        return columns;
+    }
+
+    let mut columns = Vec::with_capacity(width);
+    let max_source_index = source.len() - 1;
+    for index in 0..width {
+        let source_index = if width == 1 {
+            0
+        } else {
+            index * max_source_index / (width - 1)
+        };
+        let sample = source[source_index].clamp(-1.0, 1.0);
+        columns.push(WaveformColumn {
+            min: sample.min(0.0),
+            max: sample.max(0.0),
+        });
+    }
+    columns
+}
+
+fn waveform_column(samples: &[f32]) -> WaveformColumn {
+    let mut min = 0.0_f32;
+    let mut max = 0.0_f32;
+    for sample in samples {
+        let sample = sample.clamp(-1.0, 1.0);
+        min = min.min(sample);
+        max = max.max(sample);
+    }
+    WaveformColumn { min, max }
+}
+
 fn render_bar_value(value: f32, settings: &Settings) -> f32 {
     let ceiling = settings.ceiling.max(0.01);
     let value = (value.clamp(0.0, ceiling) / ceiling).clamp(0.0, 1.0);
@@ -1873,22 +2187,38 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         frame,
         app,
         chunks,
-        panel_block(app.t("settings"), app.theme()),
+        panel_title(app.t("settings"), app.theme()),
     );
 }
 
-fn draw_settings_list(frame: &mut Frame, app: &App, area: Rect, block: Block<'static>) {
+fn draw_settings_list(frame: &mut Frame, app: &App, area: Rect, title: Line<'static>) {
     let theme = app.theme();
+    let inner = draw_panel(frame, area, theme, Some(title));
     let rows = vec![
         setting_line(app, "language", language_label(app.lang)),
         setting_line(app, "theme", theme_label(app)),
         setting_line(
             app,
-            "smoothing",
-            format!("{:>3}%", (app.config.settings.smoothing * 100.0) as u16),
+            "analysis_preset",
+            preset_label(app, app.config.settings.analysis_preset),
+        ),
+        setting_line(
+            app,
+            "attack",
+            format!("{:>3}%", (app.config.settings.attack * 100.0) as u16),
+        ),
+        setting_line(
+            app,
+            "release",
+            format!("{:>3}%", (app.config.settings.release * 100.0) as u16),
         ),
         setting_line(app, "bars", app.config.settings.bar_count.to_string()),
         setting_line(app, "fft_size", app.config.settings.fft_size.to_string()),
+        setting_line(
+            app,
+            "analysis_hop",
+            app.config.settings.analysis_hop.to_string(),
+        ),
         setting_line(
             app,
             "refresh_rate",
@@ -1930,19 +2260,22 @@ fn draw_settings_list(frame: &mut Frame, app: &App, area: Rect, block: Block<'st
     let mut state = ListState::default();
     state.select(Some(app.setting_index));
 
-    let list = List::new(items)
-        .block(block)
-        .highlight_symbol("  ")
-        .highlight_style(
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        );
-    frame.render_stateful_widget(list, area, &mut state);
+    let list = List::new(items).highlight_symbol("  ").highlight_style(
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(list, inner, &mut state);
 }
 
 fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
+    let inner = draw_panel(
+        frame,
+        area,
+        theme,
+        Some(module_title_line(app, 'p', "pipeline")),
+    );
     let settings = &app.config.settings;
     let shelf = if settings.high_shelf_enabled {
         format!("HS +{:.0}dB", settings.high_shelf_db)
@@ -1957,7 +2290,13 @@ fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
     let lines = vec![
         Line::from(vec![
             pipeline_stage(theme, "SRC"),
-            Span::styled("SCStream 48k/2ch", Style::default().fg(theme.text)),
+            Span::styled(
+                format!(
+                    "SCStream 48k/2ch | {}",
+                    preset_label(app, settings.analysis_preset)
+                ),
+                Style::default().fg(theme.text),
+            ),
         ]),
         Line::from(vec![
             pipeline_stage(theme, "SYNC"),
@@ -1968,12 +2307,15 @@ fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(vec![
             pipeline_stage(theme, "PRE"),
-            Span::styled("DC trim -> Hann window", Style::default().fg(theme.text)),
+            Span::styled("mono -> DC trim -> Hann", Style::default().fg(theme.text)),
         ]),
         Line::from(vec![
             pipeline_stage(theme, "FFT"),
             Span::styled(
-                format!("{} log bands 35Hz-18k", settings.fft_size),
+                format!(
+                    "{} hop {} log 35Hz-18k",
+                    settings.fft_size, settings.analysis_hop
+                ),
                 Style::default().fg(theme.text),
             ),
         ]),
@@ -1981,8 +2323,9 @@ fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
             pipeline_stage(theme, "DET"),
             Span::styled(
                 format!(
-                    "RMS+peak  atk 62  rel {:>2}%",
-                    (settings.smoothing * 100.0) as u16
+                    "RMS+peak atk {:>2} rel {:>2}",
+                    (settings.attack * 100.0) as u16,
+                    (settings.release * 100.0) as u16
                 ),
                 Style::default().fg(theme.text),
             ),
@@ -2001,12 +2344,7 @@ fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
         ]),
     ];
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(module_block(app, 'p', "pipeline")),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 fn pipeline_stage(theme: Theme, label: &'static str) -> Span<'static> {
@@ -2054,29 +2392,117 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         )),
     ];
 
-    frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: true })
-            .block(panel_block(app.t("help"), theme)),
+    let inner = draw_panel(
+        frame,
         chunks,
+        theme,
+        Some(panel_title(app.t("help"), theme)),
     );
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
 }
 
-fn panel_block(title: &'static str, theme: Theme) -> Block<'static> {
-    Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border))
-        .style(Style::default().fg(theme.text))
+struct Panel {
+    title: Option<Line<'static>>,
+    theme: Theme,
 }
 
-fn module_block(app: &App, shortcut: char, title_key: &'static str) -> Block<'static> {
-    let theme = app.theme();
-    Block::default()
-        .title(module_title_line(app, shortcut, title_key))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border))
-        .style(Style::default().fg(theme.text))
+impl Panel {
+    fn new(title: Option<Line<'static>>, theme: Theme) -> Self {
+        Self { title, theme }
+    }
+
+    fn inner(area: Rect) -> Rect {
+        Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        }
+    }
+
+    fn set_cell(buf: &mut Buffer, x: u16, y: u16, symbol: &str, style: Style) {
+        buf[(x, y)].set_symbol(symbol).set_style(style);
+    }
+
+    fn render_title(&self, area: Rect, buf: &mut Buffer, title: &Line<'_>) {
+        if area.width < 7 || title.width() == 0 {
+            return;
+        }
+
+        let border_style = border_style(self.theme);
+        let text_start = area.x + 3;
+        let max_width = area.width.saturating_sub(5);
+        let right_limit = area.right().saturating_sub(1);
+
+        Self::set_cell(buf, area.x + 2, area.y, "┐", border_style);
+        let (end_x, _) = buf.set_line(text_start, area.y, title, max_width);
+        if end_x < right_limit {
+            Self::set_cell(buf, end_x, area.y, "┌", border_style);
+        }
+    }
+}
+
+impl Widget for Panel {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let content_style = Style::default().fg(self.theme.text);
+        let border_style = border_style(self.theme);
+        buf.set_style(area, content_style);
+
+        if area.width < 2 || area.height < 2 {
+            return;
+        }
+
+        let x0 = area.left();
+        let y0 = area.top();
+        let x1 = area.right() - 1;
+        let y1 = area.bottom() - 1;
+
+        for y in y0 + 1..y1 {
+            for x in x0 + 1..x1 {
+                Self::set_cell(buf, x, y, " ", content_style);
+            }
+        }
+
+        for x in x0 + 1..x1 {
+            Self::set_cell(buf, x, y0, "─", border_style);
+            Self::set_cell(buf, x, y1, "─", border_style);
+        }
+
+        for y in y0 + 1..y1 {
+            Self::set_cell(buf, x0, y, "│", border_style);
+            Self::set_cell(buf, x1, y, "│", border_style);
+        }
+
+        Self::set_cell(buf, x0, y0, "╭", border_style);
+        Self::set_cell(buf, x1, y0, "╮", border_style);
+        Self::set_cell(buf, x0, y1, "╰", border_style);
+        Self::set_cell(buf, x1, y1, "╯", border_style);
+
+        if let Some(title) = &self.title {
+            self.render_title(area, buf, title);
+        }
+    }
+}
+
+fn draw_panel(frame: &mut Frame, area: Rect, theme: Theme, title: Option<Line<'static>>) -> Rect {
+    let inner = Panel::inner(area);
+    frame.render_widget(Panel::new(title, theme), area);
+    inner
+}
+
+fn panel_title(title: &'static str, theme: Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        title,
+        title_style(theme).add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn border_style(theme: Theme) -> Style {
+    Style::default().fg(theme.border)
 }
 
 fn module_title_line(app: &App, shortcut: char, title_key: &'static str) -> Line<'static> {
@@ -2176,6 +2602,10 @@ fn theme_label(app: &App) -> &'static str {
     app.t(app.theme().title_key)
 }
 
+fn preset_label(app: &App, preset: AnalysisPreset) -> &'static str {
+    app.t(preset.title_key())
+}
+
 fn on_off_label(app: &App, enabled: bool) -> &'static str {
     if enabled {
         app.t("on")
@@ -2215,6 +2645,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "language") => "语言",
         (Lang::Zh, "theme") => "主题",
         (Lang::Zh, "smoothing") => "平滑",
+        (Lang::Zh, "analysis_preset") => "分析预设",
+        (Lang::Zh, "attack") => "Attack",
+        (Lang::Zh, "release") => "Release",
+        (Lang::Zh, "analysis_hop") => "Hop",
         (Lang::Zh, "bars") => "频段",
         (Lang::Zh, "fft_size") => "FFT",
         (Lang::Zh, "refresh_rate") => "刷新率",
@@ -2268,6 +2702,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "theme_ocean") => "海蓝",
         (Lang::Zh, "theme_amber") => "琥珀",
         (Lang::Zh, "theme_mono") => "单色",
+        (Lang::Zh, "preset_low_latency") => "低延迟",
+        (Lang::Zh, "preset_balanced") => "均衡",
+        (Lang::Zh, "preset_precision") => "精细",
+        (Lang::Zh, "preset_custom") => "自定义",
 
         (Lang::En, "main_menu") => "Main Menu",
         (Lang::En, "menu_spectrum") => "Open Spectrum",
@@ -2288,6 +2726,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "language") => "Language",
         (Lang::En, "theme") => "Theme",
         (Lang::En, "smoothing") => "Smoothing",
+        (Lang::En, "analysis_preset") => "Preset",
+        (Lang::En, "attack") => "Attack",
+        (Lang::En, "release") => "Release",
+        (Lang::En, "analysis_hop") => "Hop",
         (Lang::En, "bars") => "Bands",
         (Lang::En, "fft_size") => "FFT",
         (Lang::En, "refresh_rate") => "Refresh",
@@ -2341,6 +2783,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "theme_ocean") => "Ocean",
         (Lang::En, "theme_amber") => "Amber",
         (Lang::En, "theme_mono") => "Mono",
+        (Lang::En, "preset_low_latency") => "Low Latency",
+        (Lang::En, "preset_balanced") => "Balanced",
+        (Lang::En, "preset_precision") => "Precision",
+        (Lang::En, "preset_custom") => "Custom",
 
         (Lang::Ja, "main_menu") => "メインメニュー",
         (Lang::Ja, "menu_spectrum") => "スペクトラムを開く",
@@ -2361,6 +2807,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "language") => "言語",
         (Lang::Ja, "theme") => "テーマ",
         (Lang::Ja, "smoothing") => "平滑化",
+        (Lang::Ja, "analysis_preset") => "解析プリセット",
+        (Lang::Ja, "attack") => "Attack",
+        (Lang::Ja, "release") => "Release",
+        (Lang::Ja, "analysis_hop") => "Hop",
         (Lang::Ja, "bars") => "バンド",
         (Lang::Ja, "fft_size") => "FFT",
         (Lang::Ja, "refresh_rate") => "更新率",
@@ -2414,6 +2864,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "theme_ocean") => "オーシャン",
         (Lang::Ja, "theme_amber") => "アンバー",
         (Lang::Ja, "theme_mono") => "モノ",
+        (Lang::Ja, "preset_low_latency") => "低遅延",
+        (Lang::Ja, "preset_balanced") => "バランス",
+        (Lang::Ja, "preset_precision") => "精密",
+        (Lang::Ja, "preset_custom") => "カスタム",
 
         _ => key,
     }
@@ -2428,6 +2882,23 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn buffer_row(buf: &Buffer, y: u16, width: u16) -> String {
+        (0..width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    #[test]
+    fn panel_renders_rounded_btop_style_title_cutout() {
+        let theme = theme(ThemeId::System);
+        let area = Rect::new(0, 0, 16, 3);
+        let mut buf = Buffer::empty(area);
+
+        Panel::new(Some(inline_hotkey_label(theme, 's', "settings")), theme).render(area, &mut buf);
+
+        assert_eq!(buffer_row(&buf, 0, 16), "╭─┐settings┌───╮");
+        assert_eq!(buffer_row(&buf, 1, 16), "│              │");
+        assert_eq!(buffer_row(&buf, 2, 16), "╰──────────────╯");
     }
 
     #[test]
@@ -2467,6 +2938,25 @@ mod tests {
     }
 
     #[test]
+    fn display_waveform_preserves_signed_column_extents() {
+        let columns = display_waveform(&[-0.20, 0.70, -0.85, 0.10], 2);
+
+        assert_eq!(
+            columns,
+            vec![
+                WaveformColumn {
+                    min: -0.20,
+                    max: 0.70
+                },
+                WaveformColumn {
+                    min: -0.85,
+                    max: 0.10
+                }
+            ]
+        );
+    }
+
+    #[test]
     fn render_bar_value_maps_ceiling_to_full_height() {
         let settings = Settings {
             ceiling: 0.88,
@@ -2480,11 +2970,57 @@ mod tests {
     fn analyzer_gates_silence_to_zero() {
         let settings = Config::default().settings;
         let pipeline = SpectrumPipeline::from_settings(&settings);
-        let mut analyzer = SpectrumAnalyzer::new(1024, 48_000.0, 32);
+        let mut analyzer = SpectrumAnalyzer::new(1024, 48_000.0, 32, 256);
         let bars = analyzer
-            .consume(&vec![0.0; 2048], settings.smoothing, pipeline)
+            .consume(
+                &vec![0.0; 2048],
+                settings.attack,
+                settings.release,
+                pipeline,
+            )
             .expect("enough samples");
 
         assert!(bars.iter().all(|bar| *bar == 0.0));
+    }
+
+    #[test]
+    fn analyzer_respects_analysis_hop() {
+        let settings = Config::default().settings;
+        let pipeline = SpectrumPipeline::from_settings(&settings);
+        let mut analyzer = SpectrumAnalyzer::new(1024, 48_000.0, 32, 256);
+
+        assert!(analyzer
+            .consume(&vec![0.0; 512], settings.attack, settings.release, pipeline)
+            .is_none());
+        assert!(analyzer
+            .consume(&vec![0.0; 512], settings.attack, settings.release, pipeline)
+            .is_some());
+        assert!(analyzer
+            .consume(&vec![0.0; 128], settings.attack, settings.release, pipeline)
+            .is_none());
+        assert!(analyzer
+            .consume(&vec![0.0; 128], settings.attack, settings.release, pipeline)
+            .is_some());
+    }
+
+    #[test]
+    fn low_latency_preset_applies_realtime_analysis_defaults() {
+        let mut settings = Settings {
+            analysis_preset: AnalysisPreset::Balanced,
+            fft_size: 4096,
+            analysis_hop: 1024,
+            refresh_hz: 45,
+            attack: 0.20,
+            release: 0.90,
+            ..Config::default().settings
+        };
+
+        settings.apply_analysis_preset(AnalysisPreset::LowLatency);
+
+        assert_eq!(settings.fft_size, 1024);
+        assert_eq!(settings.analysis_hop, 256);
+        assert_eq!(settings.refresh_hz, 90);
+        assert!((settings.attack - DEFAULT_ATTACK).abs() < f32::EPSILON);
+        assert!((settings.release - DEFAULT_RELEASE).abs() < f32::EPSILON);
     }
 }
