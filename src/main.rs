@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     env, fs, io,
     io::{BufRead, BufReader, Read},
     path::PathBuf,
@@ -45,8 +46,12 @@ const MAX_FREQUENCY: f32 = 18_000.0;
 const DEFAULT_HIGH_SHELF_DB: f32 = 6.0;
 const DEFAULT_VISUAL_CURVE: f32 = 0.88;
 const DEFAULT_CEILING: f32 = 0.88;
+const DEFAULT_AUDIO_DELAY_MS: u16 = 0;
+const AUDIO_DELAY_STEP_MS: i32 = 10;
+const MAX_AUDIO_DELAY_MS: i32 = 500;
 const FFT_SIZES: &[usize] = &[1024, 2048, 4096, 8192];
 const SILENCE_GATE: f32 = 0.000_12;
+const WAVEFORM_SAMPLES: usize = 1024;
 const TITLE_ART: &[&str] = &[
     " _            _     ",
     "| |_ ___ _ __| |__  ",
@@ -134,9 +139,16 @@ fn handle_menu_key(app: &mut App, key: KeyEvent) -> bool {
 
 fn handle_spectrum_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('m') => app.screen = Screen::Menu,
+        KeyCode::Char('q') | KeyCode::Esc => app.screen = Screen::Menu,
         KeyCode::Char(' ') => app.toggle_capture(),
-        KeyCode::Char('s') => app.screen = Screen::Settings,
+        KeyCode::Char('S') => app.screen = Screen::Settings,
+        KeyCode::Char('s') => app.toggle_settings_panel(),
+        KeyCode::Char('p') => app.toggle_pipeline_panel(),
+        KeyCode::Char('t') => app.toggle_toolbar_panel(),
+        KeyCode::Char('m') => app.toggle_master_panel(),
+        KeyCode::Char('w') => app.toggle_waveform_panel(),
+        KeyCode::Char('-') => app.adjust_audio_delay(-1),
+        KeyCode::Char('=') | KeyCode::Char('+') => app.adjust_audio_delay(1),
         KeyCode::Char('?') => app.screen = Screen::Help,
         KeyCode::Up | KeyCode::Char('k') => app.prev_setting(),
         KeyCode::Down | KeyCode::Char('j') => app.next_setting(),
@@ -161,6 +173,8 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Down | KeyCode::Char('j') => app.next_setting(),
         KeyCode::Left | KeyCode::Char('h') => app.adjust_setting(-1),
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => app.adjust_setting(1),
+        KeyCode::Char('-') => app.adjust_audio_delay(-1),
+        KeyCode::Char('=') | KeyCode::Char('+') => app.adjust_audio_delay(1),
         KeyCode::Char(' ') => app.toggle_capture(),
         KeyCode::Char('?') => app.screen = Screen::Help,
         _ => {}
@@ -226,6 +240,8 @@ struct Settings {
     fft_size: usize,
     #[serde(default = "default_refresh_hz")]
     refresh_hz: u16,
+    #[serde(default = "default_audio_delay_ms")]
+    audio_delay_ms: u16,
     #[serde(default = "default_high_shelf_enabled")]
     high_shelf_enabled: bool,
     #[serde(default = "default_high_shelf_db")]
@@ -236,10 +252,24 @@ struct Settings {
     visual_curve: f32,
     #[serde(default = "default_ceiling")]
     ceiling: f32,
+    #[serde(default = "default_show_settings_panel")]
+    show_settings_panel: bool,
+    #[serde(default = "default_show_pipeline_panel")]
+    show_pipeline_panel: bool,
+    #[serde(default = "default_show_toolbar_panel")]
+    show_toolbar_panel: bool,
+    #[serde(default = "default_show_master_panel")]
+    show_master_panel: bool,
+    #[serde(default = "default_show_waveform_panel")]
+    show_waveform_panel: bool,
 }
 
 fn default_refresh_hz() -> u16 {
     45
+}
+
+fn default_audio_delay_ms() -> u16 {
+    DEFAULT_AUDIO_DELAY_MS
 }
 
 fn default_fft_size() -> usize {
@@ -266,6 +296,26 @@ fn default_ceiling() -> f32 {
     DEFAULT_CEILING
 }
 
+fn default_show_settings_panel() -> bool {
+    true
+}
+
+fn default_show_pipeline_panel() -> bool {
+    true
+}
+
+fn default_show_toolbar_panel() -> bool {
+    true
+}
+
+fn default_show_master_panel() -> bool {
+    true
+}
+
+fn default_show_waveform_panel() -> bool {
+    false
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -277,11 +327,17 @@ impl Default for Config {
                 bar_count: 72,
                 fft_size: default_fft_size(),
                 refresh_hz: default_refresh_hz(),
+                audio_delay_ms: default_audio_delay_ms(),
                 high_shelf_enabled: default_high_shelf_enabled(),
                 high_shelf_db: default_high_shelf_db(),
                 visual_curve_enabled: default_visual_curve_enabled(),
                 visual_curve: default_visual_curve(),
                 ceiling: default_ceiling(),
+                show_settings_panel: default_show_settings_panel(),
+                show_pipeline_panel: default_show_pipeline_panel(),
+                show_toolbar_panel: default_show_toolbar_panel(),
+                show_master_panel: default_show_master_panel(),
+                show_waveform_panel: default_show_waveform_panel(),
             },
         }
     }
@@ -348,11 +404,15 @@ struct App {
     status: String,
     spectrum: Vec<f32>,
     level: f32,
+    master_left: f32,
+    master_right: f32,
+    waveform: Vec<f32>,
     analyzer: SpectrumAnalyzer,
     audio: Option<AudioProcess>,
     rx: Receiver<AudioEvent>,
     tx: Sender<AudioEvent>,
     last_samples_at: Option<Instant>,
+    delayed_audio: VecDeque<DelayedAudio>,
 }
 
 impl App {
@@ -376,11 +436,15 @@ impl App {
             status: tr(lang, "ready").to_string(),
             spectrum: vec![0.0; bar_count],
             level: 0.0,
+            master_left: 0.0,
+            master_right: 0.0,
+            waveform: vec![0.0; WAVEFORM_SAMPLES],
             analyzer: SpectrumAnalyzer::new(fft_size, 48_000.0, bar_count),
             audio: None,
             rx,
             tx,
             last_samples_at: None,
+            delayed_audio: VecDeque::new(),
         }
     }
 
@@ -411,27 +475,19 @@ impl App {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 AudioEvent::Samples(samples) => {
-                    self.capture_state = CaptureState::Running;
-                    self.last_samples_at = Some(Instant::now());
-                    self.level = audio_level(&samples);
-                    let pipeline = SpectrumPipeline::from_settings(&self.config.settings);
-                    if let Some(bars) =
-                        self.analyzer
-                            .consume(&samples, self.config.settings.smoothing, pipeline)
-                    {
-                        self.spectrum = bars;
-                    }
-                    self.status = self.t("running").to_string();
+                    self.queue_audio_samples(samples);
                 }
                 AudioEvent::Status(message) => {
                     if message.contains("ready") {
                         self.status = self.t("helper_ready").to_string();
                     } else if message.contains("permission-denied") {
                         self.audio = None;
+                        self.delayed_audio.clear();
                         self.capture_state = CaptureState::PermissionNeeded;
                         self.status = self.t("permission_needed").to_string();
                     } else if message.contains("no-display") || message.contains("capture-error") {
                         self.audio = None;
+                        self.delayed_audio.clear();
                         self.capture_state = CaptureState::Failed;
                         self.status = self.t("capture_failed").to_string();
                     }
@@ -441,6 +497,7 @@ impl App {
                         continue;
                     }
                     self.audio = None;
+                    self.delayed_audio.clear();
                     self.capture_state = if code == Some(2) {
                         CaptureState::PermissionNeeded
                     } else {
@@ -453,11 +510,62 @@ impl App {
                     };
                 }
                 AudioEvent::Error(message) => {
+                    self.delayed_audio.clear();
                     self.capture_state = CaptureState::Failed;
                     self.status = message;
                 }
             }
         }
+        self.flush_audio_delay();
+    }
+
+    fn queue_audio_samples(&mut self, samples: AudioSamples) {
+        self.delayed_audio.push_back(DelayedAudio {
+            received_at: Instant::now(),
+            samples,
+        });
+
+        while self.delayed_audio.len() > 256 {
+            self.delayed_audio.pop_front();
+        }
+
+        self.flush_audio_delay();
+    }
+
+    fn flush_audio_delay(&mut self) {
+        let delay = self.audio_delay_duration();
+        loop {
+            let Some(front) = self.delayed_audio.front() else {
+                break;
+            };
+            if front.received_at.elapsed() < delay {
+                break;
+            }
+            if let Some(delayed) = self.delayed_audio.pop_front() {
+                self.process_audio_samples(delayed.samples);
+            }
+        }
+    }
+
+    fn process_audio_samples(&mut self, samples: AudioSamples) {
+        self.capture_state = CaptureState::Running;
+        self.last_samples_at = Some(Instant::now());
+        self.level = audio_level(&samples.mono);
+        self.master_left = samples.left_level;
+        self.master_right = samples.right_level;
+        self.update_waveform(&samples.mono);
+        let pipeline = SpectrumPipeline::from_settings(&self.config.settings);
+        if let Some(bars) =
+            self.analyzer
+                .consume(&samples.mono, self.config.settings.smoothing, pipeline)
+        {
+            self.spectrum = bars;
+        }
+        self.status = self.t("running").to_string();
+    }
+
+    fn audio_delay_duration(&self) -> Duration {
+        Duration::from_millis(self.config.settings.audio_delay_ms as u64)
     }
 
     fn start_capture(&mut self) {
@@ -486,7 +594,11 @@ impl App {
         self.capture_state = CaptureState::Idle;
         self.status = self.t("stopped").to_string();
         self.level = 0.0;
+        self.master_left = 0.0;
+        self.master_right = 0.0;
         self.spectrum.fill(0.0);
+        self.waveform.fill(0.0);
+        self.delayed_audio.clear();
     }
 
     fn toggle_capture(&mut self) {
@@ -511,7 +623,7 @@ impl App {
     }
 
     fn next_setting(&mut self) {
-        self.setting_index = (self.setting_index + 1).min(10);
+        self.setting_index = (self.setting_index + 1).min(11);
     }
 
     fn adjust_setting(&mut self, direction: i32) {
@@ -543,21 +655,22 @@ impl App {
                 self.rebuild_analyzer();
             }
             5 => self.cycle_refresh_rate(direction),
-            6 => self.config.settings.high_shelf_enabled = !self.config.settings.high_shelf_enabled,
-            7 => {
+            6 => self.adjust_audio_delay_unsaved(direction),
+            7 => self.config.settings.high_shelf_enabled = !self.config.settings.high_shelf_enabled,
+            8 => {
                 self.config.settings.high_shelf_db =
                     (self.config.settings.high_shelf_db + direction as f32).clamp(0.0, 18.0);
             }
-            8 => {
+            9 => {
                 self.config.settings.visual_curve_enabled =
                     !self.config.settings.visual_curve_enabled;
             }
-            9 => {
+            10 => {
                 let delta = if direction < 0 { -0.04 } else { 0.04 };
                 self.config.settings.visual_curve =
                     (self.config.settings.visual_curve + delta).clamp(0.55, 1.35);
             }
-            10 => {
+            11 => {
                 let delta = if direction < 0 { -0.02 } else { 0.02 };
                 self.config.settings.ceiling =
                     (self.config.settings.ceiling + delta).clamp(0.70, 0.98);
@@ -565,6 +678,20 @@ impl App {
             _ => {}
         }
         self.save_config();
+    }
+
+    fn adjust_audio_delay(&mut self, direction: i32) {
+        self.adjust_audio_delay_unsaved(direction);
+        self.save_config();
+    }
+
+    fn adjust_audio_delay_unsaved(&mut self, direction: i32) {
+        let current = self.config.settings.audio_delay_ms as i32;
+        let next = (current + direction * AUDIO_DELAY_STEP_MS).clamp(0, MAX_AUDIO_DELAY_MS) as u16;
+        if next != self.config.settings.audio_delay_ms {
+            self.config.settings.audio_delay_ms = next;
+            self.flush_audio_delay();
+        }
     }
 
     fn cycle_language(&mut self, direction: i32) {
@@ -648,13 +775,69 @@ impl App {
     fn save_config(&self) {
         self.config.save();
     }
+
+    fn toggle_settings_panel(&mut self) {
+        self.config.settings.show_settings_panel = !self.config.settings.show_settings_panel;
+        self.save_config();
+    }
+
+    fn toggle_pipeline_panel(&mut self) {
+        self.config.settings.show_pipeline_panel = !self.config.settings.show_pipeline_panel;
+        self.save_config();
+    }
+
+    fn toggle_toolbar_panel(&mut self) {
+        self.config.settings.show_toolbar_panel = !self.config.settings.show_toolbar_panel;
+        self.save_config();
+    }
+
+    fn toggle_master_panel(&mut self) {
+        self.config.settings.show_master_panel = !self.config.settings.show_master_panel;
+        self.save_config();
+    }
+
+    fn toggle_waveform_panel(&mut self) {
+        self.config.settings.show_waveform_panel = !self.config.settings.show_waveform_panel;
+        self.save_config();
+    }
+
+    fn update_waveform(&mut self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+
+        let stride = (samples.len() / 128).max(1);
+        for chunk in samples.chunks(stride) {
+            let peak = chunk
+                .iter()
+                .copied()
+                .fold(0.0_f32, |current, sample| current.max(sample.abs()));
+            self.waveform.push(peak.min(1.0));
+        }
+
+        if self.waveform.len() > WAVEFORM_SAMPLES {
+            let excess = self.waveform.len() - WAVEFORM_SAMPLES;
+            self.waveform.drain(0..excess);
+        }
+    }
 }
 
 enum AudioEvent {
-    Samples(Vec<f32>),
+    Samples(AudioSamples),
     Status(String),
     Exit(Option<i32>),
     Error(String),
+}
+
+struct AudioSamples {
+    mono: Vec<f32>,
+    left_level: f32,
+    right_level: f32,
+}
+
+struct DelayedAudio {
+    received_at: Instant,
+    samples: AudioSamples,
 }
 
 struct AudioProcess {
@@ -714,19 +897,36 @@ fn helper_path() -> io::Result<PathBuf> {
 
 fn read_audio_stdout(mut stdout: impl Read, tx: Sender<AudioEvent>) {
     let mut buffer = vec![0_u8; 4096 * 4];
+    let mut pending = Vec::new();
     loop {
         match stdout.read(&mut buffer) {
             Ok(0) => break,
             Ok(size) => {
-                let sample_count = size / 4;
-                if sample_count == 0 {
+                pending.extend_from_slice(&buffer[..size]);
+                let frame_count = pending.len() / 8;
+                if frame_count == 0 {
                     continue;
                 }
 
-                let mut samples = Vec::with_capacity(sample_count);
-                for chunk in buffer[..sample_count * 4].chunks_exact(4) {
-                    samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                let bytes_to_read = frame_count * 8;
+                let mut mono = Vec::with_capacity(frame_count);
+                let mut left = Vec::with_capacity(frame_count);
+                let mut right = Vec::with_capacity(frame_count);
+
+                for chunk in pending[..bytes_to_read].chunks_exact(8) {
+                    let left_sample = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    let right_sample = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+                    left.push(left_sample);
+                    right.push(right_sample);
+                    mono.push((left_sample + right_sample) * 0.5);
                 }
+
+                pending.drain(0..bytes_to_read);
+                let samples = AudioSamples {
+                    left_level: audio_level(&left),
+                    right_level: audio_level(&right),
+                    mono,
+                };
 
                 if tx.send(AudioEvent::Samples(samples)).is_err() {
                     break;
@@ -1004,17 +1204,15 @@ fn theme(id: ThemeId) -> Theme {
 }
 
 fn bar_color(theme: Theme, index: usize, len: usize, value: f32) -> Color {
-    if value > 0.72 {
+    if value > 0.90 {
         return theme.high;
     }
 
     let ratio = index as f32 / len.max(1) as f32;
     if ratio < 0.45 {
         theme.low
-    } else if ratio < 0.78 {
-        theme.mid
     } else {
-        theme.high
+        theme.mid
     }
 }
 
@@ -1237,44 +1435,130 @@ fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_spectrum_screen(frame: &mut Frame, app: &App, area: Rect) {
-    let show_sidebar = area.width >= 90 && area.height >= 22;
-    if show_sidebar {
+    let settings = &app.config.settings;
+    let left_height = left_module_height(settings);
+    let show_left_modules = left_height > 0 && area.width >= 96 && area.height >= left_height;
+    let mut content_area = area;
+
+    if show_left_modules {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(35), Constraint::Min(24)])
+            .constraints([Constraint::Length(35), Constraint::Min(28)])
             .split(area);
-        draw_sidebar(frame, app, chunks[0]);
-        draw_spectrum(frame, app, chunks[1], app.t("spectrum"));
-    } else {
+        draw_left_modules(frame, app, chunks[0]);
+        content_area = chunks[1];
+    }
+
+    let show_master =
+        settings.show_master_panel && content_area.width >= 63 && content_area.height >= 14;
+    let mut visual_area = content_area;
+    if show_master {
+        let meter_width = if content_area.width >= 120 { 14 } else { 13 };
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(24), Constraint::Length(meter_width)])
+            .split(content_area);
+        visual_area = chunks[0];
+        draw_master_meter(frame, app, chunks[1]);
+    }
+
+    let show_compact_footer = !show_left_modules && visual_area.height >= 9;
+    let chart_area = if show_compact_footer {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(6), Constraint::Length(3)])
-            .split(area);
-        draw_spectrum(frame, app, rows[0], "terb");
+            .split(visual_area);
         draw_compact_footer(frame, app, rows[1]);
+        rows[0]
+    } else {
+        visual_area
+    };
+
+    if settings.show_waveform_panel && chart_area.width >= 28 && chart_area.height >= 16 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(7), Constraint::Min(6)])
+            .split(chart_area);
+        draw_waveform(frame, app, rows[0]);
+        draw_spectrum(frame, app, rows[1], app.t("spectrum"));
+    } else {
+        draw_spectrum(frame, app, chart_area, app.t("spectrum"));
     }
 }
 
-fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    let theme = app.theme();
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(7),
-            Constraint::Length(13),
-            Constraint::Length(6),
-            Constraint::Min(7),
-        ])
-        .split(area);
+fn left_module_height(settings: &Settings) -> u16 {
+    let mut height = 0;
+    if settings.show_toolbar_panel {
+        height += 7;
+    }
+    if settings.show_settings_panel {
+        height += 14;
+    }
+    if settings.show_pipeline_panel {
+        height += 8;
+    }
+    height
+}
 
-    let data = Paragraph::new(vec![
+fn draw_left_modules(frame: &mut Frame, app: &App, area: Rect) {
+    let settings = &app.config.settings;
+    let mut constraints = Vec::new();
+
+    if settings.show_toolbar_panel {
+        constraints.push(Constraint::Length(7));
+    }
+    if settings.show_settings_panel {
+        constraints.push(Constraint::Length(14));
+    }
+    if settings.show_pipeline_panel {
+        constraints.push(Constraint::Length(8));
+    }
+    if constraints.is_empty() {
+        return;
+    }
+    constraints.push(Constraint::Min(0));
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    let mut index = 0;
+
+    if settings.show_toolbar_panel {
+        draw_toolbar(frame, app, chunks[index]);
+        index += 1;
+    }
+    if settings.show_settings_panel {
+        draw_settings_list(
+            frame,
+            app,
+            chunks[index],
+            module_block(app, 's', "settings"),
+        );
+        index += 1;
+    }
+    if settings.show_pipeline_panel {
+        draw_pipeline(frame, app, chunks[index]);
+    }
+}
+
+fn draw_toolbar(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let lines = vec![
         Line::from(vec![
-            Span::styled(app.t("status"), Style::default().fg(theme.muted)),
-            Span::raw(" "),
-            Span::styled(state_label(app), Style::default().fg(theme.accent)),
-            Span::raw("  "),
             Span::styled(
-                format!("{} {:>3}%", app.t("level"), (app.level * 100.0) as u16),
+                capture_control_label(app),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                format!(
+                    "L{:>3} R{:>3}",
+                    (app.master_left * 100.0) as u16,
+                    (app.master_right * 100.0) as u16
+                ),
                 Style::default().fg(theme.text),
             ),
         ]),
@@ -1290,23 +1574,184 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 format!("{}Hz", app.config.settings.refresh_hz),
                 Style::default().fg(theme.text),
             ),
+            Span::raw("  "),
+            Span::styled(app.t("audio_delay"), Style::default().fg(theme.muted)),
+            Span::raw(" "),
+            Span::styled(
+                format!("{}ms", app.config.settings.audio_delay_ms),
+                Style::default().fg(theme.text),
+            ),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(&app.status, Style::default().fg(theme.text))),
+        module_toggle_line(app),
+        Line::from(vec![
+            Span::styled("S", Style::default().fg(theme.accent)),
+            Span::styled(
+                format!(" {}  ", app.t("settings")),
+                Style::default().fg(theme.muted),
+            ),
+            Span::styled("?", Style::default().fg(theme.accent)),
+            Span::styled(
+                format!(" {}  ", app.t("help")),
+                Style::default().fg(theme.muted),
+            ),
+            Span::styled("q", Style::default().fg(theme.accent)),
+            Span::styled(
+                format!(" {}", app.t("main_menu")),
+                Style::default().fg(theme.muted),
+            ),
+        ]),
+        Line::from(Span::styled(&app.status, Style::default().fg(theme.muted))),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(module_block(app, 't', "toolbar")),
+        area,
+    );
+}
+
+fn module_toggle_line(app: &App) -> Line<'static> {
+    let theme = app.theme();
+    Line::from(vec![
+        Span::styled(
+            module_toggle_keys(app),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {}", app.t("modules")),
+            Style::default().fg(theme.muted),
+        ),
     ])
-    .wrap(Wrap { trim: true })
-    .block(panel_block("terb", theme));
-    frame.render_widget(data, rows[0]);
+}
 
-    draw_settings_list(frame, app, rows[1], app.t("settings"));
+fn module_toggle_keys(app: &App) -> String {
+    if app.lang == Lang::En {
+        "s p t m w".to_string()
+    } else {
+        "[s] [p] [t] [m] [w]".to_string()
+    }
+}
 
-    draw_pipeline(frame, app, rows[2]);
+fn draw_master_meter(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let block = module_block(app, 'm', "master");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let hint = Paragraph::new(app.t("sidebar_hint"))
-        .wrap(Wrap { trim: true })
-        .style(Style::default().fg(theme.muted))
-        .block(panel_block(app.t("controls"), theme));
-    frame.render_widget(hint, rows[3]);
+    if inner.width < 5 || inner.height < 5 {
+        return;
+    }
+
+    let chart_height = inner.height.saturating_sub(1) as usize;
+    let meter_width = ((inner.width as usize).saturating_sub(3) / 2).max(1);
+    let left = app.master_left.clamp(0.0, 1.0);
+    let right = app.master_right.clamp(0.0, 1.0);
+    let mut lines = Vec::with_capacity(chart_height + 1);
+
+    for row in 0..chart_height {
+        let threshold = 1.0 - (row as f32 + 0.5) / chart_height as f32;
+        let left_fill = left >= threshold;
+        let right_fill = right >= threshold;
+        let left_bar = if left_fill {
+            "█".repeat(meter_width)
+        } else {
+            " ".repeat(meter_width)
+        };
+        let right_bar = if right_fill {
+            "█".repeat(meter_width)
+        } else {
+            " ".repeat(meter_width)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                left_bar,
+                Style::default().fg(if left_fill {
+                    meter_color(theme, threshold)
+                } else {
+                    Color::Reset
+                }),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                right_bar,
+                Style::default().fg(if right_fill {
+                    meter_color(theme, threshold)
+                } else {
+                    Color::Reset
+                }),
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("L{:>3}", (left * 100.0) as u16),
+            Style::default().fg(theme.muted),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("R{:>3}", (right * 100.0) as u16),
+            Style::default().fg(theme.muted),
+        ),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn meter_color(theme: Theme, value: f32) -> Color {
+    if value > 0.82 {
+        theme.high
+    } else if value > 0.52 {
+        theme.mid
+    } else {
+        theme.low
+    }
+}
+
+fn draw_waveform(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let block = module_block(app, 'w', "waveform");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 8 || inner.height < 3 {
+        return;
+    }
+
+    let samples = display_bars(&app.waveform, inner.width as usize);
+    let height = inner.height as usize;
+    let center = (height.saturating_sub(1)) as f32 * 0.5;
+    let center_row = center.round() as usize;
+    let mut lines = Vec::with_capacity(height);
+
+    for row in 0..height {
+        let distance = if center <= 0.0 {
+            0.0
+        } else {
+            ((row as f32 - center).abs() / center).clamp(0.0, 1.0)
+        };
+        let mut spans = Vec::with_capacity(samples.len());
+        for sample in &samples {
+            let value = sample.clamp(0.0, 1.0);
+            let filled = value > 0.002 && value >= distance;
+            let symbol = if filled {
+                "█"
+            } else if row == center_row {
+                "─"
+            } else {
+                " "
+            };
+            let color = if filled { theme.accent } else { theme.border };
+            spans.push(Span::styled(symbol, Style::default().fg(color)));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_spectrum(frame: &mut Frame, app: &App, area: Rect, title: &'static str) {
@@ -1352,7 +1797,11 @@ fn draw_compact_footer(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw("  "),
         Span::styled(
-            format!("{} {:>3}%", app.t("level"), (app.level * 100.0) as u16),
+            format!(
+                "L{:>3} R{:>3}",
+                (app.master_left * 100.0) as u16,
+                (app.master_right * 100.0) as u16
+            ),
             Style::default().fg(theme.text),
         ),
         Span::raw("  "),
@@ -1417,13 +1866,18 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = if area.width < 70 || area.height < 20 {
         area
     } else {
-        centered_rect(54, 52, area)
+        centered_rect(54, 62, area)
     };
     frame.render_widget(Clear, chunks);
-    draw_settings_list(frame, app, chunks, app.t("settings"));
+    draw_settings_list(
+        frame,
+        app,
+        chunks,
+        panel_block(app.t("settings"), app.theme()),
+    );
 }
 
-fn draw_settings_list(frame: &mut Frame, app: &App, area: Rect, title: &'static str) {
+fn draw_settings_list(frame: &mut Frame, app: &App, area: Rect, block: Block<'static>) {
     let theme = app.theme();
     let rows = vec![
         setting_line(app, "language", language_label(app.lang)),
@@ -1439,6 +1893,11 @@ fn draw_settings_list(frame: &mut Frame, app: &App, area: Rect, title: &'static 
             app,
             "refresh_rate",
             format!("{}Hz", app.config.settings.refresh_hz),
+        ),
+        setting_line(
+            app,
+            "audio_delay",
+            format!("{}ms", app.config.settings.audio_delay_ms),
         ),
         setting_line(
             app,
@@ -1472,7 +1931,7 @@ fn draw_settings_list(frame: &mut Frame, app: &App, area: Rect, title: &'static 
     state.select(Some(app.setting_index));
 
     let list = List::new(items)
-        .block(panel_block(title, theme))
+        .block(block)
         .highlight_symbol("  ")
         .highlight_style(
             Style::default()
@@ -1485,72 +1944,78 @@ fn draw_settings_list(frame: &mut Frame, app: &App, area: Rect, title: &'static 
 fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
     let settings = &app.config.settings;
+    let shelf = if settings.high_shelf_enabled {
+        format!("HS +{:.0}dB", settings.high_shelf_db)
+    } else {
+        "HS bypass".to_string()
+    };
+    let meter = if settings.visual_curve_enabled {
+        format!("pow {:.2}", settings.visual_curve)
+    } else {
+        "linear".to_string()
+    };
     let lines = vec![
         Line::from(vec![
-            Span::styled("IN", Style::default().fg(theme.text)),
-            Span::styled(" > ", Style::default().fg(theme.muted)),
-            Span::styled(
-                format!("GATE {:.0}e-5", SILENCE_GATE * 100_000.0),
-                Style::default().fg(theme.text),
-            ),
-            Span::styled(" > ", Style::default().fg(theme.muted)),
-            Span::styled("WIN", Style::default().fg(theme.text)),
+            pipeline_stage(theme, "SRC"),
+            Span::styled("SCStream 48k/2ch", Style::default().fg(theme.text)),
         ]),
         Line::from(vec![
+            pipeline_stage(theme, "SYNC"),
             Span::styled(
-                format!("FFT{}", settings.fft_size),
-                Style::default().fg(theme.text),
-            ),
-            Span::styled(" > ", Style::default().fg(theme.muted)),
-            Span::styled(
-                format!("BAND{}", settings.bar_count),
-                Style::default().fg(theme.text),
-            ),
-            Span::styled(" > ", Style::default().fg(theme.muted)),
-            Span::styled("DET", Style::default().fg(theme.text)),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                if settings.high_shelf_enabled {
-                    format!("EQ +{:.0}dB", settings.high_shelf_db)
-                } else {
-                    "EQ bypass".to_string()
-                },
-                Style::default().fg(if settings.high_shelf_enabled {
-                    theme.accent
-                } else {
-                    theme.muted
-                }),
-            ),
-            Span::styled(" > ", Style::default().fg(theme.muted)),
-            Span::styled(
-                format!("LIM {}%", (settings.ceiling * 100.0) as u16),
+                format!("delay {}ms -> mono bus", settings.audio_delay_ms),
                 Style::default().fg(theme.text),
             ),
         ]),
         Line::from(vec![
+            pipeline_stage(theme, "PRE"),
+            Span::styled("DC trim -> Hann window", Style::default().fg(theme.text)),
+        ]),
+        Line::from(vec![
+            pipeline_stage(theme, "FFT"),
             Span::styled(
-                if settings.visual_curve_enabled {
-                    format!("MTR pow {:.2}", settings.visual_curve)
-                } else {
-                    "MTR linear".to_string()
-                },
-                Style::default().fg(if settings.visual_curve_enabled {
-                    theme.accent
-                } else {
-                    theme.muted
-                }),
+                format!("{} log bands 35Hz-18k", settings.fft_size),
+                Style::default().fg(theme.text),
             ),
-            Span::styled(" > OUT", Style::default().fg(theme.muted)),
+        ]),
+        Line::from(vec![
+            pipeline_stage(theme, "DET"),
+            Span::styled(
+                format!(
+                    "RMS+peak  atk 62  rel {:>2}%",
+                    (settings.smoothing * 100.0) as u16
+                ),
+                Style::default().fg(theme.text),
+            ),
+        ]),
+        Line::from(vec![
+            pipeline_stage(theme, "PROC"),
+            Span::styled(
+                format!(
+                    "{} | lim {:>2}% | {}",
+                    shelf,
+                    (settings.ceiling * 100.0) as u16,
+                    meter
+                ),
+                Style::default().fg(theme.text),
+            ),
         ]),
     ];
 
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
-            .block(panel_block(app.t("pipeline"), theme)),
+            .block(module_block(app, 'p', "pipeline")),
         area,
     );
+}
+
+fn pipeline_stage(theme: Theme, label: &'static str) -> Span<'static> {
+    Span::styled(
+        format!("{:<5}", label),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 fn setting_line(app: &App, key: &'static str, value: impl Into<String>) -> Line<'static> {
@@ -1605,6 +2070,81 @@ fn panel_block(title: &'static str, theme: Theme) -> Block<'static> {
         .style(Style::default().fg(theme.text))
 }
 
+fn module_block(app: &App, shortcut: char, title_key: &'static str) -> Block<'static> {
+    let theme = app.theme();
+    Block::default()
+        .title(module_title_line(app, shortcut, title_key))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border))
+        .style(Style::default().fg(theme.text))
+}
+
+fn module_title_line(app: &App, shortcut: char, title_key: &'static str) -> Line<'static> {
+    let theme = app.theme();
+    if app.lang == Lang::En {
+        inline_hotkey_label(theme, shortcut, english_module_title(title_key))
+    } else {
+        Line::from(vec![
+            Span::styled(
+                format!("[{}]", shortcut),
+                hotkey_style(theme).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                app.t(title_key).to_string(),
+                title_style(theme).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    }
+}
+
+fn inline_hotkey_label(theme: Theme, shortcut: char, label: &'static str) -> Line<'static> {
+    let mut chars = label.chars();
+    let first = chars.next().unwrap_or(shortcut);
+    if first.eq_ignore_ascii_case(&shortcut) {
+        Line::from(vec![
+            Span::styled(
+                first.to_string(),
+                hotkey_style(theme).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                chars.as_str().to_string(),
+                title_style(theme).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                shortcut.to_string(),
+                hotkey_style(theme).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {}", label),
+                title_style(theme).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    }
+}
+
+fn english_module_title(title_key: &'static str) -> &'static str {
+    match title_key {
+        "settings" => "settings",
+        "pipeline" => "pipeline",
+        "toolbar" => "toolbar",
+        "master" => "master",
+        "waveform" => "waveform",
+        _ => title_key,
+    }
+}
+
+fn hotkey_style(theme: Theme) -> Style {
+    Style::default().fg(theme.accent)
+}
+
+fn title_style(theme: Theme) -> Style {
+    Style::default().fg(theme.text)
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -1654,16 +2194,6 @@ fn capture_control_label(app: &App) -> String {
     }
 }
 
-fn state_label(app: &App) -> &'static str {
-    match app.capture_state {
-        CaptureState::Idle => app.t("state_idle"),
-        CaptureState::Starting => app.t("state_starting"),
-        CaptureState::Running => app.t("state_running"),
-        CaptureState::PermissionNeeded => app.t("state_permission"),
-        CaptureState::Failed => app.t("state_failed"),
-    }
-}
-
 fn tr(lang: Lang, key: &'static str) -> &'static str {
     match (lang, key) {
         (Lang::Zh, "main_menu") => "主菜单",
@@ -1688,12 +2218,17 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "bars") => "频段",
         (Lang::Zh, "fft_size") => "FFT",
         (Lang::Zh, "refresh_rate") => "刷新率",
+        (Lang::Zh, "audio_delay") => "音频延迟",
         (Lang::Zh, "high_shelf") => "高频补偿",
         (Lang::Zh, "high_shelf_db") => "补偿强度",
         (Lang::Zh, "visual_curve") => "高度曲线",
         (Lang::Zh, "curve_power") => "曲线指数",
         (Lang::Zh, "ceiling") => "上限",
         (Lang::Zh, "pipeline") => "音频链路",
+        (Lang::Zh, "toolbar") => "工具栏",
+        (Lang::Zh, "master") => "master",
+        (Lang::Zh, "waveform") => "波形",
+        (Lang::Zh, "modules") => "模块",
         (Lang::Zh, "on") => "开",
         (Lang::Zh, "off") => "关",
         (Lang::Zh, "transport_idle") => "○ 待机",
@@ -1706,14 +2241,14 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "help_title") => "Terb 终端频谱",
         (Lang::Zh, "help_1") => "↑/↓ 或 j/k 移动选择。",
         (Lang::Zh, "help_2") => "Enter 执行；Space 开始或停止捕获。",
-        (Lang::Zh, "help_3") => "频谱页左侧栏显示状态和设置；↑/↓ 选择设置，←/→ 调整。",
-        (Lang::Zh, "help_4") => "窗口较小时侧栏会隐藏；按 s 打开全屏设置，按 m 或 q 返回主菜单。",
-        (Lang::Zh, "help_5") => "q/Esc 返回；在主菜单再次按 q/Esc 退出。",
+        (Lang::Zh, "help_3") => "频谱页按 s/p/t/m/w 显示或隐藏设置、链路、工具栏、master、波形。",
+        (Lang::Zh, "help_4") => "↑/↓ 选择设置，←/→ 调整；-/= 调整音频延迟；S 打开全屏设置。",
+        (Lang::Zh, "help_5") => "窗口较小时模块会自动隐藏，仍可用快捷键操作；主菜单 q/Esc 退出。",
         (Lang::Zh, "permission_note") => "首次捕获会触发 macOS 屏幕与系统音频录制授权；Terb 只实时分析，不保存音频。",
         (Lang::Zh, "menu_hint") => "↑/↓ 选择 · Enter 确认 · Space 捕获 · ? 帮助 · q 退出",
-        (Lang::Zh, "spectrum_hint") => "Space 捕获 · ↑/↓ 选择设置 · ←/→ 调整 · s 设置 · m 菜单",
-        (Lang::Zh, "sidebar_hint") => "Space 开关捕获\n↑/↓ 选择设置\n←/→ 调整\ns 全屏设置\nm/q 主菜单\n? 帮助",
-        (Lang::Zh, "compact_hint") => "Space 捕获 · s 设置 · m/q 菜单",
+        (Lang::Zh, "spectrum_hint") => "Space 捕获 · -/= 延迟 · s/p/t/m/w 模块 · S 设置 · q 菜单",
+        (Lang::Zh, "sidebar_hint") => "Space 开关捕获\n-/= 音频延迟\ns/p/t/m/w 模块\n↑/↓ 选择设置\n←/→ 调整\nS 设置\nq 菜单\n? 帮助",
+        (Lang::Zh, "compact_hint") => "-/= 延迟 · s/p/t/m/w 模块 · S 设置 · q 菜单",
         (Lang::Zh, "ready") => "准备就绪。",
         (Lang::Zh, "starting") => "正在启动系统音频捕获...",
         (Lang::Zh, "helper_ready") => "捕获进程已就绪，等待音频。",
@@ -1756,12 +2291,17 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "bars") => "Bands",
         (Lang::En, "fft_size") => "FFT",
         (Lang::En, "refresh_rate") => "Refresh",
+        (Lang::En, "audio_delay") => "Audio Delay",
         (Lang::En, "high_shelf") => "High-shelf",
         (Lang::En, "high_shelf_db") => "Shelf Gain",
         (Lang::En, "visual_curve") => "Height Curve",
         (Lang::En, "curve_power") => "Curve Power",
         (Lang::En, "ceiling") => "Ceiling",
         (Lang::En, "pipeline") => "Pipeline",
+        (Lang::En, "toolbar") => "Toolbar",
+        (Lang::En, "master") => "master",
+        (Lang::En, "waveform") => "Waveform",
+        (Lang::En, "modules") => "modules",
         (Lang::En, "on") => "On",
         (Lang::En, "off") => "Off",
         (Lang::En, "transport_idle") => "○ Idle",
@@ -1774,14 +2314,14 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "help_title") => "Terb terminal spectrum",
         (Lang::En, "help_1") => "Use ↑/↓ or j/k to move.",
         (Lang::En, "help_2") => "Enter activates; Space starts or stops capture.",
-        (Lang::En, "help_3") => "In Spectrum, the sidebar shows status and settings. Use ↑/↓ to select and ←/→ to adjust.",
-        (Lang::En, "help_4") => "When the window is small, the sidebar hides. Press s for full-screen settings, m or q for menu.",
-        (Lang::En, "help_5") => "q/Esc goes back; on the main menu it quits.",
+        (Lang::En, "help_3") => "In Spectrum, press s/p/t/m/w to show or hide settings, pipeline, toolbar, master, and waveform.",
+        (Lang::En, "help_4") => "Use ↑/↓ to select settings and ←/→ to adjust. -/= adjusts audio delay; S opens full-screen settings.",
+        (Lang::En, "help_5") => "Small terminals hide modules automatically, but shortcuts still work. q/Esc quits from the main menu.",
         (Lang::En, "permission_note") => "First capture may trigger macOS Screen & System Audio Recording permission. Terb analyzes live audio only and does not save it.",
         (Lang::En, "menu_hint") => "↑/↓ select · Enter confirm · Space capture · ? help · q quit",
-        (Lang::En, "spectrum_hint") => "Space capture · ↑/↓ select setting · ←/→ adjust · s settings · m menu",
-        (Lang::En, "sidebar_hint") => "Space toggle capture\n↑/↓ select setting\n←/→ adjust\ns full settings\nm/q main menu\n? help",
-        (Lang::En, "compact_hint") => "Space capture · s settings · m/q menu",
+        (Lang::En, "spectrum_hint") => "Space capture · -/= delay · s/p/t/m/w modules · S settings · q menu",
+        (Lang::En, "sidebar_hint") => "Space toggle capture\n-/= audio delay\ns/p/t/m/w modules\n↑/↓ select setting\n←/→ adjust\nS settings\nq menu\n? help",
+        (Lang::En, "compact_hint") => "-/= delay · s/p/t/m/w modules · S settings · q menu",
         (Lang::En, "ready") => "Ready.",
         (Lang::En, "starting") => "Starting system-audio capture...",
         (Lang::En, "helper_ready") => "Capture helper is ready; waiting for audio.",
@@ -1824,12 +2364,17 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "bars") => "バンド",
         (Lang::Ja, "fft_size") => "FFT",
         (Lang::Ja, "refresh_rate") => "更新率",
+        (Lang::Ja, "audio_delay") => "音声遅延",
         (Lang::Ja, "high_shelf") => "高域補正",
         (Lang::Ja, "high_shelf_db") => "補正量",
         (Lang::Ja, "visual_curve") => "高さ曲線",
         (Lang::Ja, "curve_power") => "曲線指数",
         (Lang::Ja, "ceiling") => "上限",
         (Lang::Ja, "pipeline") => "音声チェーン",
+        (Lang::Ja, "toolbar") => "ツールバー",
+        (Lang::Ja, "master") => "master",
+        (Lang::Ja, "waveform") => "波形",
+        (Lang::Ja, "modules") => "モジュール",
         (Lang::Ja, "on") => "オン",
         (Lang::Ja, "off") => "オフ",
         (Lang::Ja, "transport_idle") => "○ 待機",
@@ -1842,14 +2387,14 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "help_title") => "Terb ターミナルスペクトラム",
         (Lang::Ja, "help_1") => "↑/↓ または j/k で移動します。",
         (Lang::Ja, "help_2") => "Enter で実行、Space でキャプチャ開始/停止。",
-        (Lang::Ja, "help_3") => "スペクトラム画面のサイドバーで状態と設定を表示します。↑/↓ で選択、←/→ で変更。",
-        (Lang::Ja, "help_4") => "小さいウィンドウではサイドバーを隠します。s で全画面設定、m/q でメニュー。",
-        (Lang::Ja, "help_5") => "q/Esc で戻る。メインメニューでは終了します。",
+        (Lang::Ja, "help_3") => "スペクトラム画面では s/p/t/m/w で設定、チェーン、ツールバー、master、波形を表示/非表示にします。",
+        (Lang::Ja, "help_4") => "↑/↓ で設定選択、←/→ で変更。-/= で音声遅延を調整、S で全画面設定。",
+        (Lang::Ja, "help_5") => "小さいウィンドウではモジュールを自動で隠しますが、ショートカットは使えます。メインメニューでは q/Esc で終了します。",
         (Lang::Ja, "permission_note") => "初回キャプチャでは macOS の画面とシステム音声録音権限が必要です。Terb はリアルタイム解析のみ行い、音声を保存しません。",
         (Lang::Ja, "menu_hint") => "↑/↓ 選択 · Enter 決定 · Space キャプチャ · ? ヘルプ · q 終了",
-        (Lang::Ja, "spectrum_hint") => "Space キャプチャ · ↑/↓ 設定選択 · ←/→ 変更 · s 設定 · m メニュー",
-        (Lang::Ja, "sidebar_hint") => "Space キャプチャ切替\n↑/↓ 設定選択\n←/→ 変更\ns 全画面設定\nm/q メニュー\n? ヘルプ",
-        (Lang::Ja, "compact_hint") => "Space キャプチャ · s 設定 · m/q メニュー",
+        (Lang::Ja, "spectrum_hint") => "Space キャプチャ · -/= 遅延 · s/p/t/m/w モジュール · S 設定 · q メニュー",
+        (Lang::Ja, "sidebar_hint") => "Space キャプチャ切替\n-/= 音声遅延\ns/p/t/m/w モジュール\n↑/↓ 設定選択\n←/→ 変更\nS 設定\nq メニュー\n? ヘルプ",
+        (Lang::Ja, "compact_hint") => "-/= 遅延 · s/p/t/m/w モジュール · S 設定 · q メニュー",
         (Lang::Ja, "ready") => "準備完了。",
         (Lang::Ja, "starting") => "システム音声キャプチャを開始しています...",
         (Lang::Ja, "helper_ready") => "キャプチャヘルパーは準備完了。音声を待っています。",
@@ -1877,6 +2422,33 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn english_module_title_highlights_inline_hotkey() {
+        let mut config = Config::default();
+        config.settings.language = "en".to_string();
+        let app = App::new(config);
+        let line = module_title_line(&app, 's', "settings");
+
+        assert_eq!(line_text(&line), "settings");
+        assert_eq!(line.spans[0].content.as_ref(), "s");
+        assert_eq!(line.spans[1].content.as_ref(), "ettings");
+    }
+
+    #[test]
+    fn localized_module_title_uses_bracketed_hotkey() {
+        let app = App::new(Config::default());
+        let line = module_title_line(&app, 'p', "pipeline");
+
+        assert_eq!(line_text(&line), "[p] 音频链路");
+    }
 
     #[test]
     fn display_bars_expands_to_full_width() {

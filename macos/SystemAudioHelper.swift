@@ -54,7 +54,7 @@ final class AudioCapture: NSObject, SCStreamDelegate, SCStreamOutput {
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
         guard outputType == .audio, sampleBuffer.isValid else { return }
-        let samples = extractMonoSamples(from: sampleBuffer)
+        let samples = extractStereoSamples(from: sampleBuffer)
         guard !samples.isEmpty else { return }
 
         samples.withUnsafeBytes { rawBuffer in
@@ -64,7 +64,7 @@ final class AudioCapture: NSObject, SCStreamDelegate, SCStreamOutput {
         }
     }
 
-    private func extractMonoSamples(from sampleBuffer: CMSampleBuffer) -> [Float] {
+    private func extractStereoSamples(from sampleBuffer: CMSampleBuffer) -> [Float] {
         guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
               let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) else {
             return []
@@ -105,39 +105,41 @@ final class AudioCapture: NSObject, SCStreamDelegate, SCStreamOutput {
 
         guard !channels.isEmpty else { return [] }
 
-        if isNonInterleaved && channels.count > 1 {
+        if isNonInterleaved {
             let frameCount = channels.map(\.count).min() ?? 0
             guard frameCount > 0 else { return [] }
 
-            var mono = Array(repeating: Float(0), count: frameCount)
-            for channel in channels {
-                for index in 0..<frameCount {
-                    mono[index] += channel[index]
-                }
+            let left = channels[0]
+            let right = channels.count > 1 ? channels[1] : channels[0]
+            var stereo: [Float] = []
+            stereo.reserveCapacity(frameCount * 2)
+            for index in 0..<frameCount {
+                stereo.append(left[index])
+                stereo.append(right[index])
             }
-
-            let scale = Float(channels.count)
-            for index in mono.indices {
-                mono[index] /= scale
-            }
-            return mono
+            return stereo
         }
 
         let combined = channels.flatMap { $0 }
-        guard channelCount > 1 else { return combined }
+        if channelCount == 1 {
+            var stereo: [Float] = []
+            stereo.reserveCapacity(combined.count * 2)
+            for sample in combined {
+                stereo.append(sample)
+                stereo.append(sample)
+            }
+            return stereo
+        }
 
-        var mono: [Float] = []
-        mono.reserveCapacity(combined.count / channelCount)
+        var stereo: [Float] = []
+        stereo.reserveCapacity((combined.count / channelCount) * 2)
         var index = 0
         while index + channelCount <= combined.count {
-            var value = Float(0)
-            for offset in 0..<channelCount {
-                value += combined[index + offset]
-            }
-            mono.append(value / Float(channelCount))
+            stereo.append(combined[index])
+            stereo.append(combined[index + 1])
             index += channelCount
         }
-        return mono
+        return stereo
     }
 
     private func convert(data: UnsafeMutableRawPointer, byteCount: Int, bitsPerChannel: Int, isFloat: Bool, isSignedInteger: Bool) -> [Float] {
