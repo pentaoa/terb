@@ -1,10 +1,13 @@
 use std::{
     collections::VecDeque,
     env, fs, io,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Cursor, Read},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc, OnceLock,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -27,7 +30,6 @@ use ratatui::{
 };
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 const LANGUAGES: &[(&str, &str)] = &[("zh", "中文"), ("en", "English"), ("ja", "日本語")];
 const THEMES: &[ThemeId] = &[
@@ -37,6 +39,7 @@ const THEMES: &[ThemeId] = &[
     ThemeId::Aurora,
     ThemeId::SonicTexture,
     ThemeId::NoiseWarp,
+    ThemeId::Miku,
     ThemeId::Amber,
     ThemeId::Mono,
 ];
@@ -61,7 +64,9 @@ const DEFAULT_TRAIL_DECAY: f32 = 0.88;
 const DEFAULT_ACCENT_TRACE_THRESHOLD: f32 = 0.50;
 const ACCENT_TRACE_LIFETIME_MS: u64 = 500;
 const ACCENT_TRACE_COOLDOWN_MS: u64 = 90;
-const ACCENT_TRACE_VERTICAL_OFFSET_CELLS: usize = 5;
+const ACCENT_TRACE_START_OFFSET_CELLS: f32 = 1.0;
+const ACCENT_TRACE_END_OFFSET_CELLS: f32 = 5.0;
+const ACCENT_TRACE_OFFSET_ANIMATION_MS: u64 = 100;
 const ACCENT_TRACE_SETTLE_FRAMES: usize = 1;
 const ACCENT_TRACE_MAX_CAPTURE_FRAMES: usize = 8;
 const ACCENT_TRACE_RISE_EPSILON: f32 = 0.012;
@@ -79,6 +84,11 @@ const SILENCE_GATE: f32 = 0.000_12;
 const WAVEFORM_SAMPLES: usize = 1024;
 const WAVEFORM_TARGET_PEAK: f32 = 0.72;
 const BRAILLE_DOT_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+const TERMINAL_CELL_ASPECT: f32 = 0.5;
+const MIKU_BASE_FPS: f32 = 5.0;
+const MIKU_TRIGGER_SPEED_STEP: f32 = 0.20;
+const MIKU_TRIGGER_WINDOW_MS: u64 = 3_000;
+const MIKU_GIF: &[u8] = include_bytes!("../assets/miku/miku.gif");
 const TITLE_ART: &[&str] = &[
     " _            _     ",
     "| |_ ___ _ __| |__  ",
@@ -264,6 +274,7 @@ enum ThemeId {
     HarmonicComb,
     SonicTexture,
     NoiseWarp,
+    Miku,
     Amber,
     Mono,
 }
@@ -648,6 +659,8 @@ struct App {
     spectrum_trail: Vec<f32>,
     pending_accent_trace: Option<PendingAccentTrace>,
     accent_traces: Vec<AccentTrace>,
+    miku_trigger_times: VecDeque<Instant>,
+    miku_frame_phase: f32,
     accent_energy_baseline: f32,
     accent_trace_cooldown: Duration,
     color_state: VisualColorState,
@@ -711,12 +724,25 @@ impl AccentTrace {
         let age = self.age.as_secs_f32();
         (1.0 - age / lifetime).clamp(0.0, 1.0)
     }
+
+    fn vertical_offset_rows(&self) -> f32 {
+        let duration = ACCENT_TRACE_OFFSET_ANIMATION_MS as f32 / 1000.0;
+        let progress = (self.age.as_secs_f32() / duration.max(f32::EPSILON)).clamp(0.0, 1.0);
+        let offset_cells = lerp(
+            ACCENT_TRACE_START_OFFSET_CELLS,
+            ACCENT_TRACE_END_OFFSET_CELLS,
+            smoothstep(progress),
+        );
+
+        offset_cells * 4.0
+    }
 }
 
 #[derive(Clone, Debug)]
 struct AccentTraceRender {
     envelope: Vec<f32>,
     fade: f32,
+    vertical_offset_rows: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -734,6 +760,288 @@ struct AccentTriggerThresholds {
     flux: f32,
     rise: f32,
     ratio: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MikuPixel {
+    red: u8,
+    green: u8,
+    blue: u8,
+    alpha: u8,
+}
+
+#[derive(Clone, Debug)]
+struct MikuFrame {
+    width: usize,
+    height: usize,
+    pixels: Vec<MikuPixel>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MikuAnimation {
+    width: usize,
+    height: usize,
+    total_duration_ms: u64,
+    frames: Vec<MikuFrame>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MikuSample {
+    red: u8,
+    green: u8,
+    blue: u8,
+    alpha: f32,
+}
+
+impl MikuAnimation {
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut options = gif::DecodeOptions::new();
+        options.set_color_output(gif::ColorOutput::RGBA);
+        let mut reader = options.read_info(Cursor::new(bytes)).ok()?;
+        let width = reader.width() as usize;
+        let height = reader.height() as usize;
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        let mut canvas = vec![MikuPixel::default(); width * height];
+        let mut frames = Vec::new();
+        let mut total_duration_ms = 0_u64;
+
+        while let Some(frame) = reader.read_next_frame().ok()? {
+            let before_frame = canvas.clone();
+            composite_miku_frame(&mut canvas, width, height, frame);
+            let delay_ms = (frame.delay as u64).max(2) * 10;
+            let mut pixels = canvas.clone();
+            remove_miku_outer_matte(&mut pixels, width, height);
+            total_duration_ms += delay_ms;
+            frames.push(MikuFrame {
+                width,
+                height,
+                pixels,
+            });
+
+            match frame.dispose {
+                gif::DisposalMethod::Background => {
+                    clear_miku_frame_rect(&mut canvas, width, height, frame);
+                }
+                gif::DisposalMethod::Previous => {
+                    canvas = before_frame;
+                }
+                _ => {}
+            }
+        }
+
+        if frames.is_empty() {
+            None
+        } else {
+            Some(Self {
+                width,
+                height,
+                total_duration_ms: total_duration_ms.max(1),
+                frames,
+            })
+        }
+    }
+
+    fn frame_at_phase(&self, phase: f32) -> Option<&MikuFrame> {
+        if self.frames.is_empty() {
+            return None;
+        }
+
+        let index = phase.floor().max(0.0) as usize % self.frames.len();
+        self.frames.get(index)
+    }
+}
+
+fn miku_animation() -> &'static MikuAnimation {
+    static ANIMATION: OnceLock<MikuAnimation> = OnceLock::new();
+    ANIMATION.get_or_init(|| MikuAnimation::decode(MIKU_GIF).unwrap_or_default())
+}
+
+fn composite_miku_frame(
+    canvas: &mut [MikuPixel],
+    canvas_width: usize,
+    canvas_height: usize,
+    frame: &gif::Frame<'_>,
+) {
+    let frame_width = frame.width as usize;
+    let frame_height = frame.height as usize;
+    let left = frame.left as usize;
+    let top = frame.top as usize;
+    let buffer = frame.buffer.as_ref();
+
+    for y in 0..frame_height {
+        let canvas_y = top + y;
+        if canvas_y >= canvas_height {
+            continue;
+        }
+
+        for x in 0..frame_width {
+            let canvas_x = left + x;
+            if canvas_x >= canvas_width {
+                continue;
+            }
+
+            let source_index = (y * frame_width + x) * 4;
+            if source_index + 3 >= buffer.len() {
+                continue;
+            }
+
+            let source = MikuPixel {
+                red: buffer[source_index],
+                green: buffer[source_index + 1],
+                blue: buffer[source_index + 2],
+                alpha: buffer[source_index + 3],
+            };
+            if source.alpha == 0 {
+                continue;
+            }
+
+            let target_index = canvas_y * canvas_width + canvas_x;
+            canvas[target_index] = alpha_blend_pixel(canvas[target_index], source);
+        }
+    }
+}
+
+fn clear_miku_frame_rect(
+    canvas: &mut [MikuPixel],
+    canvas_width: usize,
+    canvas_height: usize,
+    frame: &gif::Frame<'_>,
+) {
+    let frame_width = frame.width as usize;
+    let frame_height = frame.height as usize;
+    let left = frame.left as usize;
+    let top = frame.top as usize;
+
+    for y in top..(top + frame_height).min(canvas_height) {
+        for x in left..(left + frame_width).min(canvas_width) {
+            canvas[y * canvas_width + x] = MikuPixel::default();
+        }
+    }
+}
+
+fn remove_miku_outer_matte(pixels: &mut [MikuPixel], width: usize, height: usize) {
+    if pixels.len() != width.saturating_mul(height) || width == 0 || height == 0 {
+        return;
+    }
+
+    let mut visited = vec![false; pixels.len()];
+    let mut queue = VecDeque::new();
+    for x in 0..width {
+        enqueue_miku_matte_pixel(pixels, &mut visited, &mut queue, x, 0, width);
+        enqueue_miku_matte_pixel(
+            pixels,
+            &mut visited,
+            &mut queue,
+            x,
+            height.saturating_sub(1),
+            width,
+        );
+    }
+    for y in 0..height {
+        enqueue_miku_matte_pixel(pixels, &mut visited, &mut queue, 0, y, width);
+        enqueue_miku_matte_pixel(
+            pixels,
+            &mut visited,
+            &mut queue,
+            width.saturating_sub(1),
+            y,
+            width,
+        );
+    }
+
+    while let Some(index) = queue.pop_front() {
+        let x = index % width;
+        let y = index / width;
+        for (dx, dy) in [(1_isize, 0_isize), (-1, 0), (0, 1), (0, -1)] {
+            let next_x = x as isize + dx;
+            let next_y = y as isize + dy;
+            if next_x < 0 || next_y < 0 || next_x >= width as isize || next_y >= height as isize {
+                continue;
+            }
+
+            enqueue_miku_matte_pixel(
+                pixels,
+                &mut visited,
+                &mut queue,
+                next_x as usize,
+                next_y as usize,
+                width,
+            );
+        }
+    }
+
+    for (index, pixel) in pixels.iter_mut().enumerate() {
+        if visited[index] && pixel.alpha > 0 {
+            *pixel = MikuPixel::default();
+        }
+    }
+}
+
+fn enqueue_miku_matte_pixel(
+    pixels: &[MikuPixel],
+    visited: &mut [bool],
+    queue: &mut VecDeque<usize>,
+    x: usize,
+    y: usize,
+    width: usize,
+) {
+    let index = y * width + x;
+    if visited.get(index).copied().unwrap_or(true) {
+        return;
+    }
+    let Some(pixel) = pixels.get(index).copied() else {
+        return;
+    };
+    if !is_miku_background_or_matte(pixel) {
+        return;
+    }
+
+    visited[index] = true;
+    queue.push_back(index);
+}
+
+fn is_miku_background_or_matte(pixel: MikuPixel) -> bool {
+    if pixel.alpha == 0 {
+        return true;
+    }
+
+    let max = pixel.red.max(pixel.green).max(pixel.blue) as i16;
+    let min = pixel.red.min(pixel.green).min(pixel.blue) as i16;
+    let saturation = max - min;
+    let luma = 0.299 * pixel.red as f32 + 0.587 * pixel.green as f32 + 0.114 * pixel.blue as f32;
+
+    luma > 165.0 && saturation < 55
+}
+
+fn alpha_blend_pixel(destination: MikuPixel, source: MikuPixel) -> MikuPixel {
+    if source.alpha == u8::MAX {
+        return source;
+    }
+
+    let source_alpha = source.alpha as f32 / 255.0;
+    let destination_alpha = destination.alpha as f32 / 255.0;
+    let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
+    if output_alpha <= f32::EPSILON {
+        return MikuPixel::default();
+    }
+
+    let blend_channel = |source: u8, destination: u8| {
+        ((source as f32 * source_alpha
+            + destination as f32 * destination_alpha * (1.0 - source_alpha))
+            / output_alpha)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+
+    MikuPixel {
+        red: blend_channel(source.red, destination.red),
+        green: blend_channel(source.green, destination.green),
+        blue: blend_channel(source.blue, destination.blue),
+        alpha: (output_alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -862,6 +1170,8 @@ impl App {
             spectrum_trail: vec![0.0; bar_count],
             pending_accent_trace: None,
             accent_traces: Vec::new(),
+            miku_trigger_times: VecDeque::new(),
+            miku_frame_phase: 0.0,
             accent_energy_baseline: 0.0,
             accent_trace_cooldown: Duration::from_millis(0),
             color_state: VisualColorState::default(),
@@ -894,6 +1204,7 @@ impl App {
     }
 
     fn tick(&mut self, elapsed: Duration) {
+        self.advance_miku_animation(elapsed);
         if self.capture_state == CaptureState::Running {
             self.advance_accent_traces(elapsed);
             if let Some(last) = self.last_samples_at {
@@ -904,12 +1215,48 @@ impl App {
         }
     }
 
+    fn advance_miku_animation(&mut self, elapsed: Duration) {
+        let fps = self.miku_playback_fps();
+        self.miku_frame_phase =
+            (self.miku_frame_phase + elapsed.as_secs_f32() * fps).rem_euclid(1_000_000.0);
+    }
+
+    fn miku_playback_fps(&self) -> f32 {
+        MIKU_BASE_FPS * (1.0 + MIKU_TRIGGER_SPEED_STEP * self.recent_miku_trigger_count() as f32)
+    }
+
+    fn recent_miku_trigger_count(&self) -> usize {
+        let window = Duration::from_millis(MIKU_TRIGGER_WINDOW_MS);
+        self.miku_trigger_times
+            .iter()
+            .filter(|triggered_at| triggered_at.elapsed() <= window)
+            .count()
+    }
+
+    fn record_miku_trigger(&mut self) {
+        self.miku_trigger_times.push_back(Instant::now());
+        self.prune_miku_trigger_times();
+    }
+
+    fn prune_miku_trigger_times(&mut self) {
+        let window = Duration::from_millis(MIKU_TRIGGER_WINDOW_MS);
+        while self
+            .miku_trigger_times
+            .front()
+            .map(|triggered_at| triggered_at.elapsed() > window)
+            .unwrap_or(false)
+        {
+            self.miku_trigger_times.pop_front();
+        }
+    }
+
     fn advance_accent_traces(&mut self, elapsed: Duration) {
         let lifetime = Duration::from_millis(ACCENT_TRACE_LIFETIME_MS);
         for trace in &mut self.accent_traces {
             trace.age += elapsed;
         }
         self.accent_traces.retain(|trace| trace.age < lifetime);
+        self.prune_miku_trigger_times();
         self.accent_trace_cooldown = self
             .accent_trace_cooldown
             .checked_sub(elapsed)
@@ -1113,6 +1460,7 @@ impl App {
             envelope: bars.to_vec(),
             age: Duration::from_millis(0),
         });
+        self.record_miku_trigger();
     }
 
     fn audio_delay_duration(&self) -> Duration {
@@ -1877,6 +2225,7 @@ enum ColorMode {
     Aurora,
     SonicTexture,
     NoiseWarp,
+    Miku,
 }
 
 fn theme(id: ThemeId) -> Theme {
@@ -1950,6 +2299,17 @@ fn theme(id: ThemeId) -> Theme {
             mid: Color::LightBlue,
             high: Color::White,
             color_mode: ColorMode::NoiseWarp,
+        },
+        ThemeId::Miku => Theme {
+            title_key: "theme_miku",
+            accent: Color::LightCyan,
+            text: Color::Gray,
+            muted: Color::DarkGray,
+            border: Color::DarkGray,
+            low: Color::Cyan,
+            mid: Color::LightCyan,
+            high: Color::White,
+            color_mode: ColorMode::Miku,
         },
         ThemeId::Amber => Theme {
             title_key: "theme_amber",
@@ -2722,6 +3082,7 @@ fn music_color_for_position_at(
         ColorMode::NoiseWarp => {
             noise_warp_theme_color(theme, state, position, intensity, height_ratio, trail)
         }
+        ColorMode::Miku => miku_theme_color(theme, intensity, height_ratio, trail),
     }
 }
 
@@ -2976,6 +3337,205 @@ fn blend_color(from: Color, to: Color, amount: f32) -> Color {
     )
 }
 
+fn miku_block_sample(
+    app: &App,
+    virtual_width: usize,
+    virtual_height: usize,
+    col: usize,
+    row: usize,
+) -> Option<MikuSample> {
+    miku_cell_sample(
+        app,
+        virtual_width,
+        virtual_height,
+        col,
+        row,
+        1,
+        1,
+        TERMINAL_CELL_ASPECT,
+    )
+    .map(|(_, sample)| sample)
+}
+
+fn miku_braille_sample(
+    app: &App,
+    virtual_width: usize,
+    virtual_height: usize,
+    cell_col: usize,
+    cell_row: usize,
+) -> Option<(u8, MikuSample)> {
+    miku_cell_sample(
+        app,
+        virtual_width,
+        virtual_height,
+        cell_col * 2,
+        cell_row * 4,
+        2,
+        4,
+        1.0,
+    )
+}
+
+fn miku_cell_sample(
+    app: &App,
+    virtual_width: usize,
+    virtual_height: usize,
+    base_x: usize,
+    base_y: usize,
+    dot_width: usize,
+    dot_height: usize,
+    x_aspect: f32,
+) -> Option<(u8, MikuSample)> {
+    let frame = miku_animation().frame_at_phase(app.miku_frame_phase)?;
+    let mut mask = 0_u8;
+    let mut alpha_sum = 0.0_f32;
+    let mut red_sum = 0.0_f32;
+    let mut green_sum = 0.0_f32;
+    let mut blue_sum = 0.0_f32;
+    let dot_count = (dot_width * dot_height).max(1) as f32;
+
+    for dot_col in 0..dot_width {
+        for dot_row in 0..dot_height {
+            let Some(sample) = miku_virtual_sample(
+                frame,
+                virtual_width,
+                virtual_height,
+                base_x + dot_col,
+                base_y + dot_row,
+                x_aspect,
+            ) else {
+                continue;
+            };
+            if sample.alpha <= 0.02 {
+                continue;
+            }
+
+            alpha_sum += sample.alpha;
+            red_sum += sample.red as f32 * sample.alpha;
+            green_sum += sample.green as f32 * sample.alpha;
+            blue_sum += sample.blue as f32 * sample.alpha;
+
+            if sample.alpha > 0.08 {
+                if dot_width == 2 && dot_height == 4 {
+                    mask |= BRAILLE_DOT_BITS[dot_col][dot_row];
+                } else {
+                    mask = u8::MAX;
+                }
+            }
+        }
+    }
+
+    if alpha_sum <= 0.02 || mask == 0 {
+        return None;
+    }
+
+    Some((
+        mask,
+        MikuSample {
+            red: (red_sum / alpha_sum).round().clamp(0.0, 255.0) as u8,
+            green: (green_sum / alpha_sum).round().clamp(0.0, 255.0) as u8,
+            blue: (blue_sum / alpha_sum).round().clamp(0.0, 255.0) as u8,
+            alpha: (alpha_sum / dot_count).clamp(0.0, 1.0),
+        },
+    ))
+}
+
+fn miku_virtual_sample(
+    frame: &MikuFrame,
+    virtual_width: usize,
+    virtual_height: usize,
+    virtual_x: usize,
+    virtual_y: usize,
+    x_aspect: f32,
+) -> Option<MikuSample> {
+    let (left, top, scale) = miku_layout(frame, virtual_width, virtual_height, x_aspect)?;
+    let x = virtual_x as f32 + 0.5;
+    let y = virtual_y as f32 + 0.5;
+    let right = left + frame.width as f32 * scale / x_aspect.max(f32::EPSILON);
+    let bottom = top + frame.height as f32 * scale;
+    if x < left || x >= right || y < top || y >= bottom {
+        return None;
+    }
+
+    let source_x = ((x - left) * x_aspect.max(f32::EPSILON) / scale).floor() as usize;
+    let source_y = ((y - top) / scale).floor() as usize;
+    let source_x = source_x.min(frame.width.saturating_sub(1));
+    let source_y = source_y.min(frame.height.saturating_sub(1));
+    let pixel = frame
+        .pixels
+        .get(source_y * frame.width + source_x)
+        .copied()?;
+    if pixel.alpha == 0 {
+        return None;
+    }
+
+    Some(MikuSample {
+        red: pixel.red,
+        green: pixel.green,
+        blue: pixel.blue,
+        alpha: pixel.alpha as f32 / 255.0,
+    })
+}
+
+fn miku_layout(
+    frame: &MikuFrame,
+    virtual_width: usize,
+    virtual_height: usize,
+    x_aspect: f32,
+) -> Option<(f32, f32, f32)> {
+    if frame.width == 0 || frame.height == 0 || virtual_width == 0 || virtual_height == 0 {
+        return None;
+    }
+
+    let x_aspect = x_aspect.max(f32::EPSILON);
+    let scale = (virtual_width as f32 * x_aspect / frame.width as f32)
+        .min(virtual_height as f32 / frame.height as f32);
+    if scale <= f32::EPSILON {
+        return None;
+    }
+
+    let scaled_width = frame.width as f32 * scale / x_aspect;
+    let scaled_height = frame.height as f32 * scale;
+    Some((
+        (virtual_width as f32 - scaled_width) * 0.5,
+        (virtual_height as f32 - scaled_height) * 0.5,
+        scale,
+    ))
+}
+
+fn miku_background_color(theme: Theme, sample: MikuSample) -> Color {
+    let background = accent_trace_background_color(theme);
+    let image = Color::Rgb(sample.red, sample.green, sample.blue);
+    blend_color(background, image, 0.12 + sample.alpha * 0.24)
+}
+
+fn miku_highlight_color(theme: Theme, sample: MikuSample, intensity: f32, trail: bool) -> Color {
+    let background = accent_trace_background_color(theme);
+    let image = Color::Rgb(sample.red, sample.green, sample.blue);
+    let lit = blend_color(image, theme.high, if trail { 0.04 } else { 0.10 });
+    let amount = if trail {
+        0.42 + sample.alpha * 0.18
+    } else {
+        0.58 + sample.alpha * 0.24 + intensity.clamp(0.0, 1.0) * 0.12
+    };
+
+    blend_color(background, lit, amount)
+}
+
+fn miku_theme_color(theme: Theme, intensity: f32, height_ratio: f32, trail: bool) -> Color {
+    let intensity = intensity.clamp(0.0, 1.0);
+    let height_ratio = height_ratio.clamp(0.0, 1.0);
+    let base = blend_color(theme.border, theme.accent, 0.18 + intensity * 0.50);
+    let glow = blend_color(base, theme.high, (intensity - 0.78).max(0.0) * 0.70);
+    let color = blend_color(base, glow, 0.35 + height_ratio * 0.20);
+
+    if trail {
+        blend_color(theme.border, color, 0.38 + intensity * 0.18)
+    } else {
+        blend_color(theme.border, color, 0.34 + intensity * 0.52)
+    }
+}
+
 fn aurora_color(
     theme: Theme,
     state: VisualColorState,
@@ -3195,6 +3755,7 @@ fn draw_block_spectrum(frame: &mut Frame, app: &App, area: Rect) {
     let virtual_width = area.width as usize * 2;
     let virtual_height = chart_height * 4;
     let accent_traces = display_accent_traces(app, virtual_width);
+    let miku_enabled = theme.color_mode == ColorMode::Miku;
     let mut lines = Vec::with_capacity(chart_height);
 
     for row in 0..chart_height {
@@ -3216,33 +3777,45 @@ fn draw_block_spectrum(frame: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or(0.0);
             let filled = value >= threshold;
             let trail_filled = !filled && trail_value > value && trail_value >= threshold;
+            let miku_sample = if miku_enabled {
+                miku_block_sample(app, bars.len(), chart_height, index, row)
+            } else {
+                None
+            };
             let base_symbol = if filled {
                 "█".to_string()
             } else if trail_filled {
                 "░".to_string()
+            } else if miku_sample.is_some() {
+                "█".to_string()
             } else {
                 " ".to_string()
             };
             let base_color = if filled {
-                Some(spectrum_bar_color_at(
-                    app,
-                    index,
-                    bars.len(),
-                    value,
-                    threshold,
-                    false,
-                ))
+                Some(
+                    miku_sample
+                        .map(|sample| miku_highlight_color(theme, sample, value, false))
+                        .unwrap_or_else(|| {
+                            spectrum_bar_color_at(app, index, bars.len(), value, threshold, false)
+                        }),
+                )
             } else if trail_filled {
-                Some(spectrum_bar_color_at(
-                    app,
-                    index,
-                    bars.len(),
-                    trail_value,
-                    threshold,
-                    true,
-                ))
+                Some(
+                    miku_sample
+                        .map(|sample| miku_highlight_color(theme, sample, trail_value, true))
+                        .unwrap_or_else(|| {
+                            spectrum_bar_color_at(
+                                app,
+                                index,
+                                bars.len(),
+                                trail_value,
+                                threshold,
+                                true,
+                            )
+                        }),
+                )
             } else {
-                None
+                miku_sample.map(|sample| miku_background_color(theme, sample))
             };
             let (symbol, color) = if let Some(overlay) = accent_trace {
                 if let Some(base_color) = base_color {
@@ -3287,6 +3860,7 @@ fn draw_braille_spectrum(frame: &mut Frame, app: &App, area: Rect) {
         Vec::new()
     };
     let accent_traces = display_accent_traces(app, virtual_width);
+    let miku_enabled = theme.color_mode == ColorMode::Miku;
     let mut lines = Vec::with_capacity(chart_height);
 
     for row in 0..chart_height {
@@ -3304,24 +3878,48 @@ fn draw_braille_spectrum(frame: &mut Frame, app: &App, area: Rect) {
                 virtual_height,
             );
             let combined_mask = mask | (trail_mask & !mask);
+            let miku_sample = if miku_enabled {
+                miku_braille_sample(app, virtual_width, virtual_height, col, row)
+            } else {
+                None
+            };
             if let Some(overlay) = accent_trace {
                 if combined_mask == 0 {
+                    let background_mask = miku_sample
+                        .map(|(background_mask, _)| background_mask)
+                        .unwrap_or(0);
+                    let background_color =
+                        miku_sample.map(|(_, sample)| miku_background_color(theme, sample));
                     spans.push(Span::styled(
-                        braille_pattern(overlay.mask).to_string(),
-                        Style::default().fg(accent_trace_overlay_color(theme, None, overlay)),
+                        braille_pattern(overlay.mask | background_mask).to_string(),
+                        Style::default().fg(accent_trace_overlay_color(
+                            theme,
+                            background_color,
+                            overlay,
+                        )),
                     ));
                 } else {
                     let base_color = if mask == 0 {
-                        theme.border
+                        miku_sample
+                            .map(|(_, sample)| {
+                                miku_highlight_color(theme, sample, trail_value, true)
+                            })
+                            .unwrap_or(theme.border)
                     } else {
-                        spectrum_bar_color_at(
-                            app,
-                            col * 2,
-                            virtual_width,
-                            value.max(trail_value),
-                            height_ratio,
-                            false,
-                        )
+                        miku_sample
+                            .map(|(_, sample)| {
+                                miku_highlight_color(theme, sample, value.max(trail_value), false)
+                            })
+                            .unwrap_or_else(|| {
+                                spectrum_bar_color_at(
+                                    app,
+                                    col * 2,
+                                    virtual_width,
+                                    value.max(trail_value),
+                                    height_ratio,
+                                    false,
+                                )
+                            })
                     };
                     spans.push(Span::styled(
                         braille_pattern(combined_mask | overlay.mask).to_string(),
@@ -3333,19 +3931,34 @@ fn draw_braille_spectrum(frame: &mut Frame, app: &App, area: Rect) {
                     ));
                 }
             } else if combined_mask == 0 {
-                spans.push(Span::raw(" "));
+                if let Some((background_mask, sample)) = miku_sample {
+                    spans.push(Span::styled(
+                        braille_pattern(background_mask).to_string(),
+                        Style::default().fg(miku_background_color(theme, sample)),
+                    ));
+                } else {
+                    spans.push(Span::raw(" "));
+                }
             } else {
                 let color = if mask == 0 {
-                    theme.border
+                    miku_sample
+                        .map(|(_, sample)| miku_highlight_color(theme, sample, trail_value, true))
+                        .unwrap_or(theme.border)
                 } else {
-                    spectrum_bar_color_at(
-                        app,
-                        col * 2,
-                        virtual_width,
-                        value.max(trail_value),
-                        height_ratio,
-                        false,
-                    )
+                    miku_sample
+                        .map(|(_, sample)| {
+                            miku_highlight_color(theme, sample, value.max(trail_value), false)
+                        })
+                        .unwrap_or_else(|| {
+                            spectrum_bar_color_at(
+                                app,
+                                col * 2,
+                                virtual_width,
+                                value.max(trail_value),
+                                height_ratio,
+                                false,
+                            )
+                        })
                 };
                 spans.push(Span::styled(
                     braille_pattern(combined_mask).to_string(),
@@ -3531,7 +4144,11 @@ fn display_accent_traces(app: &App, virtual_width: usize) -> Vec<AccentTraceRend
                 .collect();
             smooth_accent_trace_envelope(&mut envelope);
 
-            Some(AccentTraceRender { envelope, fade })
+            Some(AccentTraceRender {
+                envelope,
+                fade,
+                vertical_offset_rows: trace.vertical_offset_rows(),
+            })
         })
         .collect()
 }
@@ -3580,8 +4197,13 @@ fn accent_trace_overlay_cell(
     let mut color = theme.accent;
 
     for trace in traces {
-        let (mask, value) =
-            accent_trace_braille_cell(&trace.envelope, cell_col, cell_row, virtual_height);
+        let (mask, value) = accent_trace_braille_cell(
+            &trace.envelope,
+            cell_col,
+            cell_row,
+            virtual_height,
+            trace.vertical_offset_rows,
+        );
         if mask == 0 {
             continue;
         }
@@ -3630,6 +4252,7 @@ fn accent_trace_braille_cell(
     cell_col: usize,
     cell_row: usize,
     virtual_height: usize,
+    vertical_offset_rows: f32,
 ) -> (u8, f32) {
     let mut mask = 0;
     let mut cell_value = 0.0_f32;
@@ -3644,7 +4267,7 @@ fn accent_trace_braille_cell(
             continue;
         }
 
-        let virtual_row = accent_trace_virtual_row(value, virtual_height);
+        let virtual_row = accent_trace_virtual_row(value, virtual_height, vertical_offset_rows);
         let mut start_row = virtual_row;
         let mut end_row = virtual_row;
         let mut segment_value = value;
@@ -3653,7 +4276,8 @@ fn accent_trace_braille_cell(
             if let Some(previous) = envelope.get(bar_index - 1).copied() {
                 let previous = previous.clamp(0.0, 1.0);
                 if previous > 0.0 {
-                    let previous_row = accent_trace_virtual_row(previous, virtual_height);
+                    let previous_row =
+                        accent_trace_virtual_row(previous, virtual_height, vertical_offset_rows);
                     start_row = start_row.min(previous_row);
                     end_row = end_row.max(previous_row);
                     segment_value = segment_value.max(previous);
@@ -3672,14 +4296,14 @@ fn accent_trace_braille_cell(
     (mask, cell_value)
 }
 
-fn accent_trace_virtual_row(value: f32, virtual_height: usize) -> usize {
+fn accent_trace_virtual_row(value: f32, virtual_height: usize, vertical_offset_rows: f32) -> usize {
     if virtual_height == 0 {
         return 0;
     }
 
     let max_row = virtual_height.saturating_sub(1) as i32;
-    let offset = (ACCENT_TRACE_VERTICAL_OFFSET_CELLS * 4) as i32;
-    let row = ((1.0 - value.clamp(0.0, 1.0)) * max_row as f32).round() as i32 - offset;
+    let row =
+        ((1.0 - value.clamp(0.0, 1.0)) * max_row as f32 - vertical_offset_rows).round() as i32;
     row.clamp(0, max_row) as usize
 }
 
@@ -4442,6 +5066,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "theme_aurora") => "奥罗拉",
         (Lang::Zh, "theme_sonic_texture") => "音纹场",
         (Lang::Zh, "theme_noise_warp") => "流纹噪声",
+        (Lang::Zh, "theme_miku") => "初音",
         (Lang::Zh, "theme_amber") => "琥珀",
         (Lang::Zh, "theme_mono") => "单色",
         (Lang::Zh, "renderer_blocks") => "方块",
@@ -4533,6 +5158,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "theme_aurora") => "Aurora",
         (Lang::En, "theme_sonic_texture") => "Sonic Texture",
         (Lang::En, "theme_noise_warp") => "Noise Warp",
+        (Lang::En, "theme_miku") => "Miku",
         (Lang::En, "theme_amber") => "Amber",
         (Lang::En, "theme_mono") => "Mono",
         (Lang::En, "renderer_blocks") => "Blocks",
@@ -4624,6 +5250,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "theme_aurora") => "オーロラ",
         (Lang::Ja, "theme_sonic_texture") => "音紋フィールド",
         (Lang::Ja, "theme_noise_warp") => "ノイズワープ",
+        (Lang::Ja, "theme_miku") => "ミク",
         (Lang::Ja, "theme_amber") => "アンバー",
         (Lang::Ja, "theme_mono") => "モノ",
         (Lang::Ja, "renderer_blocks") => "ブロック",
@@ -4825,10 +5452,142 @@ mod tests {
             ColorMode::SonicTexture
         );
         assert_eq!(theme(ThemeId::NoiseWarp).color_mode, ColorMode::NoiseWarp);
+        assert_eq!(theme(ThemeId::Miku).color_mode, ColorMode::Miku);
         assert!(!THEMES.contains(&ThemeId::PitchClass));
         assert!(!THEMES.contains(&ThemeId::ChromaBands));
         assert!(!THEMES.contains(&ThemeId::PitchMemory));
         assert!(!THEMES.contains(&ThemeId::HarmonicComb));
+    }
+
+    #[test]
+    fn miku_animation_decodes_bundled_gif_frames() {
+        let animation = miku_animation();
+
+        assert_eq!(animation.width, 153);
+        assert_eq!(animation.height, 200);
+        assert!(animation.frames.len() >= 4);
+        assert!(animation.total_duration_ms >= 100);
+        assert!(animation.frames.iter().all(|frame| {
+            frame.width == animation.width
+                && frame.height == animation.height
+                && frame.pixels.len() == animation.width * animation.height
+        }));
+    }
+
+    #[test]
+    fn miku_outer_matte_cleanup_removes_connected_light_border_only() {
+        let matte = MikuPixel {
+            red: 230,
+            green: 230,
+            blue: 228,
+            alpha: 255,
+        };
+        let dark = MikuPixel {
+            red: 20,
+            green: 24,
+            blue: 28,
+            alpha: 255,
+        };
+        let mut pixels = vec![MikuPixel::default(); 25];
+        for x in 0..5 {
+            pixels[x] = matte;
+        }
+        pixels[1 + 5] = matte;
+        pixels[2 + 2 * 5] = matte;
+        pixels[1 + 2 * 5] = dark;
+        pixels[3 + 2 * 5] = dark;
+        pixels[2 + 5] = dark;
+        pixels[2 + 3 * 5] = dark;
+
+        remove_miku_outer_matte(&mut pixels, 5, 5);
+
+        assert_eq!(pixels[0].alpha, 0);
+        assert_eq!(pixels[1 + 5].alpha, 0);
+        assert_eq!(pixels[2 + 2 * 5].alpha, 255);
+    }
+
+    #[test]
+    fn miku_frames_do_not_keep_exterior_light_matte_pixels() {
+        let frame = miku_animation().frames.first().expect("miku frame exists");
+        let mut connected = frame.pixels.clone();
+        remove_miku_outer_matte(&mut connected, frame.width, frame.height);
+
+        assert_eq!(connected, frame.pixels);
+    }
+
+    #[test]
+    fn miku_layout_contain_scales_without_overflow() {
+        let frame = miku_animation().frames.first().expect("miku frame exists");
+        let (left, top, scale) = miku_layout(frame, 80, 32, 1.0).expect("layout should fit");
+        let right = left + frame.width as f32 * scale;
+        let bottom = top + frame.height as f32 * scale;
+
+        assert!(left >= 0.0);
+        assert!(top >= 0.0);
+        assert!(right <= 80.0 + 0.001);
+        assert!(bottom <= 32.0 + 0.001);
+    }
+
+    #[test]
+    fn miku_block_layout_accounts_for_terminal_cell_aspect() {
+        let frame = miku_animation().frames.first().expect("miku frame exists");
+        let (_, _, scale) =
+            miku_layout(frame, 80, 32, TERMINAL_CELL_ASPECT).expect("layout should fit");
+        let physical_width = frame.width as f32 * scale;
+        let physical_height = frame.height as f32 * scale;
+        let physical_ratio = physical_width / physical_height;
+        let source_ratio = frame.width as f32 / frame.height as f32;
+
+        assert!((physical_ratio - source_ratio).abs() < 0.001);
+    }
+
+    #[test]
+    fn miku_theme_fallback_color_does_not_rainbow_by_position() {
+        let mut app = App::new(Config::default());
+        app.theme_id = ThemeId::Miku;
+        app.color_state = VisualColorState {
+            centroid: 0.90,
+            energy: 0.80,
+            flux: 0.70,
+            phase: 0.48,
+            ..VisualColorState::default()
+        };
+
+        let left = music_color_for_position_at(&app, 0.10, 0.72, 0.50, false);
+        let right = music_color_for_position_at(&app, 0.90, 0.72, 0.50, false);
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn miku_playback_fps_scales_with_recent_accent_triggers() {
+        let mut app = App::new(Config::default());
+        let now = Instant::now();
+        app.miku_trigger_times
+            .push_back(now - Duration::from_millis(500));
+        app.miku_trigger_times
+            .push_back(now - Duration::from_millis(2_500));
+        app.miku_trigger_times
+            .push_back(now - Duration::from_millis(3_500));
+
+        assert_eq!(
+            app.miku_playback_fps(),
+            MIKU_BASE_FPS * (1.0 + MIKU_TRIGGER_SPEED_STEP * 2.0)
+        );
+    }
+
+    #[test]
+    fn miku_animation_phase_advances_at_trigger_scaled_fps() {
+        let mut app = App::new(Config::default());
+
+        app.advance_miku_animation(Duration::from_millis(200));
+
+        assert!((app.miku_frame_phase - 1.0).abs() < 0.001);
+
+        app.miku_trigger_times.push_back(Instant::now());
+        app.advance_miku_animation(Duration::from_millis(100));
+
+        assert!((app.miku_frame_phase - 1.6).abs() < 0.001);
     }
 
     #[test]
@@ -5031,9 +5790,10 @@ mod tests {
     #[test]
     fn accent_trace_line_shifts_envelope_up_five_cells() {
         let envelope = vec![0.50, 0.50];
+        let final_offset = ACCENT_TRACE_END_OFFSET_CELLS * 4.0;
 
-        let (shifted_mask, value) = accent_trace_braille_cell(&envelope, 0, 1, 48);
-        let (lower_cell_mask, _) = accent_trace_braille_cell(&envelope, 0, 6, 48);
+        let (shifted_mask, value) = accent_trace_braille_cell(&envelope, 0, 1, 48, final_offset);
+        let (lower_cell_mask, _) = accent_trace_braille_cell(&envelope, 0, 6, 48, final_offset);
 
         assert_eq!(shifted_mask, 0x09);
         assert_eq!(value, 0.50);
@@ -5041,10 +5801,33 @@ mod tests {
     }
 
     #[test]
+    fn accent_trace_line_animates_from_one_to_five_cells_up() {
+        let envelope = vec![0.50, 0.50];
+        let mut trace = AccentTrace {
+            envelope: envelope.clone(),
+            age: Duration::from_millis(0),
+        };
+
+        let start_offset = trace.vertical_offset_rows();
+        let (start_mask, _) = accent_trace_braille_cell(&envelope, 0, 5, 48, start_offset);
+        trace.age = Duration::from_millis(ACCENT_TRACE_OFFSET_ANIMATION_MS / 2);
+        let mid_offset = trace.vertical_offset_rows();
+        trace.age = Duration::from_millis(ACCENT_TRACE_OFFSET_ANIMATION_MS);
+        let end_offset = trace.vertical_offset_rows();
+
+        assert_eq!(start_mask, 0x09);
+        assert!((start_offset - ACCENT_TRACE_START_OFFSET_CELLS * 4.0).abs() < 0.001);
+        assert!(mid_offset > start_offset);
+        assert!(mid_offset < end_offset);
+        assert!((end_offset - ACCENT_TRACE_END_OFFSET_CELLS * 4.0).abs() < 0.001);
+    }
+
+    #[test]
     fn accent_trace_line_interpolates_large_vertical_jumps() {
         let envelope = vec![0.90, 0.10];
+        let final_offset = ACCENT_TRACE_END_OFFSET_CELLS * 4.0;
 
-        let (middle_mask, value) = accent_trace_braille_cell(&envelope, 0, 3, 40);
+        let (middle_mask, value) = accent_trace_braille_cell(&envelope, 0, 3, 40, final_offset);
 
         assert_ne!(middle_mask & 0x38, 0);
         assert_eq!(value, 0.90);
