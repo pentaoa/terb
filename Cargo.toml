@@ -1,0 +1,19 @@
+[package]
+name = "terb"
+version = "0.1.0"
+edition = "2021"
+description = "A restrained terminal system-audio spectrum visualizer for macOS."
+license = "MIT"
+readme = "README.md"
+keywords = ["tui", "audio", "spectrum", "macos", "terminal"]
+categories = ["command-line-utilities", "multimedia::audio"]
+build = "build.rs"
+
+[dependencies]
+crossterm = "0.29"
+ratatui = "0.30"
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
