@@ -32,14 +32,19 @@ On first capture, macOS may ask for Screen & System Audio Recording permission. 
 - `?`: help.
 - `q` or `Esc` on the main menu: quit.
 
-Refresh rate is adjustable in Settings: 24, 30, 45, 60, 90, or 120 Hz.
+Refresh rate is adjustable in Settings: 24, 30, 45, 60, 90, 120, or 144 Hz.
 
 Spectrum rendering and processing are also adjustable from the sidebar or settings panel:
 renderer mode (blocks or Braille), frequency bands,
-FFT size, high-shelf compensation, shelf gain, height curve, curve power, and limiter ceiling.
+FFT size, high-shelf compensation, shelf gain, height curve, curve power,
+spectrum trail, trail decay, accent trace, accent threshold, and limiter ceiling.
+Accent trace detects sudden spectrum-energy lifts using the adjustable accent threshold, waits for the rise to settle, captures a low-pass-smoothed peak envelope, shifts it upward by five terminal cells, and renders an interpolated Braille line that fades toward the background over 0.5 seconds. A new accent replaces the previous visible trace.
+Music-reactive themes include Aurora, Sonic Texture, and Noise Warp. Aurora follows frequency position, spectrum energy, centroid, and transient flux. Sonic Texture samples a pitch-stable two-dimensional color field inside each Braille cell, while Noise Warp layers fBM noise, contour lines, and domain warping for broader procedural texture. Their color drivers are time-smoothed so pitch and transient changes move without harsh jumps.
 The limiter ceiling controls analysis headroom; the meter still maps that ceiling to full height.
 Audio delay is also part of the processing view, so it can be adjusted live from the keyboard or the settings list.
 
 The Spectrum view is module-based: large terminals can show settings, pipeline, toolbar, waveform, and a right-side stereo master meter at the same time. Small terminals automatically hide side modules and keep the spectrum readable.
+The waveform module always renders with Braille subpixels, sampling two virtual columns and four virtual rows per terminal cell.
+The master meter also renders with Braille subpixels, softly fading from the border/background color near the bottom toward the current theme accent near the top.
 
 Config is stored at `~/.config/terb/config.json`.
