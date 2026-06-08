@@ -11,7 +11,10 @@ use std::{
 use crossterm::{
     event::{self, Event as CEvent, KeyCode, KeyEvent},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, size as terminal_size, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -32,6 +35,8 @@ const THEMES: &[ThemeId] = &[
     ThemeId::Amber,
     ThemeId::Mono,
 ];
+const SPECTRUM_RENDERERS: &[SpectrumRenderer] =
+    &[SpectrumRenderer::Blocks, SpectrumRenderer::Braille];
 const MENU_ITEMS: &[&str] = &[
     "menu_spectrum",
     "menu_toggle",
@@ -39,6 +44,7 @@ const MENU_ITEMS: &[&str] = &[
     "menu_help",
     "menu_quit",
 ];
+const SETTING_COUNT: usize = 12;
 const REFRESH_RATES: &[u16] = &[24, 30, 45, 60, 90, 120];
 const MIN_FREQUENCY: f32 = 35.0;
 const MAX_FREQUENCY: f32 = 18_000.0;
@@ -46,7 +52,10 @@ const DEFAULT_HIGH_SHELF_DB: f32 = 6.0;
 const DEFAULT_VISUAL_CURVE: f32 = 0.88;
 const DEFAULT_CEILING: f32 = 0.88;
 const FFT_SIZES: &[usize] = &[1024, 2048, 4096, 8192];
+const MAX_ANALYSIS_BARS: usize = 1024;
+const VISUAL_NOISE_FLOOR: f32 = 0.025;
 const SILENCE_GATE: f32 = 0.000_12;
+const BRAILLE_DOT_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
 const TITLE_ART: &[&str] = &[
     " _            _     ",
     "| |_ ___ _ __| |__  ",
@@ -79,6 +88,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
     let mut last_tick = Instant::now();
 
     loop {
+        let (width, height) = terminal_size()?;
+        if let Some(target) = visual_bar_count(app, Rect::new(0, 0, width, height)) {
+            app.set_visual_bar_count(target);
+        }
         app.drain_audio_events();
         terminal.draw(|frame| draw(frame, app))?;
 
@@ -210,6 +223,13 @@ enum ThemeId {
     Mono,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SpectrumRenderer {
+    Blocks,
+    Braille,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
     version: u8,
@@ -222,6 +242,8 @@ struct Settings {
     theme: ThemeId,
     smoothing: f32,
     bar_count: usize,
+    #[serde(default = "default_spectrum_renderer")]
+    renderer: SpectrumRenderer,
     #[serde(default = "default_fft_size")]
     fft_size: usize,
     #[serde(default = "default_refresh_hz")]
@@ -238,12 +260,16 @@ struct Settings {
     ceiling: f32,
 }
 
+fn default_spectrum_renderer() -> SpectrumRenderer {
+    SpectrumRenderer::Blocks
+}
+
 fn default_refresh_hz() -> u16 {
     45
 }
 
 fn default_fft_size() -> usize {
-    2048
+    8192
 }
 
 fn default_high_shelf_enabled() -> bool {
@@ -275,6 +301,7 @@ impl Default for Config {
                 theme: ThemeId::System,
                 smoothing: 0.72,
                 bar_count: 72,
+                renderer: default_spectrum_renderer(),
                 fft_size: default_fft_size(),
                 refresh_hz: default_refresh_hz(),
                 high_shelf_enabled: default_high_shelf_enabled(),
@@ -349,6 +376,7 @@ struct App {
     spectrum: Vec<f32>,
     level: f32,
     analyzer: SpectrumAnalyzer,
+    visual_bar_count: usize,
     audio: Option<AudioProcess>,
     rx: Receiver<AudioEvent>,
     tx: Sender<AudioEvent>,
@@ -377,6 +405,7 @@ impl App {
             spectrum: vec![0.0; bar_count],
             level: 0.0,
             analyzer: SpectrumAnalyzer::new(fft_size, 48_000.0, bar_count),
+            visual_bar_count: bar_count,
             audio: None,
             rx,
             tx,
@@ -511,7 +540,29 @@ impl App {
     }
 
     fn next_setting(&mut self) {
-        self.setting_index = (self.setting_index + 1).min(10);
+        self.setting_index = (self.setting_index + 1).min(SETTING_COUNT - 1);
+    }
+
+    fn set_visual_bar_count(&mut self, bar_count: usize) {
+        let bar_count = bar_count.clamp(32, MAX_ANALYSIS_BARS);
+        if self.visual_bar_count != bar_count {
+            self.visual_bar_count = bar_count;
+            self.resize_spectrum_analyzer();
+        }
+    }
+
+    fn analysis_bar_count(&self) -> usize {
+        self.config
+            .settings
+            .bar_count
+            .max(self.visual_bar_count)
+            .clamp(32, MAX_ANALYSIS_BARS)
+    }
+
+    fn resize_spectrum_analyzer(&mut self) {
+        let bar_count = self.analysis_bar_count();
+        self.spectrum = display_bars(&self.spectrum, bar_count);
+        self.analyzer.resize_bar_count(bar_count);
     }
 
     fn adjust_setting(&mut self, direction: i32) {
@@ -534,30 +585,30 @@ impl App {
                 let next = (current + direction * 8).clamp(32, 120) as usize;
                 if next != self.config.settings.bar_count {
                     self.config.settings.bar_count = next;
-                    self.spectrum = vec![0.0; next];
-                    self.rebuild_analyzer();
+                    self.resize_spectrum_analyzer();
                 }
             }
-            4 => {
+            4 => self.cycle_renderer(direction),
+            5 => {
                 self.cycle_fft_size(direction);
                 self.rebuild_analyzer();
             }
-            5 => self.cycle_refresh_rate(direction),
-            6 => self.config.settings.high_shelf_enabled = !self.config.settings.high_shelf_enabled,
-            7 => {
+            6 => self.cycle_refresh_rate(direction),
+            7 => self.config.settings.high_shelf_enabled = !self.config.settings.high_shelf_enabled,
+            8 => {
                 self.config.settings.high_shelf_db =
                     (self.config.settings.high_shelf_db + direction as f32).clamp(0.0, 18.0);
             }
-            8 => {
+            9 => {
                 self.config.settings.visual_curve_enabled =
                     !self.config.settings.visual_curve_enabled;
             }
-            9 => {
+            10 => {
                 let delta = if direction < 0 { -0.04 } else { 0.04 };
                 self.config.settings.visual_curve =
                     (self.config.settings.visual_curve + delta).clamp(0.55, 1.35);
             }
-            10 => {
+            11 => {
                 let delta = if direction < 0 { -0.02 } else { 0.02 };
                 self.config.settings.ceiling =
                     (self.config.settings.ceiling + delta).clamp(0.70, 0.98);
@@ -638,11 +689,20 @@ impl App {
 
     fn rebuild_analyzer(&mut self) {
         let fft_size = nearest_fft_size(self.config.settings.fft_size);
-        let bar_count = self.config.settings.bar_count.clamp(32, 120);
+        let bar_count = self.analysis_bar_count();
         self.config.settings.fft_size = fft_size;
-        self.config.settings.bar_count = bar_count;
         self.analyzer = SpectrumAnalyzer::new(fft_size, 48_000.0, bar_count);
         self.spectrum = vec![0.0; bar_count];
+    }
+
+    fn cycle_renderer(&mut self, direction: i32) {
+        let index = SPECTRUM_RENDERERS
+            .iter()
+            .position(|renderer| *renderer == self.config.settings.renderer)
+            .unwrap_or(0);
+        let len = SPECTRUM_RENDERERS.len() as i32;
+        let next = (index as i32 + direction).rem_euclid(len) as usize;
+        self.config.settings.renderer = SPECTRUM_RENDERERS[next];
     }
 
     fn save_config(&self) {
@@ -800,6 +860,15 @@ impl SpectrumAnalyzer {
         }
     }
 
+    fn resize_bar_count(&mut self, bar_count: usize) {
+        if self.bar_count == bar_count {
+            return;
+        }
+
+        self.bar_count = bar_count;
+        self.smoothed = display_bars(&self.smoothed, bar_count);
+    }
+
     fn consume(
         &mut self,
         samples: &[f32],
@@ -876,35 +945,11 @@ impl SpectrumAnalyzer {
             let center_t = (lower_t + upper_t) * 0.5;
             let lower_frequency = MIN_FREQUENCY * ratio.powf(lower_t);
             let upper_frequency = MIN_FREQUENCY * ratio.powf(upper_t);
-            let lower_bin = ((lower_frequency / self.sample_rate) * self.fft_size as f32)
-                .round()
-                .max(1.0) as usize;
-            let upper_bin = ((upper_frequency / self.sample_rate) * self.fft_size as f32)
-                .round()
-                .max((lower_bin + 1) as f32) as usize;
-            let lower_bin = lower_bin.min(magnitudes.len().saturating_sub(1));
-            let upper_bin = upper_bin.min(magnitudes.len().saturating_sub(1));
-
-            let mut total = 0.0_f32;
-            let mut squared_total = 0.0_f32;
-            let mut weight_total = 0.0_f32;
-            let mut peak = 0.0_f32;
-            for (bin, magnitude) in magnitudes
-                .iter()
-                .enumerate()
-                .take(upper_bin + 1)
-                .skip(lower_bin)
-            {
-                let weight = 1.0 + (bin - lower_bin) as f32 / (upper_bin - lower_bin).max(1) as f32;
-                total += *magnitude * weight;
-                squared_total += magnitude * magnitude * weight;
-                weight_total += weight;
-                peak = peak.max(*magnitude);
-            }
-
-            let average = total / weight_total.max(1.0);
-            let rms = (squared_total / weight_total.max(1.0)).sqrt();
-            let energy = (rms * 0.72 + peak * 0.28).max(average);
+            let lower_bin = ((lower_frequency / self.sample_rate) * self.fft_size as f32).max(1.0);
+            let upper_bin =
+                ((upper_frequency / self.sample_rate) * self.fft_size as f32).max(lower_bin + 0.25);
+            let band = sample_frequency_band(magnitudes, lower_bin, upper_bin);
+            let energy = (band.rms * 0.72 + band.peak * 0.28).max(band.average);
             let high_shelf = if pipeline.high_shelf_enabled {
                 pipeline.high_shelf_db * center_t.powf(1.35)
             } else {
@@ -918,6 +963,64 @@ impl SpectrumAnalyzer {
 
         bars
     }
+}
+
+struct BandStats {
+    average: f32,
+    rms: f32,
+    peak: f32,
+}
+
+fn sample_frequency_band(magnitudes: &[f32], lower_bin: f32, upper_bin: f32) -> BandStats {
+    if magnitudes.is_empty() {
+        return BandStats {
+            average: 0.0,
+            rms: 0.0,
+            peak: 0.0,
+        };
+    }
+
+    let max_bin = (magnitudes.len() - 1) as f32;
+    let lower_bin = lower_bin.clamp(1.0, max_bin);
+    let upper_bin = upper_bin.clamp(lower_bin, max_bin);
+    let width = (upper_bin - lower_bin).max(0.001);
+    let sample_count = ((width.ceil() as usize) + 2).clamp(4, 64);
+    let mut total = 0.0_f32;
+    let mut squared_total = 0.0_f32;
+    let mut weight_total = 0.0_f32;
+    let mut peak = 0.0_f32;
+
+    for sample in 0..sample_count {
+        let position = (sample as f32 + 0.5) / sample_count as f32;
+        let bin = lower_bin + width * position;
+        let magnitude = sample_magnitude(magnitudes, bin);
+        let weight = 1.0 + position;
+        total += magnitude * weight;
+        squared_total += magnitude * magnitude * weight;
+        weight_total += weight;
+        peak = peak.max(magnitude);
+    }
+
+    BandStats {
+        average: total / weight_total.max(1.0),
+        rms: (squared_total / weight_total.max(1.0)).sqrt(),
+        peak,
+    }
+}
+
+fn sample_magnitude(magnitudes: &[f32], bin: f32) -> f32 {
+    if magnitudes.is_empty() {
+        return 0.0;
+    }
+
+    let max_index = magnitudes.len() - 1;
+    let bin = bin.clamp(0.0, max_index as f32);
+    let left = bin.floor() as usize;
+    let right = bin.ceil() as usize;
+    let mix = bin - left as f32;
+    let left_value = magnitudes[left];
+    let right_value = magnitudes[right.min(max_index)];
+    left_value * (1.0 - mix) + right_value * mix
 }
 
 fn audio_level(samples: &[f32]) -> f32 {
@@ -1033,6 +1136,38 @@ fn draw(frame: &mut Frame, app: &App) {
         Screen::Spectrum => draw_spectrum_screen(frame, app, size),
         Screen::Settings => draw_settings(frame, app, size),
         Screen::Help => draw_help(frame, app, size),
+    }
+}
+
+fn visual_bar_count(app: &App, area: Rect) -> Option<usize> {
+    if app.screen != Screen::Spectrum || area.width < 36 || area.height < 10 {
+        return None;
+    }
+
+    let chart_area = spectrum_chart_area(area);
+    let inner_width = chart_area.width.saturating_sub(2) as usize;
+    if inner_width == 0 {
+        return None;
+    }
+
+    Some(match app.config.settings.renderer {
+        SpectrumRenderer::Blocks => inner_width,
+        SpectrumRenderer::Braille => inner_width * 2,
+    })
+}
+
+fn spectrum_chart_area(area: Rect) -> Rect {
+    let show_sidebar = area.width >= 90 && area.height >= 22;
+    if show_sidebar {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(35), Constraint::Min(24)])
+            .split(area)[1]
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(6), Constraint::Length(3)])
+            .split(area)[0]
     }
 }
 
@@ -1244,13 +1379,13 @@ fn draw_spectrum_screen(frame: &mut Frame, app: &App, area: Rect) {
             .constraints([Constraint::Length(35), Constraint::Min(24)])
             .split(area);
         draw_sidebar(frame, app, chunks[0]);
-        draw_spectrum(frame, app, chunks[1], app.t("spectrum"));
+        draw_spectrum(frame, app, spectrum_chart_area(area), app.t("spectrum"));
     } else {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(6), Constraint::Length(3)])
             .split(area);
-        draw_spectrum(frame, app, rows[0], "terb");
+        draw_spectrum(frame, app, spectrum_chart_area(area), "terb");
         draw_compact_footer(frame, app, rows[1]);
     }
 }
@@ -1319,8 +1454,16 @@ fn draw_spectrum(frame: &mut Frame, app: &App, area: Rect, title: &'static str) 
         return;
     }
 
-    let bars = display_bars(&app.spectrum, inner.width as usize);
-    let chart_height = inner.height as usize;
+    match app.config.settings.renderer {
+        SpectrumRenderer::Blocks => draw_block_spectrum(frame, app, inner),
+        SpectrumRenderer::Braille => draw_braille_spectrum(frame, app, inner),
+    }
+}
+
+fn draw_block_spectrum(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let bars = display_bars(&app.spectrum, area.width as usize);
+    let chart_height = area.height as usize;
     let mut lines = Vec::with_capacity(chart_height);
 
     for row in 0..chart_height {
@@ -1340,7 +1483,38 @@ fn draw_spectrum(frame: &mut Frame, app: &App, area: Rect, title: &'static str) 
         lines.push(Line::from(spans));
     }
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_braille_spectrum(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let cell_width = area.width as usize;
+    let chart_height = area.height as usize;
+    let virtual_width = cell_width * 2;
+    let virtual_height = chart_height * 4;
+    let bars: Vec<f32> = display_bars(&app.spectrum, virtual_width)
+        .into_iter()
+        .map(|value| render_bar_value(value, &app.config.settings))
+        .collect();
+    let mut lines = Vec::with_capacity(chart_height);
+
+    for row in 0..chart_height {
+        let mut spans = Vec::with_capacity(cell_width);
+        for col in 0..cell_width {
+            let (mask, value) = braille_bar_cell(&bars, col, row, virtual_height);
+            if mask == 0 {
+                spans.push(Span::raw(" "));
+            } else {
+                spans.push(Span::styled(
+                    braille_pattern(mask).to_string(),
+                    Style::default().fg(bar_color(theme, col * 2, virtual_width, value)),
+                ));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_compact_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -1405,12 +1579,45 @@ fn display_bars(source: &[f32], width: usize) -> Vec<f32> {
 
 fn render_bar_value(value: f32, settings: &Settings) -> f32 {
     let ceiling = settings.ceiling.max(0.01);
-    let value = (value.clamp(0.0, ceiling) / ceiling).clamp(0.0, 1.0);
+    let floor = VISUAL_NOISE_FLOOR.min(ceiling * 0.5);
+    let value = ((value.clamp(0.0, ceiling) - floor) / (ceiling - floor)).clamp(0.0, 1.0);
     if settings.visual_curve_enabled {
         value.powf(settings.visual_curve)
     } else {
         value
     }
+}
+
+fn braille_bar_cell(
+    bars: &[f32],
+    cell_col: usize,
+    cell_row: usize,
+    virtual_height: usize,
+) -> (u8, f32) {
+    let mut mask = 0;
+    let mut cell_value = 0.0_f32;
+
+    for dot_col in 0..2 {
+        let bar_index = cell_col * 2 + dot_col;
+        let Some(value) = bars.get(bar_index).copied() else {
+            continue;
+        };
+        cell_value = cell_value.max(value);
+
+        for dot_row in 0..4 {
+            let virtual_row = cell_row * 4 + dot_row;
+            let threshold = 1.0 - (virtual_row as f32 + 0.5) / virtual_height.max(1) as f32;
+            if value >= threshold {
+                mask |= BRAILLE_DOT_BITS[dot_col][dot_row];
+            }
+        }
+    }
+
+    (mask, cell_value)
+}
+
+fn braille_pattern(mask: u8) -> char {
+    char::from_u32(0x2800 + mask as u32).unwrap_or(' ')
 }
 
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
@@ -1433,7 +1640,8 @@ fn draw_settings_list(frame: &mut Frame, app: &App, area: Rect, title: &'static 
             "smoothing",
             format!("{:>3}%", (app.config.settings.smoothing * 100.0) as u16),
         ),
-        setting_line(app, "bars", app.config.settings.bar_count.to_string()),
+        setting_line(app, "bars", bar_count_label(app)),
+        setting_line(app, "renderer", renderer_label(app)),
         setting_line(app, "fft_size", app.config.settings.fft_size.to_string()),
         setting_line(
             app,
@@ -1654,6 +1862,23 @@ fn capture_control_label(app: &App) -> String {
     }
 }
 
+fn renderer_label(app: &App) -> &'static str {
+    match app.config.settings.renderer {
+        SpectrumRenderer::Blocks => app.t("renderer_blocks"),
+        SpectrumRenderer::Braille => app.t("renderer_braille"),
+    }
+}
+
+fn bar_count_label(app: &App) -> String {
+    let configured = app.config.settings.bar_count;
+    let actual = app.analyzer.bar_count;
+    if actual == configured {
+        configured.to_string()
+    } else {
+        format!("{configured}/{actual}")
+    }
+}
+
 fn state_label(app: &App) -> &'static str {
     match app.capture_state {
         CaptureState::Idle => app.t("state_idle"),
@@ -1686,6 +1911,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "theme") => "主题",
         (Lang::Zh, "smoothing") => "平滑",
         (Lang::Zh, "bars") => "频段",
+        (Lang::Zh, "renderer") => "渲染",
         (Lang::Zh, "fft_size") => "FFT",
         (Lang::Zh, "refresh_rate") => "刷新率",
         (Lang::Zh, "high_shelf") => "高频补偿",
@@ -1733,6 +1959,8 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "theme_ocean") => "海蓝",
         (Lang::Zh, "theme_amber") => "琥珀",
         (Lang::Zh, "theme_mono") => "单色",
+        (Lang::Zh, "renderer_blocks") => "方块",
+        (Lang::Zh, "renderer_braille") => "盲文",
 
         (Lang::En, "main_menu") => "Main Menu",
         (Lang::En, "menu_spectrum") => "Open Spectrum",
@@ -1754,6 +1982,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "theme") => "Theme",
         (Lang::En, "smoothing") => "Smoothing",
         (Lang::En, "bars") => "Bands",
+        (Lang::En, "renderer") => "Render",
         (Lang::En, "fft_size") => "FFT",
         (Lang::En, "refresh_rate") => "Refresh",
         (Lang::En, "high_shelf") => "High-shelf",
@@ -1801,6 +2030,8 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "theme_ocean") => "Ocean",
         (Lang::En, "theme_amber") => "Amber",
         (Lang::En, "theme_mono") => "Mono",
+        (Lang::En, "renderer_blocks") => "Blocks",
+        (Lang::En, "renderer_braille") => "Braille",
 
         (Lang::Ja, "main_menu") => "メインメニュー",
         (Lang::Ja, "menu_spectrum") => "スペクトラムを開く",
@@ -1822,6 +2053,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "theme") => "テーマ",
         (Lang::Ja, "smoothing") => "平滑化",
         (Lang::Ja, "bars") => "バンド",
+        (Lang::Ja, "renderer") => "描画",
         (Lang::Ja, "fft_size") => "FFT",
         (Lang::Ja, "refresh_rate") => "更新率",
         (Lang::Ja, "high_shelf") => "高域補正",
@@ -1869,6 +2101,8 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "theme_ocean") => "オーシャン",
         (Lang::Ja, "theme_amber") => "アンバー",
         (Lang::Ja, "theme_mono") => "モノ",
+        (Lang::Ja, "renderer_blocks") => "ブロック",
+        (Lang::Ja, "renderer_braille") => "点字",
 
         _ => key,
     }
@@ -1905,6 +2139,14 @@ mod tests {
     }
 
     #[test]
+    fn render_bar_value_removes_noise_floor() {
+        let settings = Config::default().settings;
+
+        assert_eq!(render_bar_value(VISUAL_NOISE_FLOOR * 0.5, &settings), 0.0);
+        assert!(render_bar_value(VISUAL_NOISE_FLOOR * 2.0, &settings) > 0.0);
+    }
+
+    #[test]
     fn analyzer_gates_silence_to_zero() {
         let settings = Config::default().settings;
         let pipeline = SpectrumPipeline::from_settings(&settings);
@@ -1914,5 +2156,81 @@ mod tests {
             .expect("enough samples");
 
         assert!(bars.iter().all(|bar| *bar == 0.0));
+    }
+
+    #[test]
+    fn legacy_config_defaults_to_block_renderer() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "settings": {
+                    "language": "zh",
+                    "theme": "System",
+                    "smoothing": 0.72,
+                    "bar_count": 72,
+                    "refresh_hz": 45
+                }
+            }"#,
+        )
+        .expect("legacy config should still load");
+
+        assert_eq!(config.settings.renderer, SpectrumRenderer::Blocks);
+    }
+
+    #[test]
+    fn visual_bar_count_tracks_renderer_subpixels() {
+        let mut app = App::new(Config::default());
+        let area = Rect::new(0, 0, 100, 30);
+        app.screen = Screen::Spectrum;
+
+        app.config.settings.renderer = SpectrumRenderer::Blocks;
+        assert_eq!(visual_bar_count(&app, area), Some(63));
+
+        app.config.settings.renderer = SpectrumRenderer::Braille;
+        assert_eq!(visual_bar_count(&app, area), Some(126));
+    }
+
+    #[test]
+    fn visual_bar_count_resizes_spectrum_analyzer() {
+        let mut app = App::new(Config::default());
+
+        app.set_visual_bar_count(160);
+
+        assert_eq!(app.visual_bar_count, 160);
+        assert_eq!(app.spectrum.len(), 160);
+        assert_eq!(app.analyzer.bar_count, 160);
+    }
+
+    #[test]
+    fn sample_magnitude_interpolates_fractional_bins() {
+        let value = sample_magnitude(&[0.0, 1.0, 3.0, 4.0], 1.5);
+
+        assert!((value - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn braille_bar_cell_uses_standard_dot_order() {
+        let (left_mask, left_value) = braille_bar_cell(&[1.0, 0.0], 0, 0, 4);
+        let (right_mask, right_value) = braille_bar_cell(&[0.0, 1.0], 0, 0, 4);
+
+        assert_eq!(left_mask, 0x47);
+        assert_eq!(right_mask, 0xb8);
+        assert_eq!(left_value, 1.0);
+        assert_eq!(right_value, 1.0);
+    }
+
+    #[test]
+    fn braille_bar_cell_fills_from_bottom() {
+        let (left_mask, _) = braille_bar_cell(&[0.20, 0.0], 0, 0, 4);
+        let (right_mask, _) = braille_bar_cell(&[0.0, 0.20], 0, 0, 4);
+
+        assert_eq!(left_mask, 0x40);
+        assert_eq!(right_mask, 0x80);
+    }
+
+    #[test]
+    fn braille_pattern_offsets_from_unicode_braille_block() {
+        assert_eq!(braille_pattern(0x01), '\u{2801}');
+        assert_eq!(braille_pattern(0xff), '\u{28ff}');
     }
 }
