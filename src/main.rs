@@ -40,6 +40,11 @@ const MENU_ITEMS: &[&str] = &[
     "menu_quit",
 ];
 const REFRESH_RATES: &[u16] = &[24, 30, 45, 60, 90, 120];
+const MIN_FREQUENCY: f32 = 35.0;
+const MAX_FREQUENCY: f32 = 18_000.0;
+const HIGH_SHELF_DB: f32 = 12.0;
+const VISUAL_HEIGHT_CURVE: f32 = 0.72;
+const MAX_VISUAL_VALUE: f32 = 0.96;
 const TITLE_ART: &[&str] = &[
     " _            _     ",
     "| |_ ___ _ __| |__  ",
@@ -729,26 +734,29 @@ impl SpectrumAnalyzer {
     }
 
     fn make_bars(&self, magnitudes: &[f32]) -> Vec<f32> {
-        let min_frequency = 35.0_f32;
-        let max_frequency = (self.sample_rate / 2.0).min(18_000.0);
-        let ratio = max_frequency / min_frequency;
+        let max_frequency = (self.sample_rate / 2.0).min(MAX_FREQUENCY);
+        let ratio = max_frequency / MIN_FREQUENCY;
         let mut bars = vec![0.0; self.bar_count];
 
         for (bar, value) in bars.iter_mut().enumerate() {
             let lower_t = bar as f32 / self.bar_count as f32;
             let upper_t = (bar + 1) as f32 / self.bar_count as f32;
-            let lower_frequency = min_frequency * ratio.powf(lower_t);
-            let upper_frequency = min_frequency * ratio.powf(upper_t);
+            let center_t = (lower_t + upper_t) * 0.5;
+            let lower_frequency = MIN_FREQUENCY * ratio.powf(lower_t);
+            let upper_frequency = MIN_FREQUENCY * ratio.powf(upper_t);
             let lower_bin = ((lower_frequency / self.sample_rate) * self.fft_size as f32)
                 .round()
                 .max(1.0) as usize;
             let upper_bin = ((upper_frequency / self.sample_rate) * self.fft_size as f32)
                 .round()
                 .max((lower_bin + 1) as f32) as usize;
+            let lower_bin = lower_bin.min(magnitudes.len().saturating_sub(1));
             let upper_bin = upper_bin.min(magnitudes.len().saturating_sub(1));
 
             let mut total = 0.0_f32;
+            let mut squared_total = 0.0_f32;
             let mut weight_total = 0.0_f32;
+            let mut peak = 0.0_f32;
             for (bin, magnitude) in magnitudes
                 .iter()
                 .enumerate()
@@ -757,13 +765,19 @@ impl SpectrumAnalyzer {
             {
                 let weight = 1.0 + (bin - lower_bin) as f32 / (upper_bin - lower_bin).max(1) as f32;
                 total += *magnitude * weight;
+                squared_total += magnitude * magnitude * weight;
                 weight_total += weight;
+                peak = peak.max(*magnitude);
             }
 
             let average = total / weight_total.max(1.0);
-            let db = 20.0 * average.max(0.000_000_1).log10();
-            let normalized = ((db + 84.0) / 72.0).clamp(0.0, 1.0);
-            *value = (normalized.powf(1.28) * 0.94).min(0.94);
+            let rms = (squared_total / weight_total.max(1.0)).sqrt();
+            let energy = (rms * 0.72 + peak * 0.28).max(average);
+            let high_shelf = HIGH_SHELF_DB * center_t.powf(1.35);
+            let low_trim = 2.5 * (1.0 - center_t / 0.18).clamp(0.0, 1.0);
+            let db = 20.0 * energy.max(0.000_000_1).log10() + high_shelf - low_trim;
+            let normalized = ((db + 82.0) / 70.0).clamp(0.0, 1.0);
+            *value = (normalized * MAX_VISUAL_VALUE).min(MAX_VISUAL_VALUE);
         }
 
         bars
@@ -1165,18 +1179,19 @@ fn draw_spectrum(frame: &mut Frame, app: &App, area: Rect, title: &'static str) 
         return;
     }
 
-    let bars = visible_bars(&app.spectrum, inner.width as usize);
+    let bars = display_bars(&app.spectrum, inner.width as usize);
     let chart_height = inner.height as usize;
     let mut lines = Vec::with_capacity(chart_height);
 
     for row in 0..chart_height {
-        let threshold = 1.0 - row as f32 / chart_height as f32;
+        let threshold = 1.0 - (row as f32 + 0.5) / chart_height as f32;
         let mut spans = Vec::with_capacity(bars.len());
         for (index, value) in bars.iter().enumerate() {
-            let filled = *value >= threshold;
+            let value = apply_visual_height_curve(*value);
+            let filled = value >= threshold;
             let symbol = if filled { "█" } else { " " };
             let color = if filled {
-                bar_color(theme, index, bars.len(), *value)
+                bar_color(theme, index, bars.len(), value)
             } else {
                 Color::Reset
             };
@@ -1205,22 +1220,48 @@ fn draw_compact_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(text, area);
 }
 
-fn visible_bars(source: &[f32], width: usize) -> Vec<f32> {
-    let count = source.len().min(width.max(1));
-    if count == source.len() {
+fn display_bars(source: &[f32], width: usize) -> Vec<f32> {
+    if width == 0 || source.is_empty() {
+        return Vec::new();
+    }
+
+    if width == source.len() {
         return source.to_vec();
     }
 
-    let mut bars = Vec::with_capacity(count);
-    for index in 0..count {
-        let start = index * source.len() / count;
-        let end = ((index + 1) * source.len() / count)
-            .max(start + 1)
-            .min(source.len());
-        let value = source[start..end].iter().copied().fold(0.0_f32, f32::max);
-        bars.push(value);
+    if width < source.len() {
+        let mut bars = Vec::with_capacity(width);
+        for index in 0..width {
+            let start = index * source.len() / width;
+            let end = ((index + 1) * source.len() / width)
+                .max(start + 1)
+                .min(source.len());
+            let value = source[start..end].iter().copied().fold(0.0_f32, f32::max);
+            bars.push(value);
+        }
+        return bars;
+    }
+
+    let mut bars = Vec::with_capacity(width);
+    let max_source_index = source.len() - 1;
+    for index in 0..width {
+        let position = if width == 1 {
+            0.0
+        } else {
+            index as f32 * max_source_index as f32 / (width - 1) as f32
+        };
+        let left = position.floor() as usize;
+        let right = position.ceil() as usize;
+        let mix = position - left as f32;
+        let left_value = source[left];
+        let right_value = source[right.min(max_source_index)];
+        bars.push(left_value * (1.0 - mix) + right_value * mix);
     }
     bars
+}
+
+fn apply_visual_height_curve(value: f32) -> f32 {
+    value.clamp(0.0, 1.0).powf(VISUAL_HEIGHT_CURVE)
 }
 
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
@@ -1524,5 +1565,26 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "theme_mono") => "モノ",
 
         _ => key,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_bars_expands_to_full_width() {
+        let bars = display_bars(&[0.10, 0.90], 5);
+
+        assert_eq!(bars.len(), 5);
+        assert!((bars[0] - 0.10).abs() < f32::EPSILON);
+        assert!((bars[4] - 0.90).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn display_bars_preserves_peaks_when_downsampling() {
+        let bars = display_bars(&[0.10, 0.95, 0.20, 0.30], 2);
+
+        assert_eq!(bars, vec![0.95, 0.30]);
     }
 }
