@@ -1394,6 +1394,7 @@ dependencies = [
  "rustfft",
  "serde",
  "serde_json",
+ "unicode-width",
 ]
 
 [[package]]

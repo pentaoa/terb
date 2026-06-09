@@ -32,16 +32,23 @@ On first capture, macOS may ask for Screen & System Audio Recording permission. 
 - `?`: help.
 - `q` or `Esc` on the main menu: quit.
 
-Refresh rate is adjustable in Settings: 24, 30, 45, 60, 90, 120, or 144 Hz.
+Refresh rate is adjustable in Settings: 12, 24, 30, 45, 60, 90, 120, 144, 165, or 240 Hz.
 
 Spectrum rendering and processing are also adjustable from the sidebar or settings panel:
-renderer mode (blocks or Braille), frequency bands,
-FFT size, high-shelf compensation, shelf gain, height curve, curve power,
+renderer mode (blocks, Braille, or CAVA-style stepped characters), frequency bands,
+FFT size, analysis hop, refresh rate, high-shelf compensation, shelf gain,
+adaptive sensitivity, noise reduction, BPM analysis, height curve, curve power,
 spectrum trail, trail decay, accent trace, accent threshold, and limiter ceiling.
-Accent trace detects sudden spectrum-energy lifts using the adjustable accent threshold, waits for the rise to settle, captures a low-pass-smoothed peak envelope, glides it upward from one to five terminal cells over 0.1 seconds, and renders an interpolated Braille line that fades toward the background over 0.5 seconds. A new accent replaces the previous visible trace.
-Music-reactive themes include Aurora, Sonic Texture, Noise Warp, and Miku. Aurora follows frequency position, spectrum energy, centroid, and transient flux. Sonic Texture samples a pitch-stable two-dimensional color field inside each Braille cell, while Noise Warp layers fBM noise, contour lines, and domain warping for broader procedural texture. Miku loops the bundled Tenor GIF in the center of the spectrum, contain-scaled so it never crops or overflows; the background is darkened and spectrum hits brighten the sampled GIF colors. Miku playback starts at 5fps and adds 0.2x speed for every accent trigger in the last 3 seconds, with no cap. Their color drivers are time-smoothed so pitch and transient changes move without harsh jumps.
+The full settings panel shows the current value, valid range, and step for the selected row.
+Key adjustable ranges are: 8-256 base frequency bands, 512-16384 FFT size, 64-4096 analysis hop, 0-2000 ms audio delay, 2-100% attack, 0-99.5% release, 0-36 dB shelf gain, 0-95% noise reduction, 0.25-2.50 curve power, 20-99.5% trail decay, 2-98% accent threshold, and 35-100% limiter ceiling.
+The spectrum uses dB-style band normalization plus visualizer-style adaptive sensitivity. A physically mapped spectrum can sit low and rarely touch the top, which is normal for real audio dynamics, but Terb's autosens now follows the CAVA-style rule of slowly increasing gain while bars do not peak and reducing gain faster when peaks approach the ceiling.
+Accent trace detects sudden spectrum-energy lifts using the adjustable accent threshold, waits for the rise to settle, captures a low-pass-smoothed peak envelope, glides it upward over 0.1 seconds with a height-proportional offset, and renders an interpolated Braille line that fades toward the background over 0.5 seconds. A new accent replaces the previous visible trace.
+Static themes now color each spectrum column vertically by level instead of splitting colors by low and high frequency position.
+Spring is the default soft palette, built from cream, pale cyan, rose, and light rose; Vintage remains a restrained four-color calibrated theme built around muted green, parchment, clay, and wine tones.
+Music-reactive themes include Aurora, Sonic Texture, and Miku. Aurora follows frequency position, spectrum energy, centroid, and transient flux. Sonic Texture samples a pitch-stable two-dimensional color field inside each Braille cell. Miku loops the bundled Tenor GIF in the center of the spectrum, contain-scaled so it never crops or overflows; the background is darkened and spectrum hits brighten the sampled GIF colors. Miku playback starts at 5fps and adds 0.2x speed for every accent trigger in the last 3 seconds, with no cap. Their color drivers are time-smoothed so pitch and transient changes move without harsh jumps.
 The limiter ceiling controls analysis headroom; the meter still maps that ceiling to full height.
 Audio delay is also part of the processing view, so it can be adjusted live from the keyboard or the settings list.
+The pipeline module exposes the main DAW-style stages: capture, sync delay, pre-analysis windowing, FFT, detector shaping, post-processing, and tempo estimation. BPM uses a live onset-strength envelope from wideband spectral flux rather than simple low-frequency peak counting.
 
 The Spectrum view is module-based: large terminals can show settings, pipeline, toolbar, waveform, and a right-side stereo master meter at the same time. Small terminals automatically hide side modules and keep the spectrum readable.
 The waveform module always renders with Braille subpixels, sampling two virtual columns and four virtual rows per terminal cell.

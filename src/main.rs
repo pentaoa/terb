@@ -12,6 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) mod analysis;
+pub(crate) mod bpm;
+
 use crossterm::{
     event::{self, Event as CEvent, KeyCode, KeyEvent},
     execute,
@@ -30,21 +33,27 @@ use ratatui::{
 };
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use serde::{Deserialize, Serialize};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use analysis::sample_frequency_band;
+#[cfg(test)]
+use analysis::sample_magnitude;
+use bpm::{BpmAnalyzer, BPM_MAX, BPM_MIN, BPM_PULSE_DECAY_SECONDS};
 
 const LANGUAGES: &[(&str, &str)] = &[("zh", "中文"), ("en", "English"), ("ja", "日本語")];
 const THEMES: &[ThemeId] = &[
-    ThemeId::System,
-    ThemeId::Graphite,
-    ThemeId::Ocean,
+    ThemeId::Spring,
+    ThemeId::Vintage,
     ThemeId::Aurora,
     ThemeId::SonicTexture,
-    ThemeId::NoiseWarp,
     ThemeId::Miku,
-    ThemeId::Amber,
     ThemeId::Mono,
 ];
-const SPECTRUM_RENDERERS: &[SpectrumRenderer] =
-    &[SpectrumRenderer::Blocks, SpectrumRenderer::Braille];
+const SPECTRUM_RENDERERS: &[SpectrumRenderer] = &[
+    SpectrumRenderer::Blocks,
+    SpectrumRenderer::Braille,
+    SpectrumRenderer::Cava,
+];
 const MENU_ITEMS: &[&str] = &[
     "menu_spectrum",
     "menu_toggle",
@@ -52,16 +61,44 @@ const MENU_ITEMS: &[&str] = &[
     "menu_help",
     "menu_quit",
 ];
-const SETTING_COUNT: usize = 20;
-const REFRESH_RATES: &[u16] = &[24, 30, 45, 60, 90, 120, 144];
-const ANALYSIS_HOPS: &[usize] = &[128, 256, 512, 1024, 2048];
+const REFRESH_RATES: &[u16] = &[12, 24, 30, 45, 60, 90, 120, 144, 165, 240];
+const MIN_REFRESH_HZ: u16 = 12;
+const MAX_REFRESH_HZ: u16 = 240;
+const ANALYSIS_HOPS: &[usize] = &[64, 128, 256, 512, 1024, 2048, 4096];
 const MIN_FREQUENCY: f32 = 35.0;
 const MAX_FREQUENCY: f32 = 18_000.0;
 const DEFAULT_HIGH_SHELF_DB: f32 = 6.0;
+const DEFAULT_NOISE_REDUCTION: f32 = 0.26;
 const DEFAULT_VISUAL_CURVE: f32 = 0.88;
 const DEFAULT_CEILING: f32 = 0.88;
 const DEFAULT_TRAIL_DECAY: f32 = 0.88;
 const DEFAULT_ACCENT_TRACE_THRESHOLD: f32 = 0.50;
+const MIN_CONFIG_BARS: usize = 8;
+const MAX_CONFIG_BARS: usize = 256;
+const MIN_ATTACK: f32 = 0.02;
+const MAX_ATTACK: f32 = 1.00;
+const ATTACK_STEP: f32 = 0.02;
+const MIN_RELEASE: f32 = 0.00;
+const MAX_RELEASE: f32 = 0.995;
+const RELEASE_STEP: f32 = 0.02;
+const MIN_HIGH_SHELF_DB: f32 = 0.0;
+const MAX_HIGH_SHELF_DB: f32 = 36.0;
+const HIGH_SHELF_DB_STEP: f32 = 1.0;
+const MIN_NOISE_REDUCTION: f32 = 0.0;
+const MAX_NOISE_REDUCTION: f32 = 0.95;
+const NOISE_REDUCTION_STEP: f32 = 0.05;
+const MIN_VISUAL_CURVE: f32 = 0.25;
+const MAX_VISUAL_CURVE: f32 = 2.50;
+const VISUAL_CURVE_STEP: f32 = 0.05;
+const MIN_CEILING: f32 = 0.35;
+const MAX_CEILING: f32 = 1.00;
+const CEILING_STEP: f32 = 0.05;
+const MIN_TRAIL_DECAY: f32 = 0.20;
+const MAX_TRAIL_DECAY: f32 = 0.995;
+const TRAIL_DECAY_STEP: f32 = 0.05;
+const MIN_ACCENT_TRACE_THRESHOLD: f32 = 0.02;
+const MAX_ACCENT_TRACE_THRESHOLD: f32 = 0.98;
+const ACCENT_TRACE_THRESHOLD_STEP: f32 = 0.02;
 const ACCENT_TRACE_LIFETIME_MS: u64 = 500;
 const ACCENT_TRACE_COOLDOWN_MS: u64 = 90;
 const ACCENT_TRACE_START_OFFSET_CELLS: f32 = 1.0;
@@ -75,15 +112,21 @@ const DEFAULT_ATTACK: f32 = 0.82;
 const DEFAULT_RELEASE: f32 = 0.48;
 const DEFAULT_ANALYSIS_HOP: usize = 256;
 const AUDIO_DELAY_STEP_MS: i32 = 10;
-const MAX_AUDIO_DELAY_MS: i32 = 500;
-const FFT_SIZES: &[usize] = &[1024, 2048, 4096, 8192];
+const MAX_AUDIO_DELAY_MS: i32 = 2_000;
+const FFT_SIZES: &[usize] = &[512, 1024, 2048, 4096, 8192, 16_384];
 const MAX_ANALYSIS_BARS: usize = 1024;
+const ADAPTIVE_GAIN_MIN: f32 = 0.45;
+const ADAPTIVE_GAIN_MAX: f32 = 6.0;
+const ADAPTIVE_TARGET_RMS: f32 = 0.58;
+const ADAPTIVE_TARGET_PEAK: f32 = 0.94;
 const AUDIO_READ_FRAMES: usize = 512;
 const VISUAL_NOISE_FLOOR: f32 = 0.025;
 const SILENCE_GATE: f32 = 0.000_12;
 const WAVEFORM_SAMPLES: usize = 1024;
 const WAVEFORM_TARGET_PEAK: f32 = 0.72;
 const BRAILLE_DOT_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+const CAVA_BLOCKS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+const ACCENT_TRACE_REFERENCE_VIRTUAL_HEIGHT: f32 = 48.0;
 const TERMINAL_CELL_ASPECT: f32 = 0.5;
 const MIKU_BASE_FPS: f32 = 5.0;
 const MIKU_TRIGGER_SPEED_STEP: f32 = 0.20;
@@ -198,6 +241,8 @@ fn handle_spectrum_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('?') => app.screen = Screen::Help,
         KeyCode::Up | KeyCode::Char('k') => app.prev_setting(),
         KeyCode::Down | KeyCode::Char('j') => app.next_setting(),
+        KeyCode::BackTab => app.prev_setting_category(),
+        KeyCode::Tab => app.next_setting_category(),
         KeyCode::Left | KeyCode::Char('h') => app.adjust_setting(-1),
         KeyCode::Right | KeyCode::Char('l') => app.adjust_setting(1),
         _ => {}
@@ -217,6 +262,8 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Up | KeyCode::Char('k') => app.prev_setting(),
         KeyCode::Down | KeyCode::Char('j') => app.next_setting(),
+        KeyCode::BackTab => app.prev_setting_category(),
+        KeyCode::Tab => app.next_setting_category(),
         KeyCode::Left | KeyCode::Char('h') => app.adjust_setting(-1),
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => app.adjust_setting(1),
         KeyCode::Char('-') => app.adjust_audio_delay(-1),
@@ -263,11 +310,13 @@ impl Lang {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 enum ThemeId {
+    Spring,
+    // Legacy theme ids are kept only so older config files can be migrated.
     System,
     Graphite,
     Ocean,
+    Vintage,
     Aurora,
-    // Legacy theme ids are kept only so older config files can be migrated.
     PitchClass,
     ChromaBands,
     PitchMemory,
@@ -284,6 +333,30 @@ enum ThemeId {
 enum SpectrumRenderer {
     Blocks,
     Braille,
+    Cava,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingCategory {
+    General,
+    Analysis,
+    Processing,
+    Visual,
+}
+
+const SETTING_CATEGORIES: &[SettingCategory] = &[
+    SettingCategory::General,
+    SettingCategory::Analysis,
+    SettingCategory::Processing,
+    SettingCategory::Visual,
+];
+
+#[derive(Clone, Debug)]
+struct SettingRow {
+    index: usize,
+    key: &'static str,
+    category: SettingCategory,
+    value: String,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -381,6 +454,12 @@ struct Settings {
     high_shelf_enabled: bool,
     #[serde(default = "default_high_shelf_db")]
     high_shelf_db: f32,
+    #[serde(default = "default_auto_sensitivity_enabled")]
+    auto_sensitivity_enabled: bool,
+    #[serde(default = "default_noise_reduction")]
+    noise_reduction: f32,
+    #[serde(default = "default_bpm_enabled")]
+    bpm_enabled: bool,
     #[serde(default = "default_visual_curve_enabled")]
     visual_curve_enabled: bool,
     #[serde(default = "default_visual_curve")]
@@ -451,6 +530,18 @@ fn default_high_shelf_db() -> f32 {
     DEFAULT_HIGH_SHELF_DB
 }
 
+fn default_auto_sensitivity_enabled() -> bool {
+    true
+}
+
+fn default_noise_reduction() -> f32 {
+    DEFAULT_NOISE_REDUCTION
+}
+
+fn default_bpm_enabled() -> bool {
+    true
+}
+
 fn default_visual_curve_enabled() -> bool {
     true
 }
@@ -505,7 +596,7 @@ impl Default for Config {
             version: 1,
             settings: Settings {
                 language: "zh".to_string(),
-                theme: ThemeId::System,
+                theme: ThemeId::Spring,
                 smoothing: default_smoothing(),
                 analysis_preset: default_analysis_preset(),
                 attack: default_attack(),
@@ -518,6 +609,9 @@ impl Default for Config {
                 audio_delay_ms: default_audio_delay_ms(),
                 high_shelf_enabled: default_high_shelf_enabled(),
                 high_shelf_db: default_high_shelf_db(),
+                auto_sensitivity_enabled: default_auto_sensitivity_enabled(),
+                noise_reduction: default_noise_reduction(),
+                bpm_enabled: default_bpm_enabled(),
                 visual_curve_enabled: default_visual_curve_enabled(),
                 visual_curve: default_visual_curve(),
                 ceiling: default_ceiling(),
@@ -557,20 +651,29 @@ impl Config {
 
 impl Settings {
     fn normalize(&mut self) {
-        self.bar_count = self.bar_count.clamp(32, 120);
+        self.bar_count = self.bar_count.clamp(MIN_CONFIG_BARS, MAX_CONFIG_BARS);
         self.fft_size = nearest_fft_size(self.fft_size);
         self.analysis_hop = nearest_hop_size(self.analysis_hop, self.fft_size);
         self.refresh_hz = nearest_refresh_rate(self.refresh_hz);
-        self.attack = self.attack.clamp(0.10, 0.98);
-        self.release = self.release.clamp(0.05, 0.95);
+        self.attack = self.attack.clamp(MIN_ATTACK, MAX_ATTACK);
+        self.release = self.release.clamp(MIN_RELEASE, MAX_RELEASE);
         self.smoothing = self.smoothing.clamp(0.20, 0.92);
         self.audio_delay_ms = (self.audio_delay_ms as i32).clamp(0, MAX_AUDIO_DELAY_MS) as u16;
-        self.high_shelf_db = self.high_shelf_db.clamp(0.0, 18.0);
-        self.visual_curve = self.visual_curve.clamp(0.55, 1.35);
-        self.ceiling = self.ceiling.clamp(0.70, 0.98);
-        self.trail_decay = self.trail_decay.clamp(0.65, 0.98);
-        self.accent_trace_threshold = self.accent_trace_threshold.clamp(0.10, 0.90);
-        if is_retired_theme(self.theme) {
+        self.high_shelf_db = self
+            .high_shelf_db
+            .clamp(MIN_HIGH_SHELF_DB, MAX_HIGH_SHELF_DB);
+        self.noise_reduction = self
+            .noise_reduction
+            .clamp(MIN_NOISE_REDUCTION, MAX_NOISE_REDUCTION);
+        self.visual_curve = self.visual_curve.clamp(MIN_VISUAL_CURVE, MAX_VISUAL_CURVE);
+        self.ceiling = self.ceiling.clamp(MIN_CEILING, MAX_CEILING);
+        self.trail_decay = self.trail_decay.clamp(MIN_TRAIL_DECAY, MAX_TRAIL_DECAY);
+        self.accent_trace_threshold = self
+            .accent_trace_threshold
+            .clamp(MIN_ACCENT_TRACE_THRESHOLD, MAX_ACCENT_TRACE_THRESHOLD);
+        if is_removed_theme(self.theme) {
+            self.theme = ThemeId::Spring;
+        } else if is_retired_theme(self.theme) {
             self.theme = ThemeId::SonicTexture;
         }
     }
@@ -604,6 +707,13 @@ fn is_retired_theme(theme: ThemeId) -> bool {
     matches!(
         theme,
         ThemeId::PitchClass | ThemeId::ChromaBands | ThemeId::PitchMemory | ThemeId::HarmonicComb
+    )
+}
+
+fn is_removed_theme(theme: ThemeId) -> bool {
+    matches!(
+        theme,
+        ThemeId::System | ThemeId::Graphite | ThemeId::Ocean | ThemeId::NoiseWarp | ThemeId::Amber
     )
 }
 
@@ -667,6 +777,12 @@ struct App {
     level: f32,
     master_left: f32,
     master_right: f32,
+    bpm: BpmAnalyzer,
+    bpm_estimate: Option<f32>,
+    bpm_confidence: f32,
+    bpm_phase: f32,
+    bpm_pulse: f32,
+    bpm_next_beat_at: Option<Instant>,
     waveform: Vec<f32>,
     analyzer: SpectrumAnalyzer,
     visual_bar_count: usize,
@@ -725,17 +841,30 @@ impl AccentTrace {
         (1.0 - age / lifetime).clamp(0.0, 1.0)
     }
 
-    fn vertical_offset_rows(&self) -> f32 {
+    fn vertical_offset_rows(&self, virtual_height: usize) -> f32 {
         let duration = ACCENT_TRACE_OFFSET_ANIMATION_MS as f32 / 1000.0;
         let progress = (self.age.as_secs_f32() / duration.max(f32::EPSILON)).clamp(0.0, 1.0);
-        let offset_cells = lerp(
-            ACCENT_TRACE_START_OFFSET_CELLS,
-            ACCENT_TRACE_END_OFFSET_CELLS,
-            smoothstep(progress),
-        );
+        let start_offset =
+            scaled_accent_trace_offset_rows(ACCENT_TRACE_START_OFFSET_CELLS, virtual_height);
+        let end_offset =
+            scaled_accent_trace_offset_rows(ACCENT_TRACE_END_OFFSET_CELLS, virtual_height);
+        let offset_rows = lerp(start_offset, end_offset, smoothstep(progress));
 
-        offset_cells * 4.0
+        offset_rows
     }
+}
+
+fn scaled_accent_trace_offset_rows(offset_cells: f32, virtual_height: usize) -> f32 {
+    if virtual_height <= 1 {
+        return 0.0;
+    }
+
+    let fixed_rows = offset_cells * 4.0;
+    let proportional_rows =
+        virtual_height as f32 * (fixed_rows / ACCENT_TRACE_REFERENCE_VIRTUAL_HEIGHT);
+    proportional_rows
+        .clamp(1.0, fixed_rows)
+        .min((virtual_height - 1) as f32)
 }
 
 #[derive(Clone, Debug)]
@@ -791,6 +920,17 @@ struct MikuSample {
     green: u8,
     blue: u8,
     alpha: f32,
+}
+
+#[derive(Clone, Copy)]
+struct MikuSampleGrid {
+    virtual_width: usize,
+    virtual_height: usize,
+    base_x: usize,
+    base_y: usize,
+    dot_width: usize,
+    dot_height: usize,
+    x_aspect: f32,
 }
 
 impl MikuAnimation {
@@ -1178,6 +1318,12 @@ impl App {
             level: 0.0,
             master_left: 0.0,
             master_right: 0.0,
+            bpm: BpmAnalyzer::new(48_000.0),
+            bpm_estimate: None,
+            bpm_confidence: 0.0,
+            bpm_phase: 0.0,
+            bpm_pulse: 0.0,
+            bpm_next_beat_at: None,
             waveform: vec![0.0; WAVEFORM_SAMPLES],
             analyzer: SpectrumAnalyzer::new(fft_size, 48_000.0, bar_count, hop_size),
             visual_bar_count: bar_count,
@@ -1199,12 +1345,17 @@ impl App {
     }
 
     fn frame_duration(&self) -> Duration {
-        let refresh_hz = self.config.settings.refresh_hz.clamp(12, 144);
+        let refresh_hz = self
+            .config
+            .settings
+            .refresh_hz
+            .clamp(MIN_REFRESH_HZ, MAX_REFRESH_HZ);
         Duration::from_secs_f64(1.0 / refresh_hz as f64)
     }
 
     fn tick(&mut self, elapsed: Duration) {
         self.advance_miku_animation(elapsed);
+        self.advance_bpm_pulse(elapsed);
         if self.capture_state == CaptureState::Running {
             self.advance_accent_traces(elapsed);
             if let Some(last) = self.last_samples_at {
@@ -1219,6 +1370,34 @@ impl App {
         let fps = self.miku_playback_fps();
         self.miku_frame_phase =
             (self.miku_frame_phase + elapsed.as_secs_f32() * fps).rem_euclid(1_000_000.0);
+    }
+
+    fn advance_bpm_pulse(&mut self, elapsed: Duration) {
+        self.bpm_pulse =
+            (self.bpm_pulse - elapsed.as_secs_f32() / BPM_PULSE_DECAY_SECONDS).clamp(0.0, 1.0);
+        if !self.config.settings.bpm_enabled {
+            self.bpm_phase = 0.0;
+            self.bpm_pulse = 0.0;
+            self.bpm_next_beat_at = None;
+            return;
+        }
+
+        let Some(bpm) = self.bpm_estimate.filter(|bpm| *bpm > 1.0) else {
+            self.bpm_phase = 0.0;
+            self.bpm_next_beat_at = None;
+            return;
+        };
+        let beat_period = Duration::from_secs_f32(60.0 / bpm);
+        let now = Instant::now();
+        let next = self.bpm_next_beat_at.get_or_insert(now + beat_period);
+
+        while *next <= now {
+            self.bpm_pulse = 1.0;
+            *next += beat_period;
+        }
+
+        let until_next = next.saturating_duration_since(now).as_secs_f32();
+        self.bpm_phase = (1.0 - until_next / beat_period.as_secs_f32()).clamp(0.0, 1.0);
     }
 
     fn miku_playback_fps(&self) -> f32 {
@@ -1357,6 +1536,12 @@ impl App {
         self.master_left = samples.left_level;
         self.master_right = samples.right_level;
         self.update_waveform(&samples.mono);
+        if self.config.settings.bpm_enabled {
+            if let Some(estimate) = self.bpm.consume(&samples.mono) {
+                self.set_bpm_estimate(estimate.bpm);
+                self.bpm_confidence = estimate.confidence;
+            }
+        }
         let pipeline = SpectrumPipeline::from_settings(&self.config.settings);
         if let Some(bars) = self.analyzer.consume(
             &samples.mono,
@@ -1370,6 +1555,28 @@ impl App {
             self.spectrum = bars;
         }
         self.status = self.t("running").to_string();
+    }
+
+    fn set_bpm_estimate(&mut self, bpm: f32) {
+        let bpm = bpm.clamp(BPM_MIN, BPM_MAX);
+        let should_regrid = self
+            .bpm_estimate
+            .map(|previous| (previous - bpm).abs() > 3.0)
+            .unwrap_or(true);
+        self.bpm_estimate = Some(bpm);
+        if should_regrid {
+            self.bpm_next_beat_at = Some(Instant::now() + Duration::from_secs_f32(60.0 / bpm));
+            self.bpm_phase = 0.0;
+        }
+    }
+
+    fn clear_bpm_state(&mut self) {
+        self.bpm.reset();
+        self.bpm_estimate = None;
+        self.bpm_confidence = 0.0;
+        self.bpm_phase = 0.0;
+        self.bpm_pulse = 0.0;
+        self.bpm_next_beat_at = None;
     }
 
     fn update_accent_trace_detector(&mut self, bars: &[f32]) {
@@ -1516,15 +1723,27 @@ impl App {
     }
 
     fn prev_setting(&mut self) {
-        self.setting_index = self.setting_index.saturating_sub(1);
+        let rows = settings_rows(self);
+        self.setting_index = previous_setting_index(self.setting_index, &rows);
     }
 
     fn next_setting(&mut self) {
-        self.setting_index = (self.setting_index + 1).min(SETTING_COUNT - 1);
+        let rows = settings_rows(self);
+        self.setting_index = next_setting_index(self.setting_index, &rows);
+    }
+
+    fn prev_setting_category(&mut self) {
+        let rows = settings_rows(self);
+        self.setting_index = adjacent_setting_category_index(self.setting_index, &rows, -1);
+    }
+
+    fn next_setting_category(&mut self) {
+        let rows = settings_rows(self);
+        self.setting_index = adjacent_setting_category_index(self.setting_index, &rows, 1);
     }
 
     fn set_visual_bar_count(&mut self, bar_count: usize) {
-        let bar_count = bar_count.clamp(32, MAX_ANALYSIS_BARS);
+        let bar_count = bar_count.clamp(MIN_CONFIG_BARS, MAX_ANALYSIS_BARS);
         if self.visual_bar_count != bar_count {
             self.visual_bar_count = bar_count;
             self.resize_spectrum_analyzer();
@@ -1536,7 +1755,7 @@ impl App {
             .settings
             .bar_count
             .max(self.visual_bar_count)
-            .clamp(32, MAX_ANALYSIS_BARS)
+            .clamp(MIN_CONFIG_BARS, MAX_ANALYSIS_BARS)
     }
 
     fn resize_spectrum_analyzer(&mut self) {
@@ -1547,80 +1766,126 @@ impl App {
     }
 
     fn adjust_setting(&mut self, direction: i32) {
-        match self.setting_index {
-            0 => self.cycle_language(direction),
-            1 => {
-                if direction < 0 {
-                    self.prev_theme();
+        let rows = settings_rows(self);
+        if let Some(row) = selected_setting_row(self.setting_index, &rows) {
+            self.adjust_setting_by_key(row.key, direction);
+            self.save_config();
+        }
+    }
+
+    fn adjust_setting_by_key(&mut self, key: &'static str, direction: i32) {
+        match key {
+            "language" => self.cycle_language(direction),
+            "theme" => self.cycle_theme(direction),
+            "analysis_preset" => self.cycle_analysis_preset(direction),
+            "attack" => {
+                let delta = if direction < 0 {
+                    -ATTACK_STEP
                 } else {
-                    self.next_theme();
-                }
-            }
-            2 => self.cycle_analysis_preset(direction),
-            3 => {
-                let delta = if direction < 0 { -0.05 } else { 0.05 };
+                    ATTACK_STEP
+                };
                 self.config.settings.attack =
-                    (self.config.settings.attack + delta).clamp(0.10, 0.98);
+                    (self.config.settings.attack + delta).clamp(MIN_ATTACK, MAX_ATTACK);
                 self.config.settings.mark_custom_analysis();
             }
-            4 => {
-                let delta = if direction < 0 { -0.05 } else { 0.05 };
+            "release" => {
+                let delta = if direction < 0 {
+                    -RELEASE_STEP
+                } else {
+                    RELEASE_STEP
+                };
                 self.config.settings.release =
-                    (self.config.settings.release + delta).clamp(0.05, 0.95);
+                    (self.config.settings.release + delta).clamp(MIN_RELEASE, MAX_RELEASE);
                 self.config.settings.mark_custom_analysis();
             }
-            5 => {
+            "bars" => {
                 let current = self.config.settings.bar_count as i32;
-                let next = (current + direction * 8).clamp(32, 120) as usize;
+                let next = (current + direction * 8)
+                    .clamp(MIN_CONFIG_BARS as i32, MAX_CONFIG_BARS as i32)
+                    as usize;
                 if next != self.config.settings.bar_count {
                     self.config.settings.bar_count = next;
                     self.resize_spectrum_analyzer();
                 }
             }
-            6 => self.cycle_renderer(direction),
-            7 => {
+            "renderer" => self.cycle_renderer(direction),
+            "fft_size" => {
                 self.cycle_fft_size(direction);
                 self.config.settings.mark_custom_analysis();
                 self.rebuild_analyzer();
             }
-            8 => {
+            "analysis_hop" => {
                 self.cycle_analysis_hop(direction);
                 self.config.settings.mark_custom_analysis();
                 self.rebuild_analyzer();
             }
-            9 => {
+            "refresh_rate" => {
                 self.cycle_refresh_rate(direction);
                 self.config.settings.mark_custom_analysis();
             }
-            10 => self.adjust_audio_delay_unsaved(direction),
-            11 => {
+            "audio_delay" => self.adjust_audio_delay_unsaved(direction),
+            "high_shelf" => {
                 self.config.settings.high_shelf_enabled = !self.config.settings.high_shelf_enabled
             }
-            12 => {
-                self.config.settings.high_shelf_db =
-                    (self.config.settings.high_shelf_db + direction as f32).clamp(0.0, 18.0);
+            "high_shelf_db" => {
+                let delta = if direction < 0 {
+                    -HIGH_SHELF_DB_STEP
+                } else {
+                    HIGH_SHELF_DB_STEP
+                };
+                self.config.settings.high_shelf_db = (self.config.settings.high_shelf_db + delta)
+                    .clamp(MIN_HIGH_SHELF_DB, MAX_HIGH_SHELF_DB);
             }
-            13 => {
+            "auto_sensitivity" => {
+                self.config.settings.auto_sensitivity_enabled =
+                    !self.config.settings.auto_sensitivity_enabled;
+                self.analyzer.reset_adaptive_state();
+            }
+            "noise_reduction" => {
+                let delta = if direction < 0 {
+                    -NOISE_REDUCTION_STEP
+                } else {
+                    NOISE_REDUCTION_STEP
+                };
+                self.config.settings.noise_reduction = (self.config.settings.noise_reduction
+                    + delta)
+                    .clamp(MIN_NOISE_REDUCTION, MAX_NOISE_REDUCTION);
+            }
+            "bpm_analysis" => {
+                self.config.settings.bpm_enabled = !self.config.settings.bpm_enabled;
+                if !self.config.settings.bpm_enabled {
+                    self.clear_bpm_state();
+                }
+            }
+            "visual_curve" => {
                 self.config.settings.visual_curve_enabled =
                     !self.config.settings.visual_curve_enabled;
             }
-            14 => {
-                let delta = if direction < 0 { -0.04 } else { 0.04 };
-                self.config.settings.visual_curve =
-                    (self.config.settings.visual_curve + delta).clamp(0.55, 1.35);
+            "curve_power" => {
+                let delta = if direction < 0 {
+                    -VISUAL_CURVE_STEP
+                } else {
+                    VISUAL_CURVE_STEP
+                };
+                self.config.settings.visual_curve = (self.config.settings.visual_curve + delta)
+                    .clamp(MIN_VISUAL_CURVE, MAX_VISUAL_CURVE);
             }
-            15 => {
+            "trail" => {
                 self.config.settings.trail_enabled = !self.config.settings.trail_enabled;
                 if !self.config.settings.trail_enabled {
                     self.spectrum_trail.clone_from(&self.spectrum);
                 }
             }
-            16 => {
-                let delta = if direction < 0 { -0.03 } else { 0.03 };
-                self.config.settings.trail_decay =
-                    (self.config.settings.trail_decay + delta).clamp(0.65, 0.98);
+            "trail_decay" => {
+                let delta = if direction < 0 {
+                    -TRAIL_DECAY_STEP
+                } else {
+                    TRAIL_DECAY_STEP
+                };
+                self.config.settings.trail_decay = (self.config.settings.trail_decay + delta)
+                    .clamp(MIN_TRAIL_DECAY, MAX_TRAIL_DECAY);
             }
-            17 => {
+            "accent_trace" => {
                 self.config.settings.accent_trace_enabled =
                     !self.config.settings.accent_trace_enabled;
                 if !self.config.settings.accent_trace_enabled {
@@ -1628,19 +1893,27 @@ impl App {
                     self.accent_traces.clear();
                 }
             }
-            18 => {
-                let delta = if direction < 0 { -0.05 } else { 0.05 };
+            "accent_threshold" => {
+                let delta = if direction < 0 {
+                    -ACCENT_TRACE_THRESHOLD_STEP
+                } else {
+                    ACCENT_TRACE_THRESHOLD_STEP
+                };
                 self.config.settings.accent_trace_threshold =
-                    (self.config.settings.accent_trace_threshold + delta).clamp(0.10, 0.90);
+                    (self.config.settings.accent_trace_threshold + delta)
+                        .clamp(MIN_ACCENT_TRACE_THRESHOLD, MAX_ACCENT_TRACE_THRESHOLD);
             }
-            19 => {
-                let delta = if direction < 0 { -0.02 } else { 0.02 };
+            "ceiling" => {
+                let delta = if direction < 0 {
+                    -CEILING_STEP
+                } else {
+                    CEILING_STEP
+                };
                 self.config.settings.ceiling =
-                    (self.config.settings.ceiling + delta).clamp(0.70, 0.98);
+                    (self.config.settings.ceiling + delta).clamp(MIN_CEILING, MAX_CEILING);
             }
             _ => {}
         }
-        self.save_config();
     }
 
     fn adjust_audio_delay(&mut self, direction: i32) {
@@ -1675,28 +1948,15 @@ impl App {
         };
     }
 
-    fn prev_theme(&mut self) {
+    fn cycle_theme(&mut self, direction: i32) {
         let index = THEMES
             .iter()
             .position(|theme| *theme == self.theme_id)
             .unwrap_or(0);
-        let next = (index + THEMES.len() - 1) % THEMES.len();
-        self.set_theme(THEMES[next]);
-    }
-
-    fn next_theme(&mut self) {
-        let index = THEMES
-            .iter()
-            .position(|theme| *theme == self.theme_id)
-            .unwrap_or(0);
-        let next = (index + 1) % THEMES.len();
-        self.set_theme(THEMES[next]);
-    }
-
-    fn set_theme(&mut self, theme_id: ThemeId) {
-        self.theme_id = theme_id;
-        self.config.settings.theme = theme_id;
-        self.save_config();
+        let len = THEMES.len() as i32;
+        let next = (index as i32 + direction).rem_euclid(len) as usize;
+        self.theme_id = THEMES[next];
+        self.config.settings.theme = THEMES[next];
     }
 
     fn cycle_analysis_preset(&mut self, direction: i32) {
@@ -1764,6 +2024,7 @@ impl App {
         let hop_size = self.config.settings.analysis_hop;
         let bar_count = self.analysis_bar_count();
         self.analyzer = SpectrumAnalyzer::new(fft_size, 48_000.0, bar_count, hop_size);
+        self.clear_bpm_state();
         self.spectrum = vec![0.0; bar_count];
         self.spectrum_trail = vec![0.0; bar_count];
     }
@@ -1967,6 +2228,8 @@ struct SpectrumAnalyzer {
     window_sum: f32,
     sample_buffer: Vec<f32>,
     smoothed: Vec<f32>,
+    adaptive_floor: Vec<f32>,
+    adaptive_gain: f32,
     samples_since_analysis: usize,
     has_analysis: bool,
 }
@@ -1975,6 +2238,8 @@ struct SpectrumAnalyzer {
 struct SpectrumPipeline {
     high_shelf_enabled: bool,
     high_shelf_db: f32,
+    auto_sensitivity_enabled: bool,
+    noise_reduction: f32,
     ceiling: f32,
 }
 
@@ -1983,6 +2248,8 @@ impl SpectrumPipeline {
         Self {
             high_shelf_enabled: settings.high_shelf_enabled,
             high_shelf_db: settings.high_shelf_db,
+            auto_sensitivity_enabled: settings.auto_sensitivity_enabled,
+            noise_reduction: settings.noise_reduction,
             ceiling: settings.ceiling,
         }
     }
@@ -2011,6 +2278,8 @@ impl SpectrumAnalyzer {
             window_sum,
             sample_buffer: Vec::new(),
             smoothed: vec![0.0; bar_count],
+            adaptive_floor: vec![0.0; bar_count],
+            adaptive_gain: 1.0,
             samples_since_analysis: 0,
             has_analysis: false,
         }
@@ -2023,6 +2292,15 @@ impl SpectrumAnalyzer {
 
         self.bar_count = bar_count;
         self.smoothed = display_bars(&self.smoothed, bar_count);
+        self.adaptive_floor = display_bars(&self.adaptive_floor, bar_count);
+        if self.adaptive_floor.len() != bar_count {
+            self.adaptive_floor.resize(bar_count, 0.0);
+        }
+    }
+
+    fn reset_adaptive_state(&mut self) {
+        self.adaptive_floor.fill(0.0);
+        self.adaptive_gain = 1.0;
     }
 
     fn consume(
@@ -2081,9 +2359,10 @@ impl SpectrumAnalyzer {
             magnitudes[index] = buffer[index].norm() * amplitude_scale;
         }
 
-        let bars = self.make_bars(&magnitudes, pipeline);
-        let attack = attack.clamp(0.10, 0.98);
-        let release = release.clamp(0.05, 0.95);
+        let mut bars = self.make_bars(&magnitudes, pipeline);
+        self.apply_adaptive_processing(&mut bars, source_rms, pipeline);
+        let attack = attack.clamp(MIN_ATTACK, MAX_ATTACK);
+        let release = release.clamp(MIN_RELEASE, MAX_RELEASE);
 
         for (smoothed, target) in self.smoothed.iter_mut().zip(bars.into_iter()) {
             if target > *smoothed {
@@ -2130,64 +2409,75 @@ impl SpectrumAnalyzer {
 
         bars
     }
-}
 
-struct BandStats {
-    average: f32,
-    rms: f32,
-    peak: f32,
-}
+    fn apply_adaptive_processing(
+        &mut self,
+        bars: &mut [f32],
+        source_rms: f32,
+        pipeline: SpectrumPipeline,
+    ) {
+        if bars.is_empty() {
+            return;
+        }
 
-fn sample_frequency_band(magnitudes: &[f32], lower_bin: f32, upper_bin: f32) -> BandStats {
-    if magnitudes.is_empty() {
-        return BandStats {
-            average: 0.0,
-            rms: 0.0,
-            peak: 0.0,
-        };
+        if self.adaptive_floor.len() != bars.len() {
+            self.adaptive_floor = vec![0.0; bars.len()];
+        }
+
+        let noise = pipeline
+            .noise_reduction
+            .clamp(MIN_NOISE_REDUCTION, MAX_NOISE_REDUCTION);
+        for (index, value) in bars.iter_mut().enumerate() {
+            let floor = &mut self.adaptive_floor[index];
+            *floor = if *floor <= 0.0 {
+                *value * (0.30 + noise * 0.25)
+            } else if *value < *floor {
+                lerp(*floor, *value, 0.14)
+            } else {
+                lerp(*floor, *value, 0.006 + noise * 0.010)
+            };
+
+            let gate = (*floor * (0.72 + noise * 1.15)).max(VISUAL_NOISE_FLOOR * noise);
+            *value = ((*value - gate).max(0.0) / (1.0 - gate).max(0.10)).clamp(0.0, 1.0);
+        }
+
+        if pipeline.auto_sensitivity_enabled {
+            let peak = bars.iter().copied().fold(0.0_f32, f32::max);
+            let rms =
+                (bars.iter().map(|value| value * value).sum::<f32>() / bars.len() as f32).sqrt();
+            let target_rms = (pipeline.ceiling * ADAPTIVE_TARGET_RMS).clamp(0.24, 0.78);
+            let target_peak = (pipeline.ceiling * ADAPTIVE_TARGET_PEAK).clamp(0.40, 0.98);
+            let target_gain = if rms <= 0.001 && peak <= 0.001 && source_rms <= SILENCE_GATE * 4.0 {
+                1.0
+            } else {
+                let rms_gain = if rms <= 0.001 {
+                    ADAPTIVE_GAIN_MAX
+                } else {
+                    target_rms / rms
+                };
+                let peak_gain = if peak <= 0.001 {
+                    ADAPTIVE_GAIN_MAX
+                } else {
+                    target_peak / peak
+                };
+                rms_gain
+                    .min(peak_gain * 1.08)
+                    .clamp(ADAPTIVE_GAIN_MIN, ADAPTIVE_GAIN_MAX)
+            };
+            let follow = if target_gain < self.adaptive_gain {
+                0.18
+            } else {
+                0.060
+            };
+            self.adaptive_gain = lerp(self.adaptive_gain, target_gain, follow);
+        } else {
+            self.adaptive_gain = 1.0;
+        }
+
+        for value in bars {
+            *value = (*value * self.adaptive_gain).clamp(0.0, pipeline.ceiling);
+        }
     }
-
-    let max_bin = (magnitudes.len() - 1) as f32;
-    let lower_bin = lower_bin.clamp(1.0, max_bin);
-    let upper_bin = upper_bin.clamp(lower_bin, max_bin);
-    let width = (upper_bin - lower_bin).max(0.001);
-    let sample_count = ((width.ceil() as usize) + 2).clamp(4, 64);
-    let mut total = 0.0_f32;
-    let mut squared_total = 0.0_f32;
-    let mut weight_total = 0.0_f32;
-    let mut peak = 0.0_f32;
-
-    for sample in 0..sample_count {
-        let position = (sample as f32 + 0.5) / sample_count as f32;
-        let bin = lower_bin + width * position;
-        let magnitude = sample_magnitude(magnitudes, bin);
-        let weight = 1.0 + position;
-        total += magnitude * weight;
-        squared_total += magnitude * magnitude * weight;
-        weight_total += weight;
-        peak = peak.max(magnitude);
-    }
-
-    BandStats {
-        average: total / weight_total.max(1.0),
-        rms: (squared_total / weight_total.max(1.0)).sqrt(),
-        peak,
-    }
-}
-
-fn sample_magnitude(magnitudes: &[f32], bin: f32) -> f32 {
-    if magnitudes.is_empty() {
-        return 0.0;
-    }
-
-    let max_index = magnitudes.len() - 1;
-    let bin = bin.clamp(0.0, max_index as f32);
-    let left = bin.floor() as usize;
-    let right = bin.ceil() as usize;
-    let mix = bin - left as f32;
-    let left_value = magnitudes[left];
-    let right_value = magnitudes[right.min(max_index)];
-    left_value * (1.0 - mix) + right_value * mix
 }
 
 fn audio_level(samples: &[f32]) -> f32 {
@@ -2216,6 +2506,7 @@ struct Theme {
     low: Color,
     mid: Color,
     high: Color,
+    peak: Color,
     color_mode: ColorMode,
 }
 
@@ -2230,37 +2521,30 @@ enum ColorMode {
 
 fn theme(id: ThemeId) -> Theme {
     match id {
-        ThemeId::System => Theme {
-            title_key: "theme_system",
-            accent: Color::Blue,
-            text: Color::Gray,
-            muted: Color::DarkGray,
-            border: Color::DarkGray,
-            low: Color::Blue,
-            mid: Color::Cyan,
-            high: Color::LightBlue,
-            color_mode: ColorMode::Static,
-        },
-        ThemeId::Graphite => Theme {
-            title_key: "theme_graphite",
-            accent: Color::Gray,
-            text: Color::Gray,
-            muted: Color::DarkGray,
-            border: Color::DarkGray,
-            low: Color::DarkGray,
-            mid: Color::Gray,
-            high: Color::White,
-            color_mode: ColorMode::Static,
-        },
-        ThemeId::Ocean => Theme {
-            title_key: "theme_ocean",
-            accent: Color::Cyan,
-            text: Color::Gray,
-            muted: Color::DarkGray,
-            border: Color::DarkGray,
-            low: Color::Blue,
-            mid: Color::Cyan,
-            high: Color::White,
+        ThemeId::Spring | ThemeId::System | ThemeId::Graphite | ThemeId::Ocean | ThemeId::Amber => {
+            Theme {
+                title_key: "theme_spring",
+                accent: Color::Rgb(255, 164, 164),
+                text: Color::Rgb(252, 249, 234),
+                muted: Color::Rgb(186, 223, 219),
+                border: Color::Rgb(186, 223, 219),
+                low: Color::Rgb(255, 164, 164),
+                mid: Color::Rgb(255, 189, 189),
+                high: Color::Rgb(252, 249, 234),
+                peak: Color::Rgb(186, 223, 219),
+                color_mode: ColorMode::Static,
+            }
+        }
+        ThemeId::Vintage => Theme {
+            title_key: "theme_vintage",
+            accent: Color::Rgb(186, 106, 76),
+            text: Color::Rgb(238, 224, 204),
+            muted: Color::Rgb(96, 116, 86),
+            border: Color::Rgb(96, 116, 86),
+            low: Color::Rgb(123, 37, 37),
+            mid: Color::Rgb(186, 106, 76),
+            high: Color::Rgb(238, 224, 204),
+            peak: Color::Rgb(96, 116, 86),
             color_mode: ColorMode::Static,
         },
         ThemeId::Aurora => Theme {
@@ -2272,6 +2556,7 @@ fn theme(id: ThemeId) -> Theme {
             low: Color::Blue,
             mid: Color::Magenta,
             high: Color::White,
+            peak: Color::LightCyan,
             color_mode: ColorMode::Aurora,
         },
         ThemeId::PitchClass
@@ -2287,6 +2572,7 @@ fn theme(id: ThemeId) -> Theme {
             low: Color::Blue,
             mid: Color::LightMagenta,
             high: Color::White,
+            peak: Color::LightCyan,
             color_mode: ColorMode::SonicTexture,
         },
         ThemeId::NoiseWarp => Theme {
@@ -2298,6 +2584,7 @@ fn theme(id: ThemeId) -> Theme {
             low: Color::Magenta,
             mid: Color::LightBlue,
             high: Color::White,
+            peak: Color::LightMagenta,
             color_mode: ColorMode::NoiseWarp,
         },
         ThemeId::Miku => Theme {
@@ -2309,18 +2596,8 @@ fn theme(id: ThemeId) -> Theme {
             low: Color::Cyan,
             mid: Color::LightCyan,
             high: Color::White,
+            peak: Color::LightCyan,
             color_mode: ColorMode::Miku,
-        },
-        ThemeId::Amber => Theme {
-            title_key: "theme_amber",
-            accent: Color::Yellow,
-            text: Color::Gray,
-            muted: Color::DarkGray,
-            border: Color::DarkGray,
-            low: Color::DarkGray,
-            mid: Color::Yellow,
-            high: Color::White,
-            color_mode: ColorMode::Static,
         },
         ThemeId::Mono => Theme {
             title_key: "theme_mono",
@@ -2331,21 +2608,27 @@ fn theme(id: ThemeId) -> Theme {
             low: Color::Gray,
             mid: Color::Gray,
             high: Color::White,
+            peak: Color::White,
             color_mode: ColorMode::Static,
         },
     }
 }
 
-fn bar_color(theme: Theme, index: usize, len: usize, value: f32) -> Color {
-    if value > 0.90 {
-        return theme.high;
-    }
+fn bar_color(theme: Theme, height_ratio: f32, value: f32) -> Color {
+    let height_ratio = height_ratio.clamp(0.0, 1.0);
+    let value = value.clamp(0.0, 1.0);
+    let lifted = (height_ratio * 0.82 + value * 0.18).clamp(0.0, 1.0);
+    vertical_palette_color(theme, lifted)
+}
 
-    let ratio = index as f32 / len.max(1) as f32;
-    if ratio < 0.45 {
-        theme.low
+fn vertical_palette_color(theme: Theme, level: f32) -> Color {
+    let level = level.clamp(0.0, 1.0);
+    if level < 0.42 {
+        blend_color(theme.low, theme.mid, level / 0.42)
+    } else if level < 0.72 {
+        blend_color(theme.mid, theme.high, (level - 0.42) / 0.30)
     } else {
-        theme.mid
+        blend_color(theme.high, theme.peak, (level - 0.72) / 0.28)
     }
 }
 
@@ -2366,7 +2649,7 @@ fn spectrum_bar_color_at(
         if trail {
             theme.border
         } else {
-            bar_color(theme, index, len, value)
+            bar_color(theme, height_ratio, value)
         }
     } else {
         music_color_for_position_at(
@@ -2419,6 +2702,7 @@ fn visual_bar_count(app: &App, area: Rect) -> Option<usize> {
 
     Some(match app.config.settings.renderer {
         SpectrumRenderer::Blocks => inner_width,
+        SpectrumRenderer::Cava => inner_width,
         SpectrumRenderer::Braille => inner_width * 2,
     })
 }
@@ -2739,7 +3023,7 @@ fn left_module_height(settings: &Settings) -> u16 {
         height += 22;
     }
     if settings.show_pipeline_panel {
-        height += 8;
+        height += 9;
     }
     height
 }
@@ -2755,7 +3039,7 @@ fn draw_left_modules(frame: &mut Frame, app: &App, area: Rect) {
         constraints.push(Constraint::Length(22));
     }
     if settings.show_pipeline_panel {
-        constraints.push(Constraint::Length(8));
+        constraints.push(Constraint::Length(9));
     }
     if constraints.is_empty() {
         return;
@@ -2816,6 +3100,12 @@ fn draw_toolbar(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(app.t("theme"), Style::default().fg(theme.muted)),
             Span::raw(" "),
             Span::styled(theme_label(app), Style::default().fg(theme.muted)),
+            Span::raw("  "),
+            Span::styled(app.t("bpm"), Style::default().fg(theme.muted)),
+            Span::raw(" "),
+            Span::styled(bpm_label(app), Style::default().fg(theme.text)),
+            Span::raw(" "),
+            beat_indicator_span(app),
         ]),
         Line::from(vec![
             Span::styled(app.t("refresh_rate"), Style::default().fg(theme.muted)),
@@ -2854,6 +3144,46 @@ fn draw_toolbar(frame: &mut Frame, app: &App, area: Rect) {
     ];
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+fn beat_indicator_span(app: &App) -> Span<'static> {
+    let theme = app.theme();
+    let symbol = if app.bpm_pulse > 0.66 {
+        "●"
+    } else if app.bpm_pulse > 0.24 {
+        "◉"
+    } else {
+        "○"
+    };
+    let style = if app.bpm_pulse > 0.0 {
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    Span::styled(symbol, style)
+}
+
+fn beat_phase_bar(app: &App, width: usize) -> String {
+    if width == 0 || !app.config.settings.bpm_enabled || app.bpm_estimate.is_none() {
+        return String::new();
+    }
+
+    let position = (app.bpm_phase * width as f32).floor() as usize;
+    (0..width)
+        .map(|index| {
+            if index == position.min(width - 1) {
+                if app.bpm_pulse > 0.0 {
+                    '●'
+                } else {
+                    '◆'
+                }
+            } else {
+                '─'
+            }
+        })
+        .collect()
 }
 
 fn module_toggle_line(app: &App) -> Line<'static> {
@@ -2966,17 +3296,15 @@ fn master_braille_cell(
     let mut mask = 0;
     let mut cell_value = 0.0_f32;
 
-    for dot_col in 0..2 {
-        for dot_row in 0..4 {
-            let virtual_row = cell_row * 4 + dot_row;
-            let threshold = 1.0 - (virtual_row as f32 + 0.5) / virtual_height.max(1) as f32;
-            if value < threshold {
-                continue;
-            }
-
-            mask |= BRAILLE_DOT_BITS[dot_col][dot_row];
-            cell_value = cell_value.max(threshold);
+    for (_, dot_row, bit) in braille_dot_bits() {
+        let virtual_row = cell_row * 4 + dot_row;
+        let threshold = 1.0 - (virtual_row as f32 + 0.5) / virtual_height.max(1) as f32;
+        if value < threshold {
+            continue;
         }
+
+        mask |= bit;
+        cell_value = cell_value.max(threshold);
     }
 
     (mask, cell_value)
@@ -3065,7 +3393,7 @@ fn music_color_for_position_at(
             if trail {
                 theme.border
             } else {
-                bar_color(theme, (position * 100.0) as usize, 100, intensity)
+                bar_color(theme, height_ratio, intensity)
             }
         }
         ColorMode::Aurora => aurora_color(
@@ -3346,13 +3674,15 @@ fn miku_block_sample(
 ) -> Option<MikuSample> {
     miku_cell_sample(
         app,
-        virtual_width,
-        virtual_height,
-        col,
-        row,
-        1,
-        1,
-        TERMINAL_CELL_ASPECT,
+        MikuSampleGrid {
+            virtual_width,
+            virtual_height,
+            base_x: col,
+            base_y: row,
+            dot_width: 1,
+            dot_height: 1,
+            x_aspect: TERMINAL_CELL_ASPECT,
+        },
     )
     .map(|(_, sample)| sample)
 }
@@ -3366,61 +3696,54 @@ fn miku_braille_sample(
 ) -> Option<(u8, MikuSample)> {
     miku_cell_sample(
         app,
-        virtual_width,
-        virtual_height,
-        cell_col * 2,
-        cell_row * 4,
-        2,
-        4,
-        1.0,
+        MikuSampleGrid {
+            virtual_width,
+            virtual_height,
+            base_x: cell_col * 2,
+            base_y: cell_row * 4,
+            dot_width: 2,
+            dot_height: 4,
+            x_aspect: 1.0,
+        },
     )
 }
 
-fn miku_cell_sample(
-    app: &App,
-    virtual_width: usize,
-    virtual_height: usize,
-    base_x: usize,
-    base_y: usize,
-    dot_width: usize,
-    dot_height: usize,
-    x_aspect: f32,
-) -> Option<(u8, MikuSample)> {
+fn miku_cell_sample(app: &App, grid: MikuSampleGrid) -> Option<(u8, MikuSample)> {
     let frame = miku_animation().frame_at_phase(app.miku_frame_phase)?;
     let mut mask = 0_u8;
     let mut alpha_sum = 0.0_f32;
     let mut red_sum = 0.0_f32;
     let mut green_sum = 0.0_f32;
     let mut blue_sum = 0.0_f32;
-    let dot_count = (dot_width * dot_height).max(1) as f32;
+    let dot_count = (grid.dot_width * grid.dot_height).max(1) as f32;
 
-    for dot_col in 0..dot_width {
-        for dot_row in 0..dot_height {
-            let Some(sample) = miku_virtual_sample(
-                frame,
-                virtual_width,
-                virtual_height,
-                base_x + dot_col,
-                base_y + dot_row,
-                x_aspect,
-            ) else {
-                continue;
-            };
-            if sample.alpha <= 0.02 {
-                continue;
-            }
+    for (dot_col, dot_row, bit) in braille_dot_bits()
+        .filter(|(dot_col, dot_row, _)| *dot_col < grid.dot_width && *dot_row < grid.dot_height)
+    {
+        let Some(sample) = miku_virtual_sample(
+            frame,
+            grid.virtual_width,
+            grid.virtual_height,
+            grid.base_x + dot_col,
+            grid.base_y + dot_row,
+            grid.x_aspect,
+        ) else {
+            continue;
+        };
+        if sample.alpha <= 0.02 {
+            continue;
+        }
 
-            alpha_sum += sample.alpha;
-            red_sum += sample.red as f32 * sample.alpha;
-            green_sum += sample.green as f32 * sample.alpha;
-            blue_sum += sample.blue as f32 * sample.alpha;
+        alpha_sum += sample.alpha;
+        red_sum += sample.red as f32 * sample.alpha;
+        green_sum += sample.green as f32 * sample.alpha;
+        blue_sum += sample.blue as f32 * sample.alpha;
 
-            if sample.alpha > 0.08 {
-                if dot_width == 2 && dot_height == 4 {
-                    mask |= BRAILLE_DOT_BITS[dot_col][dot_row];
-                } else {
-                    mask = u8::MAX;
-                }
+        if sample.alpha > 0.08 {
+            if grid.dot_width == 2 && grid.dot_height == 4 {
+                mask |= bit;
+            } else {
+                mask = u8::MAX;
             }
         }
     }
@@ -3483,19 +3806,23 @@ fn miku_layout(
     virtual_height: usize,
     x_aspect: f32,
 ) -> Option<(f32, f32, f32)> {
-    if frame.width == 0 || frame.height == 0 || virtual_width == 0 || virtual_height == 0 {
+    let animation = miku_animation();
+    let source_width = animation.width.max(frame.width);
+    let source_height = animation.height.max(frame.height);
+    let _duration_ms = animation.total_duration_ms;
+    if source_width == 0 || source_height == 0 || virtual_width == 0 || virtual_height == 0 {
         return None;
     }
 
     let x_aspect = x_aspect.max(f32::EPSILON);
-    let scale = (virtual_width as f32 * x_aspect / frame.width as f32)
-        .min(virtual_height as f32 / frame.height as f32);
+    let scale = (virtual_width as f32 * x_aspect / source_width as f32)
+        .min(virtual_height as f32 / source_height as f32);
     if scale <= f32::EPSILON {
         return None;
     }
 
-    let scaled_width = frame.width as f32 * scale / x_aspect;
-    let scaled_height = frame.height as f32 * scale;
+    let scaled_width = source_width as f32 * scale / x_aspect;
+    let scaled_height = source_height as f32 * scale;
     Some((
         (virtual_width as f32 - scaled_width) * 0.5,
         (virtual_height as f32 - scaled_height) * 0.5,
@@ -3619,6 +3946,14 @@ fn lerp(from: f32, to: f32, amount: f32) -> f32 {
     from + (to - from) * amount.clamp(0.0, 1.0)
 }
 
+fn normalize_unit(value: f32, min: f32, max: f32) -> f32 {
+    if max <= min {
+        0.0
+    } else {
+        ((value - min) / (max - min)).clamp(0.0, 1.0)
+    }
+}
+
 fn lerp_unit(from: f32, to: f32, amount: f32) -> f32 {
     let delta = (to - from + 0.5).rem_euclid(1.0) - 0.5;
     wrap_unit(from + delta * amount.clamp(0.0, 1.0))
@@ -3676,6 +4011,18 @@ fn master_braille_symbol(mask: u8) -> String {
     } else {
         braille_pattern(mask).to_string()
     }
+}
+
+fn braille_dot_bits() -> impl Iterator<Item = (usize, usize, u8)> {
+    BRAILLE_DOT_BITS
+        .iter()
+        .enumerate()
+        .flat_map(|(dot_col, rows)| {
+            rows.iter()
+                .copied()
+                .enumerate()
+                .map(move |(dot_row, bit)| (dot_col, dot_row, bit))
+        })
 }
 
 fn draw_waveform(frame: &mut Frame, app: &App, area: Rect) {
@@ -3739,6 +4086,7 @@ fn draw_spectrum(frame: &mut Frame, app: &App, area: Rect, title: &'static str) 
     match app.config.settings.renderer {
         SpectrumRenderer::Blocks => draw_block_spectrum(frame, app, inner),
         SpectrumRenderer::Braille => draw_braille_spectrum(frame, app, inner),
+        SpectrumRenderer::Cava => draw_cava_spectrum(frame, app, inner),
     }
 }
 
@@ -3754,7 +4102,7 @@ fn draw_block_spectrum(frame: &mut Frame, app: &App, area: Rect) {
     let chart_height = area.height as usize;
     let virtual_width = area.width as usize * 2;
     let virtual_height = chart_height * 4;
-    let accent_traces = display_accent_traces(app, virtual_width);
+    let accent_traces = display_accent_traces(app, virtual_width, virtual_height);
     let miku_enabled = theme.color_mode == ColorMode::Miku;
     let mut lines = Vec::with_capacity(chart_height);
 
@@ -3840,6 +4188,103 @@ fn draw_block_spectrum(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn draw_cava_spectrum(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let settings = &app.config.settings;
+    let bars: Vec<f32> = display_bars(&app.spectrum, area.width as usize)
+        .into_iter()
+        .map(|value| render_bar_value(value, settings))
+        .collect();
+    let trail: Vec<f32> = if settings.trail_enabled {
+        display_bars(&app.spectrum_trail, area.width as usize)
+            .into_iter()
+            .map(|value| render_bar_value(value, settings))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let chart_height = area.height as usize;
+    let virtual_height = chart_height * 8;
+    let accent_virtual_height = chart_height * 4;
+    let accent_traces = display_accent_traces(app, area.width as usize * 2, accent_virtual_height);
+    let miku_enabled = theme.color_mode == ColorMode::Miku;
+    let mut lines = Vec::with_capacity(chart_height);
+
+    for row in 0..chart_height {
+        let mut spans = Vec::with_capacity(bars.len());
+        for (index, value) in bars.iter().copied().enumerate() {
+            let cell = cava_bar_cell(value, row, chart_height);
+            let trail_cell = trail
+                .get(index)
+                .copied()
+                .map(|value| cava_bar_cell(value, row, chart_height))
+                .unwrap_or_default();
+            let visible_level = cell.level.max(trail_cell.level);
+            let trail_only = cell.level == 0 && trail_cell.level > 0;
+            let height_ratio = if virtual_height == 0 {
+                0.0
+            } else {
+                1.0 - ((row * 8 + 4) as f32 / virtual_height as f32)
+            };
+            let miku_sample = if miku_enabled {
+                miku_block_sample(app, bars.len(), chart_height, index, row)
+            } else {
+                None
+            };
+            let accent_trace = accent_trace_overlay_cell(
+                app,
+                &accent_traces,
+                index,
+                row,
+                area.width as usize * 2,
+                accent_virtual_height,
+            );
+
+            let symbol = if visible_level > 0 {
+                cava_block_symbol(visible_level)
+            } else if miku_sample.is_some() {
+                "█"
+            } else if accent_trace.is_some() {
+                "⠂"
+            } else {
+                " "
+            };
+            let intensity = if visible_level > 0 {
+                value.max(trail_cell.value)
+            } else {
+                0.0
+            };
+            let base_color = if visible_level > 0 {
+                Some(
+                    miku_sample
+                        .map(|sample| miku_highlight_color(theme, sample, intensity, trail_only))
+                        .unwrap_or_else(|| {
+                            spectrum_bar_color_at(
+                                app,
+                                index,
+                                bars.len(),
+                                intensity,
+                                height_ratio,
+                                trail_only,
+                            )
+                        }),
+                )
+            } else {
+                miku_sample.map(|sample| miku_background_color(theme, sample))
+            };
+            let color = if let Some(overlay) = accent_trace {
+                accent_trace_overlay_color(theme, base_color, overlay)
+            } else {
+                base_color.unwrap_or(Color::Reset)
+            };
+            spans.push(Span::styled(symbol, Style::default().fg(color)));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn draw_braille_spectrum(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
     let settings = &app.config.settings;
@@ -3859,7 +4304,7 @@ fn draw_braille_spectrum(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Vec::new()
     };
-    let accent_traces = display_accent_traces(app, virtual_width);
+    let accent_traces = display_accent_traces(app, virtual_width, virtual_height);
     let miku_enabled = theme.color_mode == ColorMode::Miku;
     let mut lines = Vec::with_capacity(chart_height);
 
@@ -4054,7 +4499,7 @@ fn update_spectrum_trail(trail: &mut Vec<f32>, bars: &[f32], settings: &Settings
         return;
     }
 
-    let decay = settings.trail_decay.clamp(0.65, 0.98);
+    let decay = settings.trail_decay.clamp(MIN_TRAIL_DECAY, MAX_TRAIL_DECAY);
     for (ghost, current) in trail.iter_mut().zip(bars.iter().copied()) {
         if current >= *ghost {
             *ghost = current;
@@ -4114,7 +4559,11 @@ fn spectrum_positive_flux(current: &[f32], previous: &[f32]) -> f32 {
 }
 
 fn accent_trigger_thresholds(threshold: f32) -> AccentTriggerThresholds {
-    let threshold = threshold.clamp(0.10, 0.90);
+    let threshold = normalize_unit(
+        threshold.clamp(MIN_ACCENT_TRACE_THRESHOLD, MAX_ACCENT_TRACE_THRESHOLD),
+        MIN_ACCENT_TRACE_THRESHOLD,
+        MAX_ACCENT_TRACE_THRESHOLD,
+    );
     AccentTriggerThresholds {
         peak: lerp(0.10, 0.26, threshold),
         initial_energy: lerp(0.03, 0.09, threshold),
@@ -4125,8 +4574,12 @@ fn accent_trigger_thresholds(threshold: f32) -> AccentTriggerThresholds {
     }
 }
 
-fn display_accent_traces(app: &App, virtual_width: usize) -> Vec<AccentTraceRender> {
-    if !app.config.settings.accent_trace_enabled || virtual_width == 0 {
+fn display_accent_traces(
+    app: &App,
+    virtual_width: usize,
+    virtual_height: usize,
+) -> Vec<AccentTraceRender> {
+    if !app.config.settings.accent_trace_enabled || virtual_width == 0 || virtual_height == 0 {
         return Vec::new();
     }
 
@@ -4147,7 +4600,7 @@ fn display_accent_traces(app: &App, virtual_width: usize) -> Vec<AccentTraceRend
             Some(AccentTraceRender {
                 envelope,
                 fade,
-                vertical_offset_rows: trace.vertical_offset_rows(),
+                vertical_offset_rows: trace.vertical_offset_rows(virtual_height),
             })
         })
         .collect()
@@ -4257,7 +4710,7 @@ fn accent_trace_braille_cell(
     let mut mask = 0;
     let mut cell_value = 0.0_f32;
 
-    for dot_col in 0..2 {
+    for (dot_col, _) in BRAILLE_DOT_BITS.iter().enumerate() {
         let bar_index = cell_col * 2 + dot_col;
         let Some(value) = envelope.get(bar_index).copied() else {
             continue;
@@ -4369,7 +4822,7 @@ fn waveform_braille_cell(
     let mut cell_value = 0.0_f32;
     let center = (virtual_height.saturating_sub(1)) as f32 * 0.5;
 
-    for dot_col in 0..2 {
+    for (dot_col, _) in BRAILLE_DOT_BITS.iter().enumerate() {
         let column_index = cell_col * 2 + dot_col;
         let Some(column) = columns.get(column_index).copied() else {
             continue;
@@ -4379,7 +4832,7 @@ fn waveform_braille_cell(
         let active = max.abs().max(min.abs()) > 0.002;
         cell_value = cell_value.max(max.abs()).max(min.abs());
 
-        for dot_row in 0..4 {
+        for (dot_row, bit) in BRAILLE_DOT_BITS[dot_col].iter().copied().enumerate() {
             let virtual_row = cell_row * 4 + dot_row;
             let position = if center <= 0.0 {
                 0.0
@@ -4387,7 +4840,7 @@ fn waveform_braille_cell(
                 ((center - virtual_row as f32) / center).clamp(-1.0, 1.0)
             };
             if active && position >= min && position <= max {
-                mask |= BRAILLE_DOT_BITS[dot_col][dot_row];
+                mask |= bit;
             }
         }
     }
@@ -4399,12 +4852,10 @@ fn waveform_centerline_mask(cell_row: usize, virtual_height: usize) -> u8 {
     let center_row = ((virtual_height.saturating_sub(1)) as f32 * 0.5).round() as usize;
     let mut mask = 0;
 
-    for dot_col in 0..2 {
-        for dot_row in 0..4 {
-            let virtual_row = cell_row * 4 + dot_row;
-            if virtual_row == center_row {
-                mask |= BRAILLE_DOT_BITS[dot_col][dot_row];
-            }
+    for (_, dot_row, bit) in braille_dot_bits() {
+        let virtual_row = cell_row * 4 + dot_row;
+        if virtual_row == center_row {
+            mask |= bit;
         }
     }
 
@@ -4422,6 +4873,28 @@ fn render_bar_value(value: f32, settings: &Settings) -> f32 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct CavaCell {
+    level: usize,
+    value: f32,
+}
+
+fn cava_bar_cell(value: f32, row: usize, chart_height: usize) -> CavaCell {
+    if chart_height == 0 {
+        return CavaCell::default();
+    }
+
+    let virtual_height = chart_height * 8;
+    let filled = (value.clamp(0.0, 1.0) * virtual_height as f32).round() as usize;
+    let bottom = chart_height.saturating_sub(row + 1) * 8;
+    let level = filled.saturating_sub(bottom).min(8);
+    CavaCell { level, value }
+}
+
+fn cava_block_symbol(level: usize) -> &'static str {
+    CAVA_BLOCKS[level.min(CAVA_BLOCKS.len() - 1)]
+}
+
 fn braille_bar_cell(
     bars: &[f32],
     cell_col: usize,
@@ -4431,18 +4904,18 @@ fn braille_bar_cell(
     let mut mask = 0;
     let mut cell_value = 0.0_f32;
 
-    for dot_col in 0..2 {
+    for (dot_col, _) in BRAILLE_DOT_BITS.iter().enumerate() {
         let bar_index = cell_col * 2 + dot_col;
         let Some(value) = bars.get(bar_index).copied() else {
             continue;
         };
         cell_value = cell_value.max(value);
 
-        for dot_row in 0..4 {
+        for (dot_row, bit) in BRAILLE_DOT_BITS[dot_col].iter().copied().enumerate() {
             let virtual_row = cell_row * 4 + dot_row;
             let threshold = 1.0 - (virtual_row as f32 + 0.5) / virtual_height.max(1) as f32;
             if value >= threshold {
-                mask |= BRAILLE_DOT_BITS[dot_col][dot_row];
+                mask |= bit;
             }
         }
     }
@@ -4472,114 +4945,11 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_settings_list(frame: &mut Frame, app: &App, area: Rect, title: Line<'static>) {
     let theme = app.theme();
     let inner = draw_panel(frame, area, theme, Some(title));
-    let rows = vec![
-        setting_line(app, "language", language_label(app.lang)),
-        setting_line(app, "theme", theme_label(app)),
-        setting_line(
-            app,
-            "analysis_preset",
-            preset_label(app, app.config.settings.analysis_preset),
-        ),
-        setting_line(
-            app,
-            "attack",
-            format!("{:>3}%", (app.config.settings.attack * 100.0) as u16),
-        ),
-        setting_line(
-            app,
-            "release",
-            format!("{:>3}%", (app.config.settings.release * 100.0) as u16),
-        ),
-        setting_line(app, "bars", bar_count_label(app)),
-        setting_line(app, "renderer", renderer_label(app)),
-        setting_line(app, "fft_size", app.config.settings.fft_size.to_string()),
-        setting_line(
-            app,
-            "analysis_hop",
-            app.config.settings.analysis_hop.to_string(),
-        ),
-        setting_line(
-            app,
-            "refresh_rate",
-            format!("{}Hz", app.config.settings.refresh_hz),
-        ),
-        setting_line(
-            app,
-            "audio_delay",
-            format!("{}ms", app.config.settings.audio_delay_ms),
-        ),
-        setting_line(
-            app,
-            "high_shelf",
-            on_off_label(app, app.config.settings.high_shelf_enabled),
-        ),
-        setting_line(
-            app,
-            "high_shelf_db",
-            format!("{:.0}dB", app.config.settings.high_shelf_db),
-        ),
-        setting_line(
-            app,
-            "visual_curve",
-            on_off_label(app, app.config.settings.visual_curve_enabled),
-        ),
-        setting_line(
-            app,
-            "curve_power",
-            format!("{:.2}", app.config.settings.visual_curve),
-        ),
-        setting_line(
-            app,
-            "trail",
-            on_off_label(app, app.config.settings.trail_enabled),
-        ),
-        setting_line(
-            app,
-            "trail_decay",
-            format!("{:>3}%", (app.config.settings.trail_decay * 100.0) as u16),
-        ),
-        setting_line(
-            app,
-            "accent_trace",
-            on_off_label(app, app.config.settings.accent_trace_enabled),
-        ),
-        setting_line(
-            app,
-            "accent_threshold",
-            format!(
-                "{:>3}%",
-                (app.config.settings.accent_trace_threshold * 100.0).round() as u16
-            ),
-        ),
-        setting_line(
-            app,
-            "ceiling",
-            format!("{:>3}%", (app.config.settings.ceiling * 100.0) as u16),
-        ),
-    ];
-
-    let visible_height = inner.height as usize;
-    let selected = app.setting_index.min(rows.len().saturating_sub(1));
-    let start = visible_list_start(selected, rows.len(), visible_height);
-    let end = rows.len().min(start + visible_height);
-    let visible_rows = if visible_height == 0 {
-        Vec::new()
+    if inner.width >= 58 && inner.height >= 10 {
+        draw_settings_board(frame, app, inner);
     } else {
-        rows.into_iter()
-            .skip(start)
-            .take(end.saturating_sub(start))
-            .collect()
-    };
-    let items: Vec<ListItem> = visible_rows.into_iter().map(ListItem::new).collect();
-    let mut state = ListState::default();
-    state.select(Some(selected.saturating_sub(start)));
-
-    let list = List::new(items).highlight_symbol("  ").highlight_style(
-        Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD),
-    );
-    frame.render_stateful_widget(list, inner, &mut state);
+        draw_settings_compact_list(frame, app, inner);
+    }
 }
 
 fn visible_list_start(selected: usize, len: usize, visible_height: usize) -> usize {
@@ -4592,6 +4962,564 @@ fn visible_list_start(selected: usize, len: usize, visible_height: usize) -> usi
         .saturating_add(1)
         .saturating_sub(visible_height)
         .min(max_start)
+}
+
+fn draw_settings_board(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let rows = settings_rows(app);
+    let selected_row = selected_setting_row(app.setting_index, &rows);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .split(area);
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(42),
+            Constraint::Length(1),
+            Constraint::Min(24),
+        ])
+        .split(sections[0]);
+    draw_settings_rows(frame, app, columns[0], &rows);
+    draw_vertical_divider(frame, theme, columns[1]);
+    draw_settings_description(frame, app, columns[2], selected_row.as_ref());
+
+    let footer = Line::from(vec![
+        Span::styled("←", Style::default().fg(theme.accent)),
+        Span::styled(" / ", Style::default().fg(theme.muted)),
+        Span::styled("→", Style::default().fg(theme.accent)),
+        Span::styled(
+            format!(" {}  ", app.t("setting_adjust")),
+            Style::default().fg(theme.muted),
+        ),
+        Span::styled("↑", Style::default().fg(theme.accent)),
+        Span::styled(" / ", Style::default().fg(theme.muted)),
+        Span::styled("↓", Style::default().fg(theme.accent)),
+        Span::styled(
+            format!(" {}", app.t("setting_select")),
+            Style::default().fg(theme.muted),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(footer), sections[1]);
+}
+
+fn draw_vertical_divider(frame: &mut Frame, theme: Theme, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let lines = (0..area.height)
+        .map(|_| Line::from(Span::styled("│", Style::default().fg(theme.border))))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_settings_compact_list(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme();
+    let rows = settings_rows(app);
+    let visible_height = area.height as usize;
+    let selected_position = rows
+        .iter()
+        .position(|row| row.index == app.setting_index)
+        .unwrap_or(0);
+    let start = visible_list_start(selected_position, rows.len(), visible_height);
+    let items: Vec<ListItem> = rows
+        .iter()
+        .skip(start)
+        .take(visible_height)
+        .map(|row| ListItem::new(setting_list_line(app, row, area.width as usize)))
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(selected_position.saturating_sub(start)));
+    let list = List::new(items).highlight_symbol("").highlight_style(
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_settings_rows(frame: &mut Frame, app: &App, area: Rect, rows: &[SettingRow]) {
+    let theme = app.theme();
+    let visible_height = area.height as usize;
+    let selected_position = rows
+        .iter()
+        .position(|row| row.index == app.setting_index)
+        .unwrap_or(0);
+    let start = visible_list_start(selected_position, rows.len(), visible_height);
+    let items: Vec<ListItem> = rows
+        .iter()
+        .skip(start)
+        .take(visible_height)
+        .map(|row| ListItem::new(setting_board_line(app, row, area.width as usize)))
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(selected_position.saturating_sub(start)));
+    let list = List::new(items).highlight_symbol("").highlight_style(
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_settings_description(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    selected: Option<&SettingRow>,
+) {
+    let theme = app.theme();
+    let Some(row) = selected else {
+        return;
+    };
+    let area = inset_rect(area, 2, 0);
+    let lines = vec![
+        Line::from(Span::styled(
+            app.t(row.key),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            app.t("current_value"),
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(Span::styled(
+            row.value.clone(),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            app.t("setting_range"),
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(Span::styled(
+            setting_range(app, row.key),
+            Style::default().fg(theme.text),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            app.t(setting_help_key(row.key)),
+            Style::default().fg(theme.muted),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+fn setting_board_line(app: &App, row: &SettingRow, width: usize) -> Line<'static> {
+    let theme = app.theme();
+    let selected = row.index == app.setting_index;
+    let label_width = ((width.saturating_sub(4)) * 58 / 100).clamp(8, 24);
+    let value_width = width.saturating_sub(3 + label_width);
+    let label = truncate_to_width(app.t(row.key), label_width);
+    let value = truncate_to_width(&row.value, value_width);
+    let marker = if selected { "›" } else { " " };
+    let base = if selected { theme.text } else { theme.muted };
+    Line::from(vec![
+        Span::styled(marker.to_string(), Style::default().fg(theme.accent)),
+        Span::raw(" "),
+        Span::styled(
+            pad_right_to_width(&label, label_width),
+            Style::default().fg(base).add_modifier(if selected {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            pad_left_to_width(&value, value_width),
+            Style::default().fg(if selected { theme.accent } else { theme.text }),
+        ),
+    ])
+}
+
+fn setting_list_line(app: &App, row: &SettingRow, width: usize) -> Line<'static> {
+    let theme = app.theme();
+    let selected = row.index == app.setting_index;
+    let label_width = width.saturating_sub(10).clamp(8, 18);
+    let value_width = width.saturating_sub(3 + label_width);
+    let label = truncate_to_width(app.t(row.key), label_width);
+    let value = truncate_to_width(&row.value, value_width);
+    let style = if selected {
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    Line::from(vec![
+        Span::styled(if selected { "› " } else { "  " }, style),
+        Span::styled(pad_right_to_width(&label, label_width), style),
+        Span::raw(" "),
+        Span::styled(
+            pad_left_to_width(&value, value_width),
+            Style::default().fg(if selected { theme.text } else { theme.muted }),
+        ),
+    ])
+}
+
+fn truncate_to_width(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut output = String::new();
+    let mut used = 0;
+    for ch in value.chars() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + char_width > width {
+            break;
+        }
+        output.push(ch);
+        used += char_width;
+    }
+    output
+}
+
+fn pad_right_to_width(value: &str, width: usize) -> String {
+    let value = truncate_to_width(value, width);
+    let padding = width.saturating_sub(UnicodeWidthStr::width(value.as_str()));
+    format!("{}{}", value, " ".repeat(padding))
+}
+
+fn pad_left_to_width(value: &str, width: usize) -> String {
+    let value = truncate_to_width(value, width);
+    let padding = width.saturating_sub(UnicodeWidthStr::width(value.as_str()));
+    format!("{}{}", " ".repeat(padding), value)
+}
+
+fn selected_setting_category(setting_index: usize, rows: &[SettingRow]) -> SettingCategory {
+    rows.iter()
+        .find(|row| row.index == setting_index)
+        .map(|row| row.category)
+        .unwrap_or(SettingCategory::General)
+}
+
+fn selected_setting_row(setting_index: usize, rows: &[SettingRow]) -> Option<SettingRow> {
+    rows.iter().find(|row| row.index == setting_index).cloned()
+}
+
+fn previous_setting_index(current: usize, rows: &[SettingRow]) -> usize {
+    let position = rows
+        .iter()
+        .position(|row| row.index == current)
+        .unwrap_or(0);
+    rows.get(position.saturating_sub(1))
+        .map(|row| row.index)
+        .unwrap_or(current)
+}
+
+fn next_setting_index(current: usize, rows: &[SettingRow]) -> usize {
+    let position = rows
+        .iter()
+        .position(|row| row.index == current)
+        .unwrap_or(0);
+    rows.get((position + 1).min(rows.len().saturating_sub(1)))
+        .map(|row| row.index)
+        .unwrap_or(current)
+}
+
+fn adjacent_setting_category_index(current: usize, rows: &[SettingRow], direction: i32) -> usize {
+    let category = selected_setting_category(current, rows);
+    let index = SETTING_CATEGORIES
+        .iter()
+        .position(|item| *item == category)
+        .unwrap_or(0);
+    let len = SETTING_CATEGORIES.len() as i32;
+    let next = (index as i32 + direction).rem_euclid(len) as usize;
+    let next_category = SETTING_CATEGORIES[next];
+    rows.iter()
+        .find(|row| row.category == next_category)
+        .map(|row| row.index)
+        .unwrap_or(current)
+}
+
+fn settings_rows(app: &App) -> Vec<SettingRow> {
+    vec![
+        setting_row(
+            0,
+            "language",
+            SettingCategory::General,
+            language_label(app.lang),
+        ),
+        setting_row(1, "theme", SettingCategory::General, theme_label(app)),
+        setting_row(
+            2,
+            "analysis_preset",
+            SettingCategory::Analysis,
+            preset_label(app, app.config.settings.analysis_preset),
+        ),
+        setting_row(
+            3,
+            "attack",
+            SettingCategory::Analysis,
+            format!("{:>3}%", (app.config.settings.attack * 100.0) as u16),
+        ),
+        setting_row(
+            4,
+            "release",
+            SettingCategory::Analysis,
+            format!("{:>3}%", (app.config.settings.release * 100.0) as u16),
+        ),
+        setting_row(5, "bars", SettingCategory::Analysis, bar_count_label(app)),
+        setting_row(6, "renderer", SettingCategory::Visual, renderer_label(app)),
+        setting_row(
+            7,
+            "fft_size",
+            SettingCategory::Analysis,
+            app.config.settings.fft_size.to_string(),
+        ),
+        setting_row(
+            8,
+            "analysis_hop",
+            SettingCategory::Analysis,
+            app.config.settings.analysis_hop.to_string(),
+        ),
+        setting_row(
+            9,
+            "refresh_rate",
+            SettingCategory::General,
+            format!("{}Hz", app.config.settings.refresh_hz),
+        ),
+        setting_row(
+            10,
+            "audio_delay",
+            SettingCategory::Processing,
+            format!("{}ms", app.config.settings.audio_delay_ms),
+        ),
+        setting_row(
+            11,
+            "high_shelf",
+            SettingCategory::Processing,
+            on_off_label(app, app.config.settings.high_shelf_enabled),
+        ),
+        setting_row(
+            12,
+            "high_shelf_db",
+            SettingCategory::Processing,
+            format!("{:.0}dB", app.config.settings.high_shelf_db),
+        ),
+        setting_row(
+            13,
+            "auto_sensitivity",
+            SettingCategory::Processing,
+            on_off_label(app, app.config.settings.auto_sensitivity_enabled),
+        ),
+        setting_row(
+            14,
+            "noise_reduction",
+            SettingCategory::Processing,
+            format!(
+                "{:>3}%",
+                (app.config.settings.noise_reduction * 100.0).round() as u16
+            ),
+        ),
+        setting_row(
+            15,
+            "bpm_analysis",
+            SettingCategory::Analysis,
+            on_off_label(app, app.config.settings.bpm_enabled),
+        ),
+        setting_row(
+            16,
+            "visual_curve",
+            SettingCategory::Visual,
+            on_off_label(app, app.config.settings.visual_curve_enabled),
+        ),
+        setting_row(
+            17,
+            "curve_power",
+            SettingCategory::Visual,
+            format!("{:.2}", app.config.settings.visual_curve),
+        ),
+        setting_row(
+            18,
+            "trail",
+            SettingCategory::Visual,
+            on_off_label(app, app.config.settings.trail_enabled),
+        ),
+        setting_row(
+            19,
+            "trail_decay",
+            SettingCategory::Visual,
+            format!("{:>3}%", (app.config.settings.trail_decay * 100.0) as u16),
+        ),
+        setting_row(
+            20,
+            "accent_trace",
+            SettingCategory::Visual,
+            on_off_label(app, app.config.settings.accent_trace_enabled),
+        ),
+        setting_row(
+            21,
+            "accent_threshold",
+            SettingCategory::Visual,
+            format!(
+                "{:>3}%",
+                (app.config.settings.accent_trace_threshold * 100.0).round() as u16
+            ),
+        ),
+        setting_row(
+            22,
+            "ceiling",
+            SettingCategory::Processing,
+            format!("{:>3}%", (app.config.settings.ceiling * 100.0) as u16),
+        ),
+    ]
+}
+
+fn setting_row(
+    index: usize,
+    key: &'static str,
+    category: SettingCategory,
+    value: impl Into<String>,
+) -> SettingRow {
+    SettingRow {
+        index,
+        key,
+        category,
+        value: value.into(),
+    }
+}
+
+fn setting_range(app: &App, key: &'static str) -> String {
+    match key {
+        "language" => LANGUAGES
+            .iter()
+            .map(|(_, label)| *label)
+            .collect::<Vec<_>>()
+            .join(" / "),
+        "theme" => THEMES
+            .iter()
+            .map(|theme_id| app.t(theme(*theme_id).title_key))
+            .collect::<Vec<_>>()
+            .join(" / "),
+        "analysis_preset" => ANALYSIS_PRESETS
+            .iter()
+            .map(|preset| app.t(preset.title_key()))
+            .collect::<Vec<_>>()
+            .join(" / "),
+        "attack" => percent_range(app, MIN_ATTACK, MAX_ATTACK, ATTACK_STEP),
+        "release" => percent_range(app, MIN_RELEASE, MAX_RELEASE, RELEASE_STEP),
+        "bars" => range_with_step(
+            app,
+            format!("{}-{}", MIN_CONFIG_BARS, MAX_CONFIG_BARS),
+            "8".to_string(),
+        ),
+        "renderer" => SPECTRUM_RENDERERS
+            .iter()
+            .map(|renderer| app.t(renderer_title_key(*renderer)))
+            .collect::<Vec<_>>()
+            .join(" / "),
+        "fft_size" => FFT_SIZES
+            .iter()
+            .map(|size| size.to_string())
+            .collect::<Vec<_>>()
+            .join(" / "),
+        "analysis_hop" => ANALYSIS_HOPS
+            .iter()
+            .map(|size| size.to_string())
+            .collect::<Vec<_>>()
+            .join(" / "),
+        "refresh_rate" => REFRESH_RATES
+            .iter()
+            .map(|rate| format!("{}Hz", rate))
+            .collect::<Vec<_>>()
+            .join(" / "),
+        "audio_delay" => range_with_step(
+            app,
+            format!("0-{}ms", MAX_AUDIO_DELAY_MS),
+            format!("{}ms", AUDIO_DELAY_STEP_MS),
+        ),
+        "high_shelf" | "auto_sensitivity" | "bpm_analysis" | "visual_curve" | "trail"
+        | "accent_trace" => format!("{} / {}", app.t("on"), app.t("off")),
+        "high_shelf_db" => range_with_step(
+            app,
+            format!("{:.0}-{:.0}dB", MIN_HIGH_SHELF_DB, MAX_HIGH_SHELF_DB),
+            format!("{:.0}dB", HIGH_SHELF_DB_STEP),
+        ),
+        "noise_reduction" => percent_range(
+            app,
+            MIN_NOISE_REDUCTION,
+            MAX_NOISE_REDUCTION,
+            NOISE_REDUCTION_STEP,
+        ),
+        "curve_power" => range_with_step(
+            app,
+            format!("{:.2}-{:.2}", MIN_VISUAL_CURVE, MAX_VISUAL_CURVE),
+            format!("{:.2}", VISUAL_CURVE_STEP),
+        ),
+        "trail_decay" => percent_range(app, MIN_TRAIL_DECAY, MAX_TRAIL_DECAY, TRAIL_DECAY_STEP),
+        "accent_threshold" => percent_range(
+            app,
+            MIN_ACCENT_TRACE_THRESHOLD,
+            MAX_ACCENT_TRACE_THRESHOLD,
+            ACCENT_TRACE_THRESHOLD_STEP,
+        ),
+        "ceiling" => percent_range(app, MIN_CEILING, MAX_CEILING, CEILING_STEP),
+        _ => app.t("help_setting_default").to_string(),
+    }
+}
+
+fn renderer_title_key(renderer: SpectrumRenderer) -> &'static str {
+    match renderer {
+        SpectrumRenderer::Blocks => "renderer_blocks",
+        SpectrumRenderer::Braille => "renderer_braille",
+        SpectrumRenderer::Cava => "renderer_cava",
+    }
+}
+
+fn range_with_step(app: &App, range: String, step: String) -> String {
+    format!("{} · {} {}", range, app.t("setting_step"), step)
+}
+
+fn percent_range(app: &App, min: f32, max: f32, step: f32) -> String {
+    range_with_step(
+        app,
+        format!("{}-{}", percent_label(min), percent_label(max)),
+        percent_label(step),
+    )
+}
+
+fn percent_label(value: f32) -> String {
+    let percent = value * 100.0;
+    if (percent - percent.round()).abs() < 0.01 {
+        format!("{:.0}%", percent)
+    } else {
+        format!("{:.1}%", percent)
+    }
+}
+
+fn setting_help_key(key: &'static str) -> &'static str {
+    match key {
+        "language" => "help_setting_language",
+        "theme" => "help_setting_theme",
+        "analysis_preset" => "help_setting_analysis_preset",
+        "attack" => "help_setting_attack",
+        "release" => "help_setting_release",
+        "bars" => "help_setting_bars",
+        "renderer" => "help_setting_renderer",
+        "fft_size" => "help_setting_fft_size",
+        "analysis_hop" => "help_setting_analysis_hop",
+        "refresh_rate" => "help_setting_refresh_rate",
+        "audio_delay" => "help_setting_audio_delay",
+        "high_shelf" => "help_setting_high_shelf",
+        "high_shelf_db" => "help_setting_high_shelf_db",
+        "auto_sensitivity" => "help_setting_auto_sensitivity",
+        "noise_reduction" => "help_setting_noise_reduction",
+        "bpm_analysis" => "help_setting_bpm_analysis",
+        "visual_curve" => "help_setting_visual_curve",
+        "curve_power" => "help_setting_curve_power",
+        "trail" => "help_setting_trail",
+        "trail_decay" => "help_setting_trail_decay",
+        "accent_trace" => "help_setting_accent_trace",
+        "accent_threshold" => "help_setting_accent_threshold",
+        "ceiling" => "help_setting_ceiling",
+        _ => "help_setting_default",
+    }
 }
 
 fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
@@ -4626,6 +5554,17 @@ fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "accent off".to_string()
     };
+    let sensitivity = if settings.auto_sensitivity_enabled {
+        "autosens on"
+    } else {
+        "autosens off"
+    };
+    let bpm = if settings.bpm_enabled {
+        format!("bpm {}", bpm_label(app))
+    } else {
+        "bpm off".to_string()
+    };
+    let beat = beat_phase_bar(app, 8);
     let lines = vec![
         Line::from(vec![
             pipeline_stage(theme, "SRC"),
@@ -4662,9 +5601,10 @@ fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
             pipeline_stage(theme, "DET"),
             Span::styled(
                 format!(
-                    "RMS+peak atk {:>2} rel {:>2}",
+                    "RMS+peak atk {:>2} rel {:>2} | {}",
                     (settings.attack * 100.0) as u16,
-                    (settings.release * 100.0) as u16
+                    (settings.release * 100.0) as u16,
+                    sensitivity
                 ),
                 Style::default().fg(theme.text),
             ),
@@ -4673,8 +5613,9 @@ fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
             pipeline_stage(theme, "PROC"),
             Span::styled(
                 format!(
-                    "{} | lim {:>2}% | {} | {} | {}",
+                    "{} | NR {:>2}% | lim {:>2}% | {} | {} | {}",
                     shelf,
+                    (settings.noise_reduction * 100.0).round() as u16,
                     (settings.ceiling * 100.0) as u16,
                     meter,
                     trail,
@@ -4682,6 +5623,14 @@ fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
                 ),
                 Style::default().fg(theme.text),
             ),
+        ]),
+        Line::from(vec![
+            pipeline_stage(theme, "TEMPO"),
+            Span::styled(bpm, Style::default().fg(theme.text)),
+            Span::raw(" "),
+            beat_indicator_span(app),
+            Span::raw(" "),
+            Span::styled(beat, Style::default().fg(theme.muted)),
         ]),
     ];
 
@@ -4695,17 +5644,6 @@ fn pipeline_stage(theme: Theme, label: &'static str) -> Span<'static> {
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD),
     )
-}
-
-fn setting_line(app: &App, key: &'static str, value: impl Into<String>) -> Line<'static> {
-    let theme = app.theme();
-    Line::from(vec![
-        Span::styled(
-            format!("{:<12}", app.t(key)),
-            Style::default().fg(theme.text),
-        ),
-        Span::styled(value.into(), Style::default().fg(theme.muted)),
-    ])
 }
 
 fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
@@ -4931,6 +5869,17 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
+fn inset_rect(area: Rect, horizontal: u16, vertical: u16) -> Rect {
+    let inset_x = horizontal.min(area.width / 2);
+    let inset_y = vertical.min(area.height / 2);
+    Rect {
+        x: area.x + inset_x,
+        y: area.y + inset_y,
+        width: area.width.saturating_sub(inset_x * 2),
+        height: area.height.saturating_sub(inset_y * 2),
+    }
+}
+
 fn language_label(lang: Lang) -> &'static str {
     LANGUAGES
         .iter()
@@ -4969,7 +5918,24 @@ fn renderer_label(app: &App) -> &'static str {
     match app.config.settings.renderer {
         SpectrumRenderer::Blocks => app.t("renderer_blocks"),
         SpectrumRenderer::Braille => app.t("renderer_braille"),
+        SpectrumRenderer::Cava => app.t("renderer_cava"),
     }
+}
+
+fn bpm_label(app: &App) -> String {
+    if !app.config.settings.bpm_enabled {
+        return app.t("off").to_string();
+    }
+
+    app.bpm_estimate
+        .map(|bpm| {
+            format!(
+                "{:>3} {:.0}%",
+                bpm.round() as u16,
+                (app.bpm_confidence * 100.0).round()
+            )
+        })
+        .unwrap_or_else(|| "--".to_string())
 }
 
 fn bar_count_label(app: &App) -> String {
@@ -5000,6 +5966,16 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "level") => "电平",
         (Lang::Zh, "config") => "配置",
         (Lang::Zh, "settings") => "设置",
+        (Lang::Zh, "settings_general") => "通用",
+        (Lang::Zh, "settings_analysis") => "分析",
+        (Lang::Zh, "settings_processing") => "处理",
+        (Lang::Zh, "settings_visual") => "视觉",
+        (Lang::Zh, "setting_adjust") => "调整",
+        (Lang::Zh, "setting_select") => "选择",
+        (Lang::Zh, "current_value") => "当前值",
+        (Lang::Zh, "setting_range") => "范围",
+        (Lang::Zh, "setting_step") => "步进",
+        (Lang::Zh, "beat") => "节拍",
         (Lang::Zh, "language") => "语言",
         (Lang::Zh, "theme") => "主题",
         (Lang::Zh, "smoothing") => "平滑",
@@ -5014,6 +5990,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "audio_delay") => "音频延迟",
         (Lang::Zh, "high_shelf") => "高频补偿",
         (Lang::Zh, "high_shelf_db") => "补偿强度",
+        (Lang::Zh, "auto_sensitivity") => "自动灵敏度",
+        (Lang::Zh, "noise_reduction") => "降噪",
+        (Lang::Zh, "bpm_analysis") => "BPM 分析",
+        (Lang::Zh, "bpm") => "BPM",
         (Lang::Zh, "visual_curve") => "高度曲线",
         (Lang::Zh, "curve_power") => "曲线指数",
         (Lang::Zh, "trail") => "残影",
@@ -5039,12 +6019,12 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "help_1") => "↑/↓ 或 j/k 移动选择。",
         (Lang::Zh, "help_2") => "Enter 执行；Space 开始或停止捕获。",
         (Lang::Zh, "help_3") => "频谱页按 s/p/t/m/w 显示或隐藏设置、链路、工具栏、master、波形。",
-        (Lang::Zh, "help_4") => "↑/↓ 选择设置，←/→ 调整；-/= 调整音频延迟；S 打开全屏设置。",
+        (Lang::Zh, "help_4") => "↑/↓ 选择设置，Tab 切分类，←/→ 调整；-/= 调整音频延迟；S 打开全屏设置。",
         (Lang::Zh, "help_5") => "窗口较小时模块会自动隐藏，仍可用快捷键操作；主菜单 q/Esc 退出。",
         (Lang::Zh, "permission_note") => "首次捕获会触发 macOS 屏幕与系统音频录制授权；Terb 只实时分析，不保存音频。",
         (Lang::Zh, "menu_hint") => "↑/↓ 选择 · Enter 确认 · Space 捕获 · ? 帮助 · q 退出",
         (Lang::Zh, "spectrum_hint") => "Space 捕获 · -/= 延迟 · s/p/t/m/w 模块 · S 设置 · q 菜单",
-        (Lang::Zh, "sidebar_hint") => "Space 开关捕获\n-/= 音频延迟\ns/p/t/m/w 模块\n↑/↓ 选择设置\n←/→ 调整\nS 设置\nq 菜单\n? 帮助",
+        (Lang::Zh, "sidebar_hint") => "Space 开关捕获\n-/= 音频延迟\ns/p/t/m/w 模块\nTab 分类\n↑/↓ 选择设置\n←/→ 调整\nS 设置\nq 菜单\n? 帮助",
         (Lang::Zh, "compact_hint") => "-/= 延迟 · s/p/t/m/w 模块 · S 设置 · q 菜单",
         (Lang::Zh, "ready") => "准备就绪。",
         (Lang::Zh, "starting") => "正在启动系统音频捕获...",
@@ -5060,9 +6040,11 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "state_permission") => "需授权",
         (Lang::Zh, "state_failed") => "错误",
         (Lang::Zh, "too_small") => "窗口太小，请放大终端。",
+        (Lang::Zh, "theme_spring") => "Spring",
         (Lang::Zh, "theme_system") => "系统",
         (Lang::Zh, "theme_graphite") => "石墨",
         (Lang::Zh, "theme_ocean") => "海蓝",
+        (Lang::Zh, "theme_vintage") => "vintage",
         (Lang::Zh, "theme_aurora") => "奥罗拉",
         (Lang::Zh, "theme_sonic_texture") => "音纹场",
         (Lang::Zh, "theme_noise_warp") => "流纹噪声",
@@ -5071,10 +6053,35 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "theme_mono") => "单色",
         (Lang::Zh, "renderer_blocks") => "方块",
         (Lang::Zh, "renderer_braille") => "盲文",
+        (Lang::Zh, "renderer_cava") => "CAVA 字符",
         (Lang::Zh, "preset_low_latency") => "低延迟",
         (Lang::Zh, "preset_balanced") => "均衡",
         (Lang::Zh, "preset_precision") => "精细",
         (Lang::Zh, "preset_custom") => "自定义",
+        (Lang::Zh, "help_setting_language") => "切换界面语言。不会影响配置结构或音频处理。",
+        (Lang::Zh, "help_setting_theme") => "切换终端配色主题。主题只影响显示，不改变分析结果。",
+        (Lang::Zh, "help_setting_analysis_preset") => "选择分析延迟、稳定度和刷新速度的预设组合。",
+        (Lang::Zh, "help_setting_attack") => "控制频谱上升速度。越高越跟手，越低越稳。",
+        (Lang::Zh, "help_setting_release") => "控制频谱回落速度。越高残留越长，越低回落越快。",
+        (Lang::Zh, "help_setting_bars") => "设置基础频段数量；大窗口会自动扩展到可用宽度。",
+        (Lang::Zh, "help_setting_renderer") => "选择主频谱渲染方式：实心方块、盲文子像素或 CAVA 字符。",
+        (Lang::Zh, "help_setting_fft_size") => "FFT 窗口长度。越大低频越稳，延迟和惯性也越高。",
+        (Lang::Zh, "help_setting_analysis_hop") => "分析跳步。越小刷新越密，CPU 使用会略升。",
+        (Lang::Zh, "help_setting_refresh_rate") => "终端绘制刷新率。高刷新更顺滑，也更吃终端性能。",
+        (Lang::Zh, "help_setting_audio_delay") => "视觉相对音频的延迟校正，可用 -/= 快速调整。",
+        (Lang::Zh, "help_setting_high_shelf") => "启用高频补偿，让高频段不被低频能量长期压住。",
+        (Lang::Zh, "help_setting_high_shelf_db") => "高频补偿强度。过高会让齿音和噪声偏亮。",
+        (Lang::Zh, "help_setting_auto_sensitivity") => "自动调整显示增益，兼顾安静和响亮片段。",
+        (Lang::Zh, "help_setting_noise_reduction") => "降低底噪和稳态背景对频谱高度的影响。",
+        (Lang::Zh, "help_setting_bpm_analysis") => "启用宽频谱通量节拍分析，并显示 BPM 与 beat 指示。",
+        (Lang::Zh, "help_setting_visual_curve") => "启用高度曲线，用非线性方式重映射柱高。",
+        (Lang::Zh, "help_setting_curve_power") => "高度曲线指数。越高越压低小信号，越低越抬高细节。",
+        (Lang::Zh, "help_setting_trail") => "显示峰值残影，方便观察瞬态和频段运动。",
+        (Lang::Zh, "help_setting_trail_decay") => "残影衰减速度。数值越高拖尾越长。",
+        (Lang::Zh, "help_setting_accent_trace") => "显示重音轮廓线，用于突出突然抬升的能量形状。",
+        (Lang::Zh, "help_setting_accent_threshold") => "重音触发阈值。越高越克制，越低越敏感。",
+        (Lang::Zh, "help_setting_ceiling") => "分析显示上限。降低后更少触顶，升高后动态空间更大。",
+        (Lang::Zh, "help_setting_default") => "使用左右方向键调整该设置。",
 
         (Lang::En, "main_menu") => "Main Menu",
         (Lang::En, "menu_spectrum") => "Open Spectrum",
@@ -5092,6 +6099,16 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "level") => "Level",
         (Lang::En, "config") => "Config",
         (Lang::En, "settings") => "Settings",
+        (Lang::En, "settings_general") => "general",
+        (Lang::En, "settings_analysis") => "analysis",
+        (Lang::En, "settings_processing") => "processing",
+        (Lang::En, "settings_visual") => "visual",
+        (Lang::En, "setting_adjust") => "adjust",
+        (Lang::En, "setting_select") => "select",
+        (Lang::En, "current_value") => "Current",
+        (Lang::En, "setting_range") => "Range",
+        (Lang::En, "setting_step") => "step",
+        (Lang::En, "beat") => "Beat",
         (Lang::En, "language") => "Language",
         (Lang::En, "theme") => "Theme",
         (Lang::En, "smoothing") => "Smoothing",
@@ -5106,6 +6123,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "audio_delay") => "Audio Delay",
         (Lang::En, "high_shelf") => "High-shelf",
         (Lang::En, "high_shelf_db") => "Shelf Gain",
+        (Lang::En, "auto_sensitivity") => "Autosens",
+        (Lang::En, "noise_reduction") => "Noise Reduce",
+        (Lang::En, "bpm_analysis") => "BPM Analyze",
+        (Lang::En, "bpm") => "BPM",
         (Lang::En, "visual_curve") => "Height Curve",
         (Lang::En, "curve_power") => "Curve Power",
         (Lang::En, "trail") => "Trail",
@@ -5131,12 +6152,12 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "help_1") => "Use ↑/↓ or j/k to move.",
         (Lang::En, "help_2") => "Enter activates; Space starts or stops capture.",
         (Lang::En, "help_3") => "In Spectrum, press s/p/t/m/w to show or hide settings, pipeline, toolbar, master, and waveform.",
-        (Lang::En, "help_4") => "Use ↑/↓ to select settings and ←/→ to adjust. -/= adjusts audio delay; S opens full-screen settings.",
+        (Lang::En, "help_4") => "Use ↑/↓ to select settings, Tab for groups, and ←/→ to adjust. -/= adjusts audio delay; S opens full-screen settings.",
         (Lang::En, "help_5") => "Small terminals hide modules automatically, but shortcuts still work. q/Esc quits from the main menu.",
         (Lang::En, "permission_note") => "First capture may trigger macOS Screen & System Audio Recording permission. Terb analyzes live audio only and does not save it.",
         (Lang::En, "menu_hint") => "↑/↓ select · Enter confirm · Space capture · ? help · q quit",
         (Lang::En, "spectrum_hint") => "Space capture · -/= delay · s/p/t/m/w modules · S settings · q menu",
-        (Lang::En, "sidebar_hint") => "Space toggle capture\n-/= audio delay\ns/p/t/m/w modules\n↑/↓ select setting\n←/→ adjust\nS settings\nq menu\n? help",
+        (Lang::En, "sidebar_hint") => "Space toggle capture\n-/= audio delay\ns/p/t/m/w modules\nTab groups\n↑/↓ select setting\n←/→ adjust\nS settings\nq menu\n? help",
         (Lang::En, "compact_hint") => "-/= delay · s/p/t/m/w modules · S settings · q menu",
         (Lang::En, "ready") => "Ready.",
         (Lang::En, "starting") => "Starting system-audio capture...",
@@ -5152,9 +6173,11 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "state_permission") => "Permission",
         (Lang::En, "state_failed") => "Error",
         (Lang::En, "too_small") => "Terminal window is too small.",
+        (Lang::En, "theme_spring") => "Spring",
         (Lang::En, "theme_system") => "System",
         (Lang::En, "theme_graphite") => "Graphite",
         (Lang::En, "theme_ocean") => "Ocean",
+        (Lang::En, "theme_vintage") => "Vintage",
         (Lang::En, "theme_aurora") => "Aurora",
         (Lang::En, "theme_sonic_texture") => "Sonic Texture",
         (Lang::En, "theme_noise_warp") => "Noise Warp",
@@ -5163,10 +6186,35 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "theme_mono") => "Mono",
         (Lang::En, "renderer_blocks") => "Blocks",
         (Lang::En, "renderer_braille") => "Braille",
+        (Lang::En, "renderer_cava") => "CAVA",
         (Lang::En, "preset_low_latency") => "Low Latency",
         (Lang::En, "preset_balanced") => "Balanced",
         (Lang::En, "preset_precision") => "Precision",
         (Lang::En, "preset_custom") => "Custom",
+        (Lang::En, "help_setting_language") => "Switches the interface language without changing the audio pipeline.",
+        (Lang::En, "help_setting_theme") => "Changes terminal colors only; analysis output stays untouched.",
+        (Lang::En, "help_setting_analysis_preset") => "Chooses a preset balance between latency, stability, and refresh density.",
+        (Lang::En, "help_setting_attack") => "Controls how quickly spectrum bars rise toward new peaks.",
+        (Lang::En, "help_setting_release") => "Controls how quickly spectrum bars fall after peaks.",
+        (Lang::En, "help_setting_bars") => "Sets the base band count; wide terminals can expand it automatically.",
+        (Lang::En, "help_setting_renderer") => "Chooses blocks, Braille subpixels, or CAVA-style stepped characters.",
+        (Lang::En, "help_setting_fft_size") => "FFT window size. Larger windows improve low-end stability but add inertia.",
+        (Lang::En, "help_setting_analysis_hop") => "Analysis hop size. Smaller hops update more often and cost slightly more CPU.",
+        (Lang::En, "help_setting_refresh_rate") => "Terminal draw rate. Higher values feel smoother if the terminal keeps up.",
+        (Lang::En, "help_setting_audio_delay") => "Visual delay compensation; -/= adjusts it directly while playing.",
+        (Lang::En, "help_setting_high_shelf") => "Enables high-frequency compensation so treble is not buried by bass energy.",
+        (Lang::En, "help_setting_high_shelf_db") => "High-shelf gain. Too much can make hiss and sibilance too prominent.",
+        (Lang::En, "help_setting_auto_sensitivity") => "Adapts display gain across quiet and loud passages.",
+        (Lang::En, "help_setting_noise_reduction") => "Reduces floor noise and steady background energy in the visual output.",
+        (Lang::En, "help_setting_bpm_analysis") => "Enables wideband spectral-flux tempo tracking and beat indicators.",
+        (Lang::En, "help_setting_visual_curve") => "Applies nonlinear height mapping to the spectrum.",
+        (Lang::En, "help_setting_curve_power") => "Height curve exponent. Higher values suppress small signals more.",
+        (Lang::En, "help_setting_trail") => "Shows a peak trail for transients and band movement.",
+        (Lang::En, "help_setting_trail_decay") => "Trail decay amount. Higher values keep the trail longer.",
+        (Lang::En, "help_setting_accent_trace") => "Draws accent envelopes when spectrum energy rises suddenly.",
+        (Lang::En, "help_setting_accent_threshold") => "Accent trigger threshold. Higher is more restrained.",
+        (Lang::En, "help_setting_ceiling") => "Display ceiling for analysis headroom and peak mapping.",
+        (Lang::En, "help_setting_default") => "Use left and right to adjust this setting.",
 
         (Lang::Ja, "main_menu") => "メインメニュー",
         (Lang::Ja, "menu_spectrum") => "スペクトラムを開く",
@@ -5184,6 +6232,16 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "level") => "レベル",
         (Lang::Ja, "config") => "設定ファイル",
         (Lang::Ja, "settings") => "設定",
+        (Lang::Ja, "settings_general") => "一般",
+        (Lang::Ja, "settings_analysis") => "解析",
+        (Lang::Ja, "settings_processing") => "処理",
+        (Lang::Ja, "settings_visual") => "表示",
+        (Lang::Ja, "setting_adjust") => "調整",
+        (Lang::Ja, "setting_select") => "選択",
+        (Lang::Ja, "current_value") => "現在値",
+        (Lang::Ja, "setting_range") => "範囲",
+        (Lang::Ja, "setting_step") => "刻み",
+        (Lang::Ja, "beat") => "拍",
         (Lang::Ja, "language") => "言語",
         (Lang::Ja, "theme") => "テーマ",
         (Lang::Ja, "smoothing") => "平滑化",
@@ -5198,6 +6256,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "audio_delay") => "音声遅延",
         (Lang::Ja, "high_shelf") => "高域補正",
         (Lang::Ja, "high_shelf_db") => "補正量",
+        (Lang::Ja, "auto_sensitivity") => "自動感度",
+        (Lang::Ja, "noise_reduction") => "ノイズ低減",
+        (Lang::Ja, "bpm_analysis") => "BPM 解析",
+        (Lang::Ja, "bpm") => "BPM",
         (Lang::Ja, "visual_curve") => "高さ曲線",
         (Lang::Ja, "curve_power") => "曲線指数",
         (Lang::Ja, "trail") => "残像",
@@ -5223,12 +6285,12 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "help_1") => "↑/↓ または j/k で移動します。",
         (Lang::Ja, "help_2") => "Enter で実行、Space でキャプチャ開始/停止。",
         (Lang::Ja, "help_3") => "スペクトラム画面では s/p/t/m/w で設定、チェーン、ツールバー、master、波形を表示/非表示にします。",
-        (Lang::Ja, "help_4") => "↑/↓ で設定選択、←/→ で変更。-/= で音声遅延を調整、S で全画面設定。",
+        (Lang::Ja, "help_4") => "↑/↓ で設定選択、Tab で分類切替、←/→ で変更。-/= で音声遅延を調整、S で全画面設定。",
         (Lang::Ja, "help_5") => "小さいウィンドウではモジュールを自動で隠しますが、ショートカットは使えます。メインメニューでは q/Esc で終了します。",
         (Lang::Ja, "permission_note") => "初回キャプチャでは macOS の画面とシステム音声録音権限が必要です。Terb はリアルタイム解析のみ行い、音声を保存しません。",
         (Lang::Ja, "menu_hint") => "↑/↓ 選択 · Enter 決定 · Space キャプチャ · ? ヘルプ · q 終了",
         (Lang::Ja, "spectrum_hint") => "Space キャプチャ · -/= 遅延 · s/p/t/m/w モジュール · S 設定 · q メニュー",
-        (Lang::Ja, "sidebar_hint") => "Space キャプチャ切替\n-/= 音声遅延\ns/p/t/m/w モジュール\n↑/↓ 設定選択\n←/→ 変更\nS 設定\nq メニュー\n? ヘルプ",
+        (Lang::Ja, "sidebar_hint") => "Space キャプチャ切替\n-/= 音声遅延\ns/p/t/m/w モジュール\nTab 分類\n↑/↓ 設定選択\n←/→ 変更\nS 設定\nq メニュー\n? ヘルプ",
         (Lang::Ja, "compact_hint") => "-/= 遅延 · s/p/t/m/w モジュール · S 設定 · q メニュー",
         (Lang::Ja, "ready") => "準備完了。",
         (Lang::Ja, "starting") => "システム音声キャプチャを開始しています...",
@@ -5244,9 +6306,11 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "state_permission") => "権限待ち",
         (Lang::Ja, "state_failed") => "エラー",
         (Lang::Ja, "too_small") => "ターミナルウィンドウが小さすぎます。",
+        (Lang::Ja, "theme_spring") => "Spring",
         (Lang::Ja, "theme_system") => "システム",
         (Lang::Ja, "theme_graphite") => "グラファイト",
         (Lang::Ja, "theme_ocean") => "オーシャン",
+        (Lang::Ja, "theme_vintage") => "ヴィンテージ",
         (Lang::Ja, "theme_aurora") => "オーロラ",
         (Lang::Ja, "theme_sonic_texture") => "音紋フィールド",
         (Lang::Ja, "theme_noise_warp") => "ノイズワープ",
@@ -5255,10 +6319,35 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "theme_mono") => "モノ",
         (Lang::Ja, "renderer_blocks") => "ブロック",
         (Lang::Ja, "renderer_braille") => "点字",
+        (Lang::Ja, "renderer_cava") => "CAVA 文字",
         (Lang::Ja, "preset_low_latency") => "低遅延",
         (Lang::Ja, "preset_balanced") => "バランス",
         (Lang::Ja, "preset_precision") => "精密",
         (Lang::Ja, "preset_custom") => "カスタム",
+        (Lang::Ja, "help_setting_language") => "表示言語を切り替えます。音声処理には影響しません。",
+        (Lang::Ja, "help_setting_theme") => "ターミナルの配色を変更します。解析結果は変わりません。",
+        (Lang::Ja, "help_setting_analysis_preset") => "遅延、安定性、更新密度のバランスを選びます。",
+        (Lang::Ja, "help_setting_attack") => "スペクトラムがピークへ上がる速さを調整します。",
+        (Lang::Ja, "help_setting_release") => "ピーク後にスペクトラムが下がる速さを調整します。",
+        (Lang::Ja, "help_setting_bars") => "基本バンド数です。広い端末では自動で拡張されます。",
+        (Lang::Ja, "help_setting_renderer") => "ブロック、点字サブピクセル、CAVA 風文字を切り替えます。",
+        (Lang::Ja, "help_setting_fft_size") => "FFT 窓長です。大きいほど低域は安定し、慣性も増えます。",
+        (Lang::Ja, "help_setting_analysis_hop") => "解析ホップです。小さいほど更新が細かくなります。",
+        (Lang::Ja, "help_setting_refresh_rate") => "端末描画の更新率です。高いほど滑らかですが負荷も増えます。",
+        (Lang::Ja, "help_setting_audio_delay") => "映像の遅延補正です。再生中も -/= で調整できます。",
+        (Lang::Ja, "help_setting_high_shelf") => "低域に埋もれやすい高域を補正します。",
+        (Lang::Ja, "help_setting_high_shelf_db") => "高域補正量です。上げすぎるとノイズが目立ちます。",
+        (Lang::Ja, "help_setting_auto_sensitivity") => "静かな部分と大きい部分に合わせて表示ゲインを調整します。",
+        (Lang::Ja, "help_setting_noise_reduction") => "底ノイズや定常成分の表示への影響を抑えます。",
+        (Lang::Ja, "help_setting_bpm_analysis") => "広帯域スペクトルフラックスで BPM と拍表示を解析します。",
+        (Lang::Ja, "help_setting_visual_curve") => "スペクトラム高さに非線形カーブを適用します。",
+        (Lang::Ja, "help_setting_curve_power") => "高さ曲線の指数です。高いほど小信号を抑えます。",
+        (Lang::Ja, "help_setting_trail") => "ピーク残像を表示し、瞬間的な動きを見やすくします。",
+        (Lang::Ja, "help_setting_trail_decay") => "残像の減衰量です。高いほど長く残ります。",
+        (Lang::Ja, "help_setting_accent_trace") => "急なエネルギー上昇を輪郭線として表示します。",
+        (Lang::Ja, "help_setting_accent_threshold") => "アクセント検出の閾値です。高いほど控えめです。",
+        (Lang::Ja, "help_setting_ceiling") => "解析表示の上限です。ヘッドルームとピーク表示を調整します。",
+        (Lang::Ja, "help_setting_default") => "左右キーでこの設定を調整します。",
 
         _ => key,
     }
@@ -5267,6 +6356,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans
@@ -5279,6 +6369,13 @@ mod tests {
         (0..width).map(|x| buf[(x, y)].symbol()).collect()
     }
 
+    fn buffer_text(buf: &Buffer, width: u16, height: u16) -> String {
+        (0..height)
+            .map(|y| buffer_row(buf, y, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn color_delta(left: Color, right: Color) -> u16 {
         let left = color_to_rgb(left);
         let right = color_to_rgb(right);
@@ -5288,14 +6385,153 @@ mod tests {
     }
 
     #[test]
-    fn settings_list_fits_twenty_rows_without_scrolling() {
-        assert_eq!(visible_list_start(0, SETTING_COUNT, 20), 0);
-        assert_eq!(visible_list_start(SETTING_COUNT - 1, SETTING_COUNT, 20), 0);
+    fn settings_list_fits_full_height_without_scrolling() {
+        let rows = settings_rows(&App::new(Config::default()));
+        let setting_count = rows.len();
+        assert_eq!(visible_list_start(0, setting_count, setting_count), 0);
+        assert_eq!(
+            visible_list_start(setting_count - 1, setting_count, setting_count),
+            0
+        );
     }
 
     #[test]
     fn settings_list_scrolls_selected_row_into_view() {
-        assert_eq!(visible_list_start(SETTING_COUNT - 1, SETTING_COUNT, 18), 2);
+        let rows = settings_rows(&App::new(Config::default()));
+        let setting_count = rows.len();
+        assert_eq!(
+            visible_list_start(setting_count - 1, setting_count, 18),
+            setting_count - 18
+        );
+    }
+
+    #[test]
+    fn tab_setting_category_moves_to_next_group() {
+        let rows = settings_rows(&App::new(Config::default()));
+
+        assert_eq!(adjacent_setting_category_index(0, &rows, 1), 2);
+        assert_eq!(adjacent_setting_category_index(2, &rows, 1), 10);
+        assert_eq!(adjacent_setting_category_index(10, &rows, 1), 6);
+        assert_eq!(adjacent_setting_category_index(6, &rows, 1), 0);
+    }
+
+    #[test]
+    fn setting_navigation_moves_through_full_list() {
+        let rows = settings_rows(&App::new(Config::default()));
+
+        assert_eq!(next_setting_index(1, &rows), 2);
+        assert_eq!(previous_setting_index(2, &rows), 1);
+        assert_eq!(
+            next_setting_index(22, &rows),
+            rows.last().expect("settings rows").index
+        );
+    }
+
+    #[test]
+    fn selected_theme_setting_cycles_both_directions() {
+        let mut app = App::new(Config::default());
+        let initial = app.theme_id;
+
+        app.adjust_setting_by_key("theme", 1);
+        assert_ne!(app.theme_id, initial);
+        app.adjust_setting_by_key("theme", -1);
+        assert_eq!(app.theme_id, initial);
+    }
+
+    #[test]
+    fn compact_settings_sidebar_scrolls_across_all_categories() {
+        let mut config = Config::default();
+        config.settings.language = "en".to_string();
+        let mut app = App::new(config);
+        app.setting_index = 22;
+        let backend = TestBackend::new(35, 22);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+
+        terminal
+            .draw(|frame| {
+                draw_settings_list(
+                    frame,
+                    &app,
+                    Rect::new(0, 0, 35, 22),
+                    panel_title(app.t("settings"), app.theme()),
+                )
+            })
+            .expect("render compact settings");
+
+        let text = buffer_text(terminal.backend().buffer(), 35, 22);
+        assert!(text.contains("Accent Trace"));
+        assert!(text.contains("Ceiling"));
+    }
+
+    #[test]
+    fn compact_settings_sidebar_preserves_wide_label_values() {
+        let mut config = Config::default();
+        config.settings.language = "zh".to_string();
+        config.settings.theme = ThemeId::Vintage;
+        let app = App::new(config);
+        let rows = settings_rows(&app);
+        let theme_row = rows
+            .iter()
+            .find(|row| row.key == "theme")
+            .expect("theme row");
+        let line = setting_list_line(&app, theme_row, 33);
+        let text = line_text(&line);
+
+        assert!(text.contains("主题"));
+        assert!(text.contains("vintage"));
+        assert_eq!(UnicodeWidthStr::width(text.as_str()), 33);
+    }
+
+    #[test]
+    fn bpm_pulse_lights_when_predicted_beat_arrives() {
+        let mut app = App::new(Config::default());
+        app.set_bpm_estimate(120.0);
+        app.bpm_next_beat_at = Some(Instant::now() - Duration::from_millis(1));
+
+        app.advance_bpm_pulse(Duration::from_millis(16));
+
+        assert_eq!(app.bpm_pulse, 1.0);
+        assert!(app.bpm_phase < 0.10);
+        assert!(beat_phase_bar(&app, 8).contains('●'));
+    }
+
+    #[test]
+    fn settings_board_renders_list_divider_and_selected_help() {
+        let mut config = Config::default();
+        config.settings.language = "en".to_string();
+        let app = App::new(config);
+        let backend = TestBackend::new(74, 18);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+
+        terminal
+            .draw(|frame| draw_settings_board(frame, &app, Rect::new(0, 0, 74, 18)))
+            .expect("render settings");
+
+        let text = buffer_text(terminal.backend().buffer(), 74, 18);
+        assert!(!text.contains("[general]"));
+        assert!(text.contains("Language"));
+        assert!(text.contains("│"));
+        assert!(text.contains("Current"));
+        assert!(text.contains("Range"));
+        assert!(text.contains("Switches the interface language"));
+    }
+
+    #[test]
+    fn high_shelf_gain_adjusts_across_expanded_range() {
+        let mut app = App::new(Config::default());
+        app.config.settings.high_shelf_db = MIN_HIGH_SHELF_DB;
+
+        for _ in 0..64 {
+            app.adjust_setting_by_key("high_shelf_db", 1);
+        }
+
+        assert_eq!(app.config.settings.high_shelf_db, MAX_HIGH_SHELF_DB);
+
+        for _ in 0..64 {
+            app.adjust_setting_by_key("high_shelf_db", -1);
+        }
+
+        assert_eq!(app.config.settings.high_shelf_db, MIN_HIGH_SHELF_DB);
     }
 
     #[test]
@@ -5345,6 +6581,75 @@ mod tests {
         let bars = display_bars(&[0.10, 0.95, 0.20, 0.30], 2);
 
         assert_eq!(bars, vec![0.95, 0.30]);
+    }
+
+    #[test]
+    fn renderer_cycle_includes_blocks_braille_and_cava() {
+        let mut app = App::new(Config::default());
+
+        assert_eq!(app.config.settings.renderer, SpectrumRenderer::Blocks);
+        app.cycle_renderer(1);
+        assert_eq!(app.config.settings.renderer, SpectrumRenderer::Braille);
+        app.cycle_renderer(1);
+        assert_eq!(app.config.settings.renderer, SpectrumRenderer::Cava);
+        app.cycle_renderer(1);
+        assert_eq!(app.config.settings.renderer, SpectrumRenderer::Blocks);
+    }
+
+    #[test]
+    fn cava_bar_cell_uses_eighth_height_symbols() {
+        assert_eq!(cava_bar_cell(0.0, 1, 2).level, 0);
+        assert_eq!(cava_bar_cell(0.50, 1, 2).level, 8);
+        assert_eq!(cava_bar_cell(0.56, 0, 2).level, 1);
+        assert_eq!(cava_block_symbol(1), "▁");
+        assert_eq!(cava_block_symbol(8), "█");
+    }
+
+    #[test]
+    fn vintage_theme_uses_refined_four_color_palette() {
+        let vintage = theme(ThemeId::Vintage);
+
+        assert!(THEMES.contains(&ThemeId::Vintage));
+        assert_eq!(vintage.border, Color::Rgb(96, 116, 86));
+        assert_eq!(vintage.text, Color::Rgb(238, 224, 204));
+        assert_eq!(vintage.mid, Color::Rgb(186, 106, 76));
+        assert_eq!(vintage.low, Color::Rgb(123, 37, 37));
+        assert_eq!(vintage.peak, Color::Rgb(96, 116, 86));
+    }
+
+    #[test]
+    fn spring_theme_uses_soft_vertical_palette() {
+        let spring = theme(ThemeId::Spring);
+
+        assert_eq!(Config::default().settings.theme, ThemeId::Spring);
+        assert!(THEMES.contains(&ThemeId::Spring));
+        assert_eq!(spring.high, Color::Rgb(252, 249, 234));
+        assert_eq!(spring.peak, Color::Rgb(186, 223, 219));
+        assert_eq!(spring.low, Color::Rgb(255, 164, 164));
+        assert_eq!(spring.mid, Color::Rgb(255, 189, 189));
+    }
+
+    #[test]
+    fn removed_themes_are_not_selectable() {
+        assert!(!THEMES.contains(&ThemeId::System));
+        assert!(!THEMES.contains(&ThemeId::Graphite));
+        assert!(!THEMES.contains(&ThemeId::Ocean));
+        assert!(!THEMES.contains(&ThemeId::NoiseWarp));
+        assert!(!THEMES.contains(&ThemeId::Amber));
+    }
+
+    #[test]
+    fn static_spectrum_color_is_vertical_not_frequency_split() {
+        let mut app = App::new(Config::default());
+        app.theme_id = ThemeId::Spring;
+
+        let left = spectrum_bar_color_at(&app, 2, 100, 0.80, 0.54, false);
+        let right = spectrum_bar_color_at(&app, 92, 100, 0.80, 0.54, false);
+        let lower = spectrum_bar_color_at(&app, 40, 100, 0.80, 0.22, false);
+        let upper = spectrum_bar_color_at(&app, 40, 100, 0.80, 0.86, false);
+
+        assert_eq!(left, right);
+        assert_ne!(lower, upper);
     }
 
     #[test]
@@ -5412,10 +6717,10 @@ mod tests {
     #[test]
     fn master_meter_color_blends_border_toward_theme_accent() {
         let mut app = App::new(Config::default());
-        app.theme_id = ThemeId::Ocean;
+        app.theme_id = ThemeId::Spring;
 
-        assert_eq!(master_meter_color(&app, 0.0), Color::Rgb(82, 88, 100));
-        assert_eq!(master_meter_color(&app, 1.0), Color::Rgb(17, 168, 205));
+        assert_eq!(master_meter_color(&app, 0.0), Color::Rgb(186, 223, 219));
+        assert_eq!(master_meter_color(&app, 1.0), Color::Rgb(255, 164, 164));
         assert_ne!(master_meter_color(&app, 0.5), master_meter_color(&app, 0.0));
         assert_ne!(master_meter_color(&app, 0.5), master_meter_color(&app, 1.0));
     }
@@ -5451,7 +6756,6 @@ mod tests {
             theme(ThemeId::SonicTexture).color_mode,
             ColorMode::SonicTexture
         );
-        assert_eq!(theme(ThemeId::NoiseWarp).color_mode, ColorMode::NoiseWarp);
         assert_eq!(theme(ThemeId::Miku).color_mode, ColorMode::Miku);
         assert!(!THEMES.contains(&ThemeId::PitchClass));
         assert!(!THEMES.contains(&ThemeId::ChromaBands));
@@ -5489,8 +6793,8 @@ mod tests {
             alpha: 255,
         };
         let mut pixels = vec![MikuPixel::default(); 25];
-        for x in 0..5 {
-            pixels[x] = matte;
+        for pixel in pixels.iter_mut().take(5) {
+            *pixel = matte;
         }
         pixels[1 + 5] = matte;
         pixels[2 + 2 * 5] = matte;
@@ -5617,29 +6921,6 @@ mod tests {
     }
 
     #[test]
-    fn noise_warp_theme_has_smooth_height_based_texture() {
-        let mut app = App::new(Config::default());
-        app.theme_id = ThemeId::NoiseWarp;
-        app.color_state = VisualColorState {
-            centroid: 0.56,
-            energy: 0.74,
-            flux: 0.24,
-            phase: 0.33,
-            dominant_pitch: 9,
-            pitch_confidence: 0.65,
-            ..VisualColorState::default()
-        };
-
-        let lower = music_color_for_position_at(&app, 0.58, 0.76, 0.18, false);
-        let upper = music_color_for_position_at(&app, 0.58, 0.76, 0.86, false);
-        let left = music_color_for_position_at(&app, 0.512, 0.76, 0.62, false);
-        let right = music_color_for_position_at(&app, 0.518, 0.76, 0.62, false);
-
-        assert_ne!(lower, upper);
-        assert!(color_delta(left, right) < 55);
-    }
-
-    #[test]
     fn pitch_class_for_frequency_maps_a440_to_a() {
         assert_eq!(pitch_class_for_frequency(440.0), 9);
         assert_eq!(pitch_class_for_frequency(261.63), 0);
@@ -5685,6 +6966,25 @@ mod tests {
 
         assert_eq!(app.theme_id, ThemeId::SonicTexture);
         assert_eq!(app.config.settings.theme, ThemeId::SonicTexture);
+    }
+
+    #[test]
+    fn removed_theme_config_migrates_to_spring() {
+        for removed in [
+            ThemeId::System,
+            ThemeId::Graphite,
+            ThemeId::Ocean,
+            ThemeId::NoiseWarp,
+            ThemeId::Amber,
+        ] {
+            let mut config = Config::default();
+            config.settings.theme = removed;
+
+            let app = App::new(config);
+
+            assert_eq!(app.theme_id, ThemeId::Spring);
+            assert_eq!(app.config.settings.theme, ThemeId::Spring);
+        }
     }
 
     #[test]
@@ -5763,6 +7063,19 @@ mod tests {
     }
 
     #[test]
+    fn spectrum_trail_uses_expanded_decay_range() {
+        let settings = Settings {
+            trail_decay: MIN_TRAIL_DECAY,
+            ..Config::default().settings
+        };
+        let mut trail = vec![1.0];
+
+        update_spectrum_trail(&mut trail, &[0.0], &settings);
+
+        assert!((trail[0] - MIN_TRAIL_DECAY).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn disabled_spectrum_trail_tracks_current_bars() {
         let settings = Settings {
             trail_enabled: false,
@@ -5808,18 +7121,33 @@ mod tests {
             age: Duration::from_millis(0),
         };
 
-        let start_offset = trace.vertical_offset_rows();
+        let start_offset = trace.vertical_offset_rows(48);
         let (start_mask, _) = accent_trace_braille_cell(&envelope, 0, 5, 48, start_offset);
         trace.age = Duration::from_millis(ACCENT_TRACE_OFFSET_ANIMATION_MS / 2);
-        let mid_offset = trace.vertical_offset_rows();
+        let mid_offset = trace.vertical_offset_rows(48);
         trace.age = Duration::from_millis(ACCENT_TRACE_OFFSET_ANIMATION_MS);
-        let end_offset = trace.vertical_offset_rows();
+        let end_offset = trace.vertical_offset_rows(48);
 
         assert_eq!(start_mask, 0x09);
         assert!((start_offset - ACCENT_TRACE_START_OFFSET_CELLS * 4.0).abs() < 0.001);
         assert!(mid_offset > start_offset);
         assert!(mid_offset < end_offset);
         assert!((end_offset - ACCENT_TRACE_END_OFFSET_CELLS * 4.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn accent_trace_offset_scales_down_for_short_windows() {
+        let trace = AccentTrace {
+            envelope: vec![0.50, 0.50],
+            age: Duration::from_millis(ACCENT_TRACE_OFFSET_ANIMATION_MS),
+        };
+
+        let reference_offset = trace.vertical_offset_rows(48);
+        let short_offset = trace.vertical_offset_rows(16);
+
+        assert!((reference_offset - ACCENT_TRACE_END_OFFSET_CELLS * 4.0).abs() < 0.001);
+        assert!(short_offset < reference_offset);
+        assert!(short_offset <= 16.0 * reference_offset / 48.0 + 0.001);
     }
 
     #[test]
@@ -5898,13 +7226,13 @@ mod tests {
         let mut app = App::new(Config::default());
         app.spectrum = vec![0.0; 32];
 
-        app.update_accent_trace_detector(&vec![0.80; 32]);
+        app.update_accent_trace_detector(&[0.80; 32]);
 
         assert!(app.pending_accent_trace.is_some());
         assert!(app.accent_traces.is_empty());
 
         app.spectrum = vec![0.80; 32];
-        app.update_accent_trace_detector(&vec![0.55; 32]);
+        app.update_accent_trace_detector(&[0.55; 32]);
 
         assert_eq!(app.accent_traces.len(), 1);
         assert!(!app.accent_trace_cooldown.is_zero());
@@ -5916,7 +7244,7 @@ mod tests {
         app.config.settings.accent_trace_enabled = false;
         app.spectrum = vec![0.0; 32];
 
-        app.update_accent_trace_detector(&vec![0.80; 32]);
+        app.update_accent_trace_detector(&[0.80; 32]);
 
         assert!(app.pending_accent_trace.is_none());
         assert!(app.accent_traces.is_empty());
@@ -5956,6 +7284,7 @@ mod tests {
         .expect("legacy config should still load");
 
         assert_eq!(config.settings.renderer, SpectrumRenderer::Blocks);
+        assert_eq!(App::new(config).theme_id, ThemeId::Spring);
     }
 
     #[test]
@@ -5965,6 +7294,9 @@ mod tests {
         app.screen = Screen::Spectrum;
 
         app.config.settings.renderer = SpectrumRenderer::Blocks;
+        assert_eq!(visual_bar_count(&app, area), Some(82));
+
+        app.config.settings.renderer = SpectrumRenderer::Cava;
         assert_eq!(visual_bar_count(&app, area), Some(82));
 
         app.config.settings.renderer = SpectrumRenderer::Braille;
@@ -5983,10 +7315,43 @@ mod tests {
     }
 
     #[test]
+    fn configured_minimum_bar_count_reaches_analyzer() {
+        let mut config = Config::default();
+        config.settings.bar_count = MIN_CONFIG_BARS;
+        let app = App::new(config);
+
+        assert_eq!(app.analysis_bar_count(), MIN_CONFIG_BARS);
+        assert_eq!(app.analyzer.bar_count, MIN_CONFIG_BARS);
+    }
+
+    #[test]
     fn sample_magnitude_interpolates_fractional_bins() {
         let value = sample_magnitude(&[0.0, 1.0, 3.0, 4.0], 1.5);
 
         assert!((value - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn adaptive_processing_lifts_quiet_signal_without_exceeding_ceiling() {
+        let settings = Settings {
+            auto_sensitivity_enabled: true,
+            noise_reduction: 0.20,
+            ceiling: 0.88,
+            ..Config::default().settings
+        };
+        let pipeline = SpectrumPipeline::from_settings(&settings);
+        let mut analyzer = SpectrumAnalyzer::new(1024, 48_000.0, 8, 256);
+        let mut bars = vec![0.01; 8];
+
+        for _ in 0..80 {
+            bars.fill(0.01);
+            analyzer.apply_adaptive_processing(&mut bars, 0.001, pipeline);
+        }
+        bars = vec![0.05; 8];
+        analyzer.apply_adaptive_processing(&mut bars, 0.003, pipeline);
+
+        assert!(bars.iter().any(|value| *value > 0.05));
+        assert!(bars.iter().all(|value| *value <= settings.ceiling));
     }
 
     #[test]
