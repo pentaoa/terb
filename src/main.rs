@@ -119,8 +119,7 @@ const ACCENT_NOTE_FADE_IN_MS: u64 = 100;
 const ACCENT_NOTE_FADE_OUT_MS: u64 = 500;
 const ACCENT_NOTE_COUNT: usize = 28;
 const ALBUM_ART_POLL_INTERVAL_MS: u64 = 3_000;
-const ALBUM_CIRCLE_SWEEP_TURNS_PER_SECOND: f32 = 0.10;
-const ALBUM_CIRCLE_ROLL_TURNS_PER_SWEEP: f32 = 0.17;
+const ALBUM_CIRCLE_ROTATION_TURNS_PER_SECOND: f32 = 0.017;
 const MASTER_METER_WIDTH: u16 = 16;
 const MASTER_METER_CHANNEL_WIDTH: usize = 7;
 const BRAILLE_LEFT_COLUMN_MASK: u8 = 0x01 | 0x02 | 0x04 | 0x40;
@@ -812,7 +811,7 @@ struct App {
     accent_note_bursts: Vec<AccentNoteBurst>,
     miku_trigger_times: VecDeque<Instant>,
     miku_frame_phase: f32,
-    album_circle_sweep_phase: f32,
+    album_circle_rotation_phase: f32,
     accent_energy_baseline: f32,
     accent_trace_cooldown: Duration,
     color_state: VisualColorState,
@@ -1436,7 +1435,7 @@ impl App {
             accent_note_bursts: Vec::new(),
             miku_trigger_times: VecDeque::new(),
             miku_frame_phase: 0.0,
-            album_circle_sweep_phase: 0.0,
+            album_circle_rotation_phase: 0.0,
             accent_energy_baseline: 0.0,
             accent_trace_cooldown: Duration::from_millis(0),
             color_state: VisualColorState::default(),
@@ -1490,7 +1489,7 @@ impl App {
 
     fn tick(&mut self, elapsed: Duration) {
         self.advance_miku_animation(elapsed);
-        self.advance_album_circle_sweep(elapsed);
+        self.advance_album_circle_rotation(elapsed);
         self.advance_bpm_pulse(elapsed);
         self.drain_album_art_events();
         self.request_album_art_if_due();
@@ -1510,9 +1509,9 @@ impl App {
             (self.miku_frame_phase + elapsed.as_secs_f32() * fps).rem_euclid(1_000_000.0);
     }
 
-    fn advance_album_circle_sweep(&mut self, elapsed: Duration) {
-        self.album_circle_sweep_phase = (self.album_circle_sweep_phase
-            + elapsed.as_secs_f32() * ALBUM_CIRCLE_SWEEP_TURNS_PER_SECOND)
+    fn advance_album_circle_rotation(&mut self, elapsed: Duration) {
+        self.album_circle_rotation_phase = (self.album_circle_rotation_phase
+            + elapsed.as_secs_f32() * ALBUM_CIRCLE_ROTATION_TURNS_PER_SECOND)
             .rem_euclid(1_000_000.0);
     }
 
@@ -4221,7 +4220,7 @@ fn album_braille_sample(
             cell_row,
             virtual_width,
             virtual_height,
-            app.album_circle_sweep_phase,
+            app.album_circle_rotation_phase,
         ),
         _ => None,
     }
@@ -4250,11 +4249,7 @@ fn album_artwork_image_cell(
             continue;
         };
 
-        let dither = album_artwork_dot_threshold(dot_col, dot_row);
-        let density = (sample.luma * 0.78 + sample.edge * 0.42).clamp(0.0, 1.0);
-        if density > dither {
-            mask |= bit;
-        }
+        mask |= bit;
 
         let weight = (0.20 + sample.luma * 0.55 + sample.edge * 0.25).clamp(0.05, 1.0);
         red_sum += sample.red as f32 * weight;
@@ -4265,7 +4260,7 @@ fn album_artwork_image_cell(
         weight_sum += weight;
     }
 
-    if mask == 0 || weight_sum <= 0.0 {
+    if weight_sum <= 0.0 {
         return None;
     }
 
@@ -4287,7 +4282,7 @@ fn album_artwork_circle_cell(
     cell_row: usize,
     virtual_width: usize,
     virtual_height: usize,
-    sweep_phase: f32,
+    rotation_phase: f32,
 ) -> Option<(u8, AlbumSample)> {
     let mut mask = 0_u8;
     let mut red_sum = 0.0_f32;
@@ -4300,17 +4295,18 @@ fn album_artwork_circle_cell(
     for (dot_col, dot_row, bit) in braille_dot_bits() {
         let x = cell_col * 2 + dot_col;
         let y = cell_row * 4 + dot_row;
-        let Some(sample) =
-            sample_album_artwork_circle(artwork, x, y, virtual_width, virtual_height, sweep_phase)
-        else {
+        let Some(sample) = sample_album_artwork_circle(
+            artwork,
+            x,
+            y,
+            virtual_width,
+            virtual_height,
+            rotation_phase,
+        ) else {
             continue;
         };
 
-        let dither = album_artwork_dot_threshold(dot_col, dot_row);
-        let density = (sample.luma * 0.82 + sample.edge * 0.36).clamp(0.0, 1.0);
-        if density > dither {
-            mask |= bit;
-        }
+        mask |= bit;
 
         let weight = (0.22 + sample.luma * 0.58 + sample.edge * 0.20).clamp(0.05, 1.0);
         red_sum += sample.red as f32 * weight;
@@ -4321,7 +4317,7 @@ fn album_artwork_circle_cell(
         weight_sum += weight;
     }
 
-    if mask == 0 || weight_sum <= 0.0 {
+    if weight_sum <= 0.0 {
         return None;
     }
 
@@ -4335,11 +4331,6 @@ fn album_artwork_circle_cell(
             edge: (edge_sum / weight_sum).clamp(0.0, 1.0),
         },
     ))
-}
-
-fn album_artwork_dot_threshold(dot_col: usize, dot_row: usize) -> f32 {
-    const THRESHOLDS: [[f32; 4]; 2] = [[0.08, 0.56, 0.32, 0.78], [0.44, 0.20, 0.68, 0.92]];
-    THRESHOLDS[dot_col.min(1)][dot_row.min(3)]
 }
 
 fn sample_album_artwork_image(
@@ -4373,7 +4364,7 @@ fn sample_album_artwork_circle(
     y: usize,
     virtual_width: usize,
     virtual_height: usize,
-    sweep_phase: f32,
+    rotation_phase: f32,
 ) -> Option<AlbumSample> {
     if virtual_width <= 1 || virtual_height <= 1 || artwork.width <= 1 || artwork.height <= 1 {
         return None;
@@ -4394,10 +4385,7 @@ fn sample_album_artwork_circle(
         return None;
     }
 
-    let angle = local_y.atan2(local_x).rem_euclid(std::f32::consts::TAU);
-    let angle_turn = angle / std::f32::consts::TAU;
-    let last_sweep = album_circle_last_sweep_turn(angle_turn, sweep_phase);
-    let rotation = last_sweep * ALBUM_CIRCLE_ROLL_TURNS_PER_SWEEP * std::f32::consts::TAU;
+    let rotation = rotation_phase * std::f32::consts::TAU;
     let (sin, cos) = rotation.sin_cos();
     let source_x = local_x * cos - local_y * sin;
     let source_y = local_x * sin + local_y * cos;
@@ -4407,16 +4395,6 @@ fn sample_album_artwork_circle(
     let circle_edge = smoothstep(((radius_squared.sqrt() - 0.93) / 0.07).clamp(0.0, 1.0));
     sample.edge = sample.edge.max(circle_edge);
     Some(sample)
-}
-
-fn album_circle_last_sweep_turn(angle_turn: f32, sweep_phase: f32) -> f32 {
-    let angle_turn = angle_turn.rem_euclid(1.0);
-    let sweep_turn = sweep_phase.rem_euclid(1.0);
-    if angle_turn <= sweep_turn {
-        sweep_phase.floor() + angle_turn
-    } else {
-        sweep_phase.floor() - 1.0 + angle_turn
-    }
 }
 
 fn album_artwork_layout(
@@ -5118,20 +5096,18 @@ fn draw_braille_spectrum(frame: &mut Frame, app: &App, area: Rect) {
                         .map(|(background_mask, _)| background_mask)
                         .or_else(|| miku_sample.map(|(background_mask, _)| background_mask))
                         .unwrap_or(0);
+                    let color = accent_trace_overlay_color(theme, Some(base_color), overlay);
                     spans.push(Span::styled(
                         braille_pattern(combined_mask | overlay.mask | background_mask).to_string(),
-                        Style::default().fg(accent_trace_overlay_color(
-                            theme,
-                            Some(base_color),
-                            overlay,
-                        )),
+                        Style::default().fg(color),
                     ));
                 }
             } else if combined_mask == 0 {
                 if let Some((background_mask, sample)) = album_sample {
+                    let color = album_background_color(theme, sample);
                     spans.push(Span::styled(
                         braille_pattern(background_mask).to_string(),
-                        Style::default().fg(album_background_color(theme, sample)),
+                        Style::default().fg(color),
                     ));
                 } else if let Some((background_mask, sample)) = miku_sample {
                     spans.push(Span::styled(
@@ -8556,6 +8532,30 @@ mod tests {
     }
 
     #[test]
+    fn album_artwork_black_cell_renders_dark_braille() {
+        let artwork =
+            album_artwork_edges_from_luma("test".to_string(), 4, 4, &[0.0; 16]).expect("artwork");
+
+        let (mask, sample) =
+            album_artwork_image_cell(&artwork, 0, 0, 4, 4).expect("black cover cell");
+
+        assert_eq!(mask, 0xff);
+        assert!(sample.luma < 0.01);
+    }
+
+    #[test]
+    fn album_artwork_mid_luma_cell_renders_dense_braille() {
+        let artwork =
+            album_artwork_edges_from_luma("test".to_string(), 4, 4, &[0.35; 16]).expect("artwork");
+
+        let (mask, sample) =
+            album_artwork_image_cell(&artwork, 0, 0, 4, 4).expect("mid-luma cover cell");
+
+        assert_eq!(mask, 0xff);
+        assert!((sample.luma - 0.35).abs() < 0.01);
+    }
+
+    #[test]
     fn circle_album_crops_to_centered_disc() {
         let artwork =
             album_artwork_edges_from_luma("test".to_string(), 8, 8, &[1.0; 64]).expect("artwork");
@@ -8571,13 +8571,41 @@ mod tests {
     }
 
     #[test]
-    fn circle_album_uses_radial_sweep_refresh_timing() {
-        let swept = album_circle_last_sweep_turn(0.10, 3.25);
-        let waiting = album_circle_last_sweep_turn(0.80, 3.25);
+    fn circle_album_edge_uses_partial_coverage_mask() {
+        let artwork =
+            album_artwork_edges_from_luma("test".to_string(), 8, 8, &[1.0; 64]).expect("artwork");
 
-        assert!((swept - 3.10).abs() < 0.001);
-        assert!((waiting - 2.80).abs() < 0.001);
-        assert!(swept > waiting);
+        let (mask, _) =
+            album_artwork_circle_cell(&artwork, 7, 1, 16, 16, 0.0).expect("circle edge cell");
+
+        assert_ne!(mask, 0);
+        assert_ne!(mask, 0xff);
+    }
+
+    #[test]
+    fn circle_album_rotates_as_one_disc() {
+        let mut pixels = Vec::new();
+        let mut luma = Vec::new();
+        for y in 0..8 {
+            for x in 0..8 {
+                pixels.push(AlbumPixel {
+                    red: (x * 32) as u8,
+                    green: (y * 32) as u8,
+                    blue: 0,
+                });
+                luma.push(0.8);
+            }
+        }
+        let artwork = album_artwork_from_luma_and_pixels("test".to_string(), 8, 8, pixels, luma)
+            .expect("artwork");
+
+        let before =
+            sample_album_artwork_circle(&artwork, 12, 8, 16, 16, 0.0).expect("right-side sample");
+        let rotated =
+            sample_album_artwork_circle(&artwork, 12, 8, 16, 16, 0.25).expect("rotated sample");
+
+        assert!(before.red > before.green);
+        assert!(rotated.green > rotated.red);
     }
 
     #[test]
@@ -8767,6 +8795,20 @@ mod tests {
 
         app.config.settings.renderer = SpectrumRenderer::Braille;
         assert_eq!(visual_bar_count(&app, area), Some(164));
+    }
+
+    #[test]
+    fn album_theme_keeps_selected_renderer_sampling_width() {
+        let mut app = App::new(Config::default());
+        let area = Rect::new(0, 0, 100, 30);
+        app.screen = Screen::Spectrum;
+        app.theme_id = ThemeId::AlbumArt;
+
+        app.config.settings.renderer = SpectrumRenderer::Blocks;
+        assert_eq!(visual_bar_count(&app, area), Some(82));
+
+        app.config.settings.renderer = SpectrumRenderer::Cava;
+        assert_eq!(visual_bar_count(&app, area), Some(82));
     }
 
     #[test]
