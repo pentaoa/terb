@@ -5352,8 +5352,12 @@ fn next_random_unit(seed: &mut u64) -> f32 {
 
 fn fetch_now_playing_album_artwork() -> Option<AlbumArtwork> {
     fetch_mediaremote_album_artwork()
-        .or_else(fetch_music_album_artwork)
-        .or_else(fetch_spotify_album_artwork)
+        .or_else(|| fetch_music_album_artwork(false))
+        .or_else(|| fetch_spotify_album_artwork(false))
+        .or_else(fetch_mediaremote_app_icon_artwork)
+        .or_else(fetch_coreaudio_app_icon_artwork)
+        .or_else(|| fetch_music_album_artwork(true))
+        .or_else(|| fetch_spotify_album_artwork(true))
 }
 
 const MEDIAREMOTE_ADAPTER_ARCHIVE: &[u8] =
@@ -5361,20 +5365,7 @@ const MEDIAREMOTE_ADAPTER_ARCHIVE: &[u8] =
 const MEDIAREMOTE_ADAPTER_DIR: &str = "terb-mediaremote-adapter-v1";
 
 fn fetch_mediaremote_album_artwork() -> Option<AlbumArtwork> {
-    let adapter_dir = mediaremote_adapter_dir()?;
-    let script = adapter_dir.join("mediaremote-adapter.pl");
-    let framework = adapter_dir.join("MediaRemoteAdapter.framework");
-    let output = Command::new("/usr/bin/perl")
-        .arg(script)
-        .arg(framework)
-        .arg("get")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let payload = fetch_mediaremote_payload(false)?;
     let artwork = payload.get("artworkData")?.as_str()?.replace('\n', "");
     let bytes = general_purpose::STANDARD.decode(artwork.as_bytes()).ok()?;
     let bundle = json_string_field(&payload, "bundleIdentifier");
@@ -5384,6 +5375,82 @@ fn fetch_mediaremote_album_artwork() -> Option<AlbumArtwork> {
     let key = format!("MediaRemote|{bundle}|{artist}|{album}|{title}");
 
     decode_album_artwork_edges(key, &bytes)
+}
+
+fn fetch_mediaremote_payload(no_artwork: bool) -> Option<serde_json::Value> {
+    let adapter_dir = mediaremote_adapter_dir()?;
+    let script = adapter_dir.join("mediaremote-adapter.pl");
+    let framework = adapter_dir.join("MediaRemoteAdapter.framework");
+    let mut command = Command::new("/usr/bin/perl");
+    command.arg(script).arg(framework).arg("get");
+    if no_artwork {
+        command.arg("--no-artwork");
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    (!payload.is_null()).then_some(payload)
+}
+
+fn fetch_mediaremote_app_icon_artwork() -> Option<AlbumArtwork> {
+    let payload = fetch_mediaremote_payload(true)?;
+    if !mediaremote_payload_is_playing(&payload) {
+        return None;
+    }
+    let bundle = json_string_field(&payload, "bundleIdentifier");
+    if bundle.trim().is_empty() {
+        return None;
+    }
+    if is_music_player_bundle(bundle) {
+        return None;
+    }
+
+    fetch_app_icon_artwork(bundle, "MediaRemote")
+}
+
+fn mediaremote_payload_is_playing(payload: &serde_json::Value) -> bool {
+    for key in ["isPlaying", "playing"] {
+        if let Some(playing) = payload.get(key).and_then(|value| value.as_bool()) {
+            return playing;
+        }
+    }
+
+    for key in ["playbackRate", "rate"] {
+        if let Some(rate) = payload.get(key).and_then(|value| value.as_f64()) {
+            return rate.abs() > 0.01;
+        }
+        if let Some(rate) = payload
+            .get(key)
+            .and_then(|value| value.as_str())
+            .and_then(|value| value.parse::<f64>().ok())
+        {
+            return rate.abs() > 0.01;
+        }
+    }
+
+    for key in ["playbackState", "state"] {
+        if let Some(state) = payload.get(key).and_then(|value| value.as_i64()) {
+            return state != 0;
+        }
+        if let Some(state) = payload.get(key).and_then(|value| value.as_str()) {
+            let state = state.to_ascii_lowercase();
+            if state.contains("playing") || state == "1" {
+                return true;
+            }
+            if state.contains("paused")
+                || state.contains("stopped")
+                || state.contains("idle")
+                || state == "0"
+            {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 fn mediaremote_adapter_dir() -> Option<PathBuf> {
@@ -5421,9 +5488,14 @@ fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> &'a str {
         .unwrap_or("")
 }
 
-fn fetch_music_album_artwork() -> Option<AlbumArtwork> {
+fn fetch_music_album_artwork(allow_paused: bool) -> Option<AlbumArtwork> {
     let path = env::temp_dir().join("terb-now-playing-music-artwork.bin");
     let path_literal = applescript_string_literal(&path.to_string_lossy());
+    let paused_check = if allow_paused {
+        "or player state is paused"
+    } else {
+        ""
+    };
     let script = format!(
         r#"
 set outputPath to "{}"
@@ -5432,7 +5504,7 @@ tell application "System Events"
 end tell
 if musicRunning then
     tell application "Music"
-        if player state is playing or player state is paused then
+        if player state is playing {} then
             set currentTrack to current track
             if (count of artworks of currentTrack) > 0 then
                 set artData to data of artwork 1 of currentTrack
@@ -5447,7 +5519,7 @@ if musicRunning then
 end if
 return ""
 "#,
-        path_literal
+        path_literal, paused_check
     );
     let key = run_osascript(&script)?;
     if key.is_empty() {
@@ -5458,14 +5530,20 @@ return ""
     load_album_artwork_file(&path, key)
 }
 
-fn fetch_spotify_album_artwork() -> Option<AlbumArtwork> {
-    let script = r#"
+fn fetch_spotify_album_artwork(allow_paused: bool) -> Option<AlbumArtwork> {
+    let paused_check = if allow_paused {
+        "or player state is paused"
+    } else {
+        ""
+    };
+    let script = format!(
+        r#"
 tell application "System Events"
     set spotifyRunning to exists process "Spotify"
 end tell
 if spotifyRunning then
     tell application "Spotify"
-        if player state is playing or player state is paused then
+        if player state is playing {} then
             set currentTrack to current track
             set artworkUrl to artwork url of currentTrack
             if artworkUrl is not "" then
@@ -5475,8 +5553,10 @@ if spotifyRunning then
     end tell
 end if
 return ""
-"#;
-    let output = run_osascript(script)?;
+"#,
+        paused_check
+    );
+    let output = run_osascript(&script)?;
     let mut parts = output.splitn(5, '|');
     let source = parts.next()?;
     let artist = parts.next()?;
@@ -5501,6 +5581,105 @@ return ""
     }
 
     load_album_artwork_file(&path, format!("{source}|{artist}|{album}|{track}"))
+}
+
+fn fetch_app_icon_artwork(bundle_identifier: &str, source: &str) -> Option<AlbumArtwork> {
+    let bundle_identifier = bundle_identifier.trim();
+    if bundle_identifier.is_empty() {
+        return None;
+    }
+
+    let path = env::temp_dir().join(format!(
+        "terb-app-icon-{}-{}.png",
+        std::process::id(),
+        sanitize_artwork_key(bundle_identifier)
+    ));
+    let script = r#"
+ObjC.import('AppKit');
+ObjC.import('Foundation');
+
+const env = $.NSProcessInfo.processInfo.environment;
+const bundle = ObjC.unwrap(env.objectForKey('TERB_ICON_BUNDLE')) || '';
+const outputPath = ObjC.unwrap(env.objectForKey('TERB_ICON_OUT')) || '';
+const url = $.NSWorkspace.sharedWorkspace.URLForApplicationWithBundleIdentifier(bundle);
+
+if (!url || outputPath.length === 0) {
+  '';
+} else {
+  const image = $.NSWorkspace.sharedWorkspace.iconForFile(ObjC.unwrap(url.path));
+  image.setSize($.NSMakeSize(512, 512));
+  const tiff = image.TIFFRepresentation;
+  const rep = $.NSBitmapImageRep.imageRepWithData(tiff);
+  const data = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({}));
+  data.writeToFileAtomically(outputPath, true) ? outputPath : '';
+}
+"#;
+    let output = Command::new("/usr/bin/osascript")
+        .arg("-l")
+        .arg("JavaScript")
+        .arg("-e")
+        .arg(script)
+        .env("TERB_ICON_BUNDLE", bundle_identifier)
+        .env("TERB_ICON_OUT", &path)
+        .output()
+        .ok()?;
+    if !output.status.success() || !path.exists() {
+        let _ = fs::remove_file(&path);
+        return None;
+    }
+
+    load_album_artwork_file(
+        &path,
+        format!(
+            "{source}AppIcon|{}",
+            sanitize_artwork_key(bundle_identifier)
+        ),
+    )
+}
+
+fn fetch_coreaudio_app_icon_artwork() -> Option<AlbumArtwork> {
+    let helper = option_env!("TERB_AUDIO_PROCESS_HELPER")?;
+    let output = Command::new(helper).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let bundles: Vec<String> = serde_json::from_slice(&output.stdout).ok()?;
+    for bundle in bundles {
+        let bundle = bundle.trim();
+        if bundle.is_empty() || is_music_player_bundle(bundle) {
+            continue;
+        }
+        if let Some(artwork) = fetch_app_icon_artwork(bundle, "CoreAudio") {
+            return Some(artwork);
+        }
+    }
+
+    None
+}
+
+fn is_music_player_bundle(bundle_identifier: &str) -> bool {
+    matches!(
+        bundle_identifier,
+        "com.apple.Music"
+            | "com.spotify.client"
+            | "com.tencent.QQMusicMac"
+            | "com.netease.163music"
+            | "com.netease.163music.music"
+    )
+}
+
+fn sanitize_artwork_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn run_osascript(script: &str) -> Option<String> {
@@ -7253,7 +7432,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         }
         (Lang::Zh, "help_setting_accent_threshold") => "重音触发阈值。越高越克制，越低越敏感。",
         (Lang::Zh, "help_setting_album_art") => {
-            "专辑主题会从系统正在播放卡片抓取封面，抓不到时回退 Music/Spotify，并在整个频谱画布用盲文渲染封面。"
+            "专辑主题优先抓系统正在播放封面，再回退 Music/Spotify；没有封面时可用正在播放或 CoreAudio 正在出声的非音乐 app 图标。"
         }
         (Lang::Zh, "help_setting_ceiling") => "分析显示上限。降低后更少触顶，升高后动态空间更大。",
         (Lang::Zh, "help_setting_default") => "使用左右方向键调整该设置。",
@@ -7402,7 +7581,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         }
         (Lang::En, "help_setting_accent_threshold") => "Accent trigger threshold. Higher is more restrained.",
         (Lang::En, "help_setting_album_art") => {
-            "The Album theme fetches artwork from the system now-playing card, falls back to Music/Spotify, and renders the cover across the full spectrum canvas in Braille."
+            "Album themes prefer system now-playing artwork, fall back to Music/Spotify, then use the active now-playing or CoreAudio-output non-music app icon when no cover is available."
         }
         (Lang::En, "help_setting_ceiling") => "Display ceiling for analysis headroom and peak mapping.",
         (Lang::En, "help_setting_default") => "Use left and right to adjust this setting.",
@@ -7551,7 +7730,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         }
         (Lang::Ja, "help_setting_accent_threshold") => "アクセント検出の閾値です。高いほど控えめです。",
         (Lang::Ja, "help_setting_album_art") => {
-            "アルバムテーマはシステムの再生中カードからアートワークを取得し、失敗時は Music/Spotify に戻して、スペクトラム全体に点字で描画します。"
+            "アルバムテーマは再生中アートワーク、Music/Spotify、最後に再生中または CoreAudio 出力中の非音楽アプリアイコンへ戻します。"
         }
         (Lang::Ja, "help_setting_ceiling") => "解析表示の上限です。ヘッドルームとピーク表示を調整します。",
         (Lang::Ja, "help_setting_default") => "左右キーでこの設定を調整します。",
@@ -8553,6 +8732,50 @@ mod tests {
 
         assert_eq!(mask, 0xff);
         assert!((sample.luma - 0.35).abs() < 0.01);
+    }
+
+    #[test]
+    fn mediaremote_icon_fallback_requires_active_playback_when_state_is_known() {
+        assert!(mediaremote_payload_is_playing(&serde_json::json!({
+            "bundleIdentifier": "com.example.Player",
+            "playbackRate": 1.0
+        })));
+        assert!(!mediaremote_payload_is_playing(&serde_json::json!({
+            "bundleIdentifier": "com.example.Player",
+            "playbackRate": 0.0
+        })));
+        assert!(!mediaremote_payload_is_playing(&serde_json::json!({
+            "bundleIdentifier": "com.example.Player",
+            "playbackState": "paused"
+        })));
+        assert!(mediaremote_payload_is_playing(&serde_json::json!({
+            "bundleIdentifier": "com.example.Player",
+            "playbackState": "playing"
+        })));
+        assert!(!mediaremote_payload_is_playing(&serde_json::json!({
+            "bundleIdentifier": "com.example.Player",
+            "playbackState": 0
+        })));
+        assert!(mediaremote_payload_is_playing(&serde_json::json!({
+            "bundleIdentifier": "com.example.Player",
+            "playbackState": 1
+        })));
+    }
+
+    #[test]
+    fn app_icon_artwork_key_sanitizes_bundle_identifier() {
+        assert_eq!(
+            sanitize_artwork_key("com.example.Player Helper/β"),
+            "com.example.Player_Helper__"
+        );
+    }
+
+    #[test]
+    fn app_icon_fallback_skips_known_music_players() {
+        assert!(is_music_player_bundle("com.apple.Music"));
+        assert!(is_music_player_bundle("com.spotify.client"));
+        assert!(is_music_player_bundle("com.tencent.QQMusicMac"));
+        assert!(!is_music_player_bundle("com.apple.Safari"));
     }
 
     #[test]
