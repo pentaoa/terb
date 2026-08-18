@@ -1,12 +1,11 @@
 use std::{
-    collections::VecDeque,
     env, fs, io,
-    io::{BufRead, BufReader, Cursor, Read},
+    io::{BufRead, BufReader, Read},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
         mpsc::{self, Receiver, Sender},
-        Arc, OnceLock,
+        Arc,
     },
     thread,
     time::{Duration, Instant},
@@ -15,7 +14,6 @@ use std::{
 pub(crate) mod analysis;
 pub(crate) mod bpm;
 
-use base64::{engine::general_purpose, Engine as _};
 use crossterm::{
     event::{self, Event as CEvent, KeyCode, KeyEvent},
     execute,
@@ -42,16 +40,7 @@ use analysis::sample_magnitude;
 use bpm::{BpmAnalyzer, BPM_MAX, BPM_MIN, BPM_PULSE_DECAY_SECONDS};
 
 const LANGUAGES: &[(&str, &str)] = &[("zh", "中文"), ("en", "English"), ("ja", "日本語")];
-const THEMES: &[ThemeId] = &[
-    ThemeId::Spring,
-    ThemeId::Vintage,
-    ThemeId::Aurora,
-    ThemeId::SonicTexture,
-    ThemeId::Miku,
-    ThemeId::AlbumArt,
-    ThemeId::AlbumArtCircle,
-    ThemeId::Mono,
-];
+const THEMES: &[ThemeId] = &[ThemeId::Spring, ThemeId::Vintage, ThemeId::Mono];
 const SPECTRUM_RENDERERS: &[SpectrumRenderer] = &[
     SpectrumRenderer::Blocks,
     SpectrumRenderer::Braille,
@@ -118,18 +107,13 @@ const ACCENT_TRACE_RISE_EPSILON: f32 = 0.012;
 const ACCENT_NOTE_FADE_IN_MS: u64 = 100;
 const ACCENT_NOTE_FADE_OUT_MS: u64 = 500;
 const ACCENT_NOTE_COUNT: usize = 28;
-const ALBUM_ART_POLL_INTERVAL_MS: u64 = 3_000;
-const ALBUM_CIRCLE_ROTATION_TURNS_PER_SECOND: f32 = 0.017;
 const MASTER_METER_WIDTH: u16 = 16;
 const MASTER_METER_CHANNEL_WIDTH: usize = 7;
 const BRAILLE_LEFT_COLUMN_MASK: u8 = 0x01 | 0x02 | 0x04 | 0x40;
 const BRAILLE_RIGHT_COLUMN_MASK: u8 = 0x08 | 0x10 | 0x20 | 0x80;
-const DEFAULT_AUDIO_DELAY_MS: u16 = 0;
 const DEFAULT_ATTACK: f32 = 0.82;
 const DEFAULT_RELEASE: f32 = 0.48;
 const DEFAULT_ANALYSIS_HOP: usize = 256;
-const AUDIO_DELAY_STEP_MS: i32 = 10;
-const MAX_AUDIO_DELAY_MS: i32 = 2_000;
 const FFT_SIZES: &[usize] = &[512, 1024, 2048, 4096, 8192, 16_384];
 const MAX_ANALYSIS_BARS: usize = 1024;
 const ADAPTIVE_GAIN_MIN: f32 = 0.45;
@@ -144,11 +128,6 @@ const WAVEFORM_TARGET_PEAK: f32 = 0.72;
 const BRAILLE_DOT_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
 const CAVA_BLOCKS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 const ACCENT_TRACE_REFERENCE_VIRTUAL_HEIGHT: f32 = 48.0;
-const TERMINAL_CELL_ASPECT: f32 = 0.5;
-const MIKU_BASE_FPS: f32 = 5.0;
-const MIKU_TRIGGER_SPEED_STEP: f32 = 0.20;
-const MIKU_TRIGGER_WINDOW_MS: u64 = 3_000;
-const MIKU_GIF: &[u8] = include_bytes!("../assets/miku/miku.gif");
 const TITLE_ART: &[&str] = &[
     " _            _     ",
     "| |_ ___ _ __| |__  ",
@@ -253,8 +232,6 @@ fn handle_spectrum_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('t') => app.toggle_toolbar_panel(),
         KeyCode::Char('m') => app.toggle_master_panel(),
         KeyCode::Char('w') => app.toggle_waveform_panel(),
-        KeyCode::Char('-') => app.adjust_audio_delay(-1),
-        KeyCode::Char('=') | KeyCode::Char('+') => app.adjust_audio_delay(1),
         KeyCode::Char('?') => app.screen = Screen::Help,
         KeyCode::Up | KeyCode::Char('k') => app.prev_setting(),
         KeyCode::Down | KeyCode::Char('j') => app.next_setting(),
@@ -283,8 +260,6 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Tab => app.next_setting_category(),
         KeyCode::Left | KeyCode::Char('h') => app.adjust_setting(-1),
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => app.adjust_setting(1),
-        KeyCode::Char('-') => app.adjust_audio_delay(-1),
-        KeyCode::Char('=') | KeyCode::Char('+') => app.adjust_audio_delay(1),
         KeyCode::Char(' ') => app.toggle_capture(),
         KeyCode::Char('?') => app.screen = Screen::Help,
         _ => {}
@@ -458,8 +433,6 @@ struct Config {
 struct Settings {
     language: String,
     theme: ThemeId,
-    #[serde(default = "default_smoothing")]
-    smoothing: f32,
     #[serde(default = "default_analysis_preset")]
     analysis_preset: AnalysisPreset,
     #[serde(default = "default_attack")]
@@ -475,8 +448,6 @@ struct Settings {
     analysis_hop: usize,
     #[serde(default = "default_refresh_hz")]
     refresh_hz: u16,
-    #[serde(default = "default_audio_delay_ms")]
-    audio_delay_ms: u16,
     #[serde(default = "default_high_shelf_enabled")]
     high_shelf_enabled: bool,
     #[serde(default = "default_high_shelf_db")]
@@ -524,20 +495,12 @@ fn default_refresh_hz() -> u16 {
     90
 }
 
-fn default_audio_delay_ms() -> u16 {
-    DEFAULT_AUDIO_DELAY_MS
-}
-
 fn default_fft_size() -> usize {
-    8192
-}
-
-fn default_smoothing() -> f32 {
-    0.72
+    1024
 }
 
 fn default_analysis_preset() -> AnalysisPreset {
-    AnalysisPreset::Precision
+    AnalysisPreset::LowLatency
 }
 
 fn default_attack() -> f32 {
@@ -631,7 +594,6 @@ impl Default for Config {
             settings: Settings {
                 language: "zh".to_string(),
                 theme: ThemeId::Spring,
-                smoothing: default_smoothing(),
                 analysis_preset: default_analysis_preset(),
                 attack: default_attack(),
                 release: default_release(),
@@ -640,7 +602,6 @@ impl Default for Config {
                 fft_size: default_fft_size(),
                 analysis_hop: default_analysis_hop(),
                 refresh_hz: default_refresh_hz(),
-                audio_delay_ms: default_audio_delay_ms(),
                 high_shelf_enabled: default_high_shelf_enabled(),
                 high_shelf_db: default_high_shelf_db(),
                 auto_sensitivity_enabled: default_auto_sensitivity_enabled(),
@@ -692,8 +653,6 @@ impl Settings {
         self.refresh_hz = nearest_refresh_rate(self.refresh_hz);
         self.attack = self.attack.clamp(MIN_ATTACK, MAX_ATTACK);
         self.release = self.release.clamp(MIN_RELEASE, MAX_RELEASE);
-        self.smoothing = self.smoothing.clamp(0.20, 0.92);
-        self.audio_delay_ms = (self.audio_delay_ms as i32).clamp(0, MAX_AUDIO_DELAY_MS) as u16;
         self.high_shelf_db = self
             .high_shelf_db
             .clamp(MIN_HIGH_SHELF_DB, MAX_HIGH_SHELF_DB);
@@ -710,10 +669,8 @@ impl Settings {
             self.accent_display_mode = AccentDisplayMode::Off;
             self.accent_trace_enabled = true;
         }
-        if is_removed_theme(self.theme) {
+        if is_removed_theme(self.theme) || is_retired_theme(self.theme) {
             self.theme = ThemeId::Spring;
-        } else if is_retired_theme(self.theme) {
-            self.theme = ThemeId::SonicTexture;
         }
     }
 
@@ -745,7 +702,15 @@ fn nearest_fft_size(value: usize) -> usize {
 fn is_retired_theme(theme: ThemeId) -> bool {
     matches!(
         theme,
-        ThemeId::PitchClass | ThemeId::ChromaBands | ThemeId::PitchMemory | ThemeId::HarmonicComb
+        ThemeId::Aurora
+            | ThemeId::PitchClass
+            | ThemeId::ChromaBands
+            | ThemeId::PitchMemory
+            | ThemeId::HarmonicComb
+            | ThemeId::SonicTexture
+            | ThemeId::Miku
+            | ThemeId::AlbumArt
+            | ThemeId::AlbumArtCircle
     )
 }
 
@@ -809,12 +774,8 @@ struct App {
     pending_accent_trace: Option<PendingAccentTrace>,
     accent_traces: Vec<AccentTrace>,
     accent_note_bursts: Vec<AccentNoteBurst>,
-    miku_trigger_times: VecDeque<Instant>,
-    miku_frame_phase: f32,
-    album_circle_rotation_phase: f32,
     accent_energy_baseline: f32,
     accent_trace_cooldown: Duration,
-    color_state: VisualColorState,
     level: f32,
     master_left: f32,
     master_right: f32,
@@ -824,12 +785,6 @@ struct App {
     bpm_phase: f32,
     bpm_pulse: f32,
     bpm_next_beat_at: Option<Instant>,
-    album_artwork: Option<AlbumArtwork>,
-    album_art_rx: Receiver<AlbumArtEvent>,
-    album_art_tx: Sender<AlbumArtEvent>,
-    album_art_last_poll: Option<Instant>,
-    album_art_fetch_in_flight: bool,
-    album_art_status: AlbumArtFetchStatus,
     waveform: Vec<f32>,
     analyzer: SpectrumAnalyzer,
     visual_bar_count: usize,
@@ -838,7 +793,6 @@ struct App {
     rx: Receiver<AudioEvent>,
     tx: Sender<AudioEvent>,
     last_samples_at: Option<Instant>,
-    delayed_audio: VecDeque<DelayedAudio>,
 }
 
 #[derive(Clone, Debug)]
@@ -895,9 +849,7 @@ impl AccentTrace {
             scaled_accent_trace_offset_rows(ACCENT_TRACE_START_OFFSET_CELLS, virtual_height);
         let end_offset =
             scaled_accent_trace_offset_rows(ACCENT_TRACE_END_OFFSET_CELLS, virtual_height);
-        let offset_rows = lerp(start_offset, end_offset, smoothstep(progress));
-
-        offset_rows
+        lerp(start_offset, end_offset, smoothstep(progress))
     }
 }
 
@@ -963,45 +915,6 @@ struct AccentNoteOverlay {
     opacity: f32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct AlbumPixel {
-    red: u8,
-    green: u8,
-    blue: u8,
-}
-
-#[derive(Clone, Debug)]
-struct AlbumArtwork {
-    key: String,
-    width: usize,
-    height: usize,
-    pixels: Vec<AlbumPixel>,
-    luma: Vec<f32>,
-    edges: Vec<f32>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct AlbumSample {
-    red: u8,
-    green: u8,
-    blue: u8,
-    luma: f32,
-    edge: f32,
-}
-
-#[derive(Clone, Debug)]
-enum AlbumArtEvent {
-    Fetched(Option<AlbumArtwork>),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AlbumArtFetchStatus {
-    Off,
-    Waiting,
-    Loaded,
-    NotFound,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct AccentTriggerThresholds {
     peak: f32,
@@ -1010,397 +923,6 @@ struct AccentTriggerThresholds {
     flux: f32,
     rise: f32,
     ratio: f32,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct MikuPixel {
-    red: u8,
-    green: u8,
-    blue: u8,
-    alpha: u8,
-}
-
-#[derive(Clone, Debug)]
-struct MikuFrame {
-    width: usize,
-    height: usize,
-    pixels: Vec<MikuPixel>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct MikuAnimation {
-    width: usize,
-    height: usize,
-    total_duration_ms: u64,
-    frames: Vec<MikuFrame>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct MikuSample {
-    red: u8,
-    green: u8,
-    blue: u8,
-    alpha: f32,
-}
-
-#[derive(Clone, Copy)]
-struct MikuSampleGrid {
-    virtual_width: usize,
-    virtual_height: usize,
-    base_x: usize,
-    base_y: usize,
-    dot_width: usize,
-    dot_height: usize,
-    x_aspect: f32,
-}
-
-impl MikuAnimation {
-    fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut options = gif::DecodeOptions::new();
-        options.set_color_output(gif::ColorOutput::RGBA);
-        let mut reader = options.read_info(Cursor::new(bytes)).ok()?;
-        let width = reader.width() as usize;
-        let height = reader.height() as usize;
-        if width == 0 || height == 0 {
-            return None;
-        }
-
-        let mut canvas = vec![MikuPixel::default(); width * height];
-        let mut frames = Vec::new();
-        let mut total_duration_ms = 0_u64;
-
-        while let Some(frame) = reader.read_next_frame().ok()? {
-            let before_frame = canvas.clone();
-            composite_miku_frame(&mut canvas, width, height, frame);
-            let delay_ms = (frame.delay as u64).max(2) * 10;
-            let mut pixels = canvas.clone();
-            remove_miku_outer_matte(&mut pixels, width, height);
-            total_duration_ms += delay_ms;
-            frames.push(MikuFrame {
-                width,
-                height,
-                pixels,
-            });
-
-            match frame.dispose {
-                gif::DisposalMethod::Background => {
-                    clear_miku_frame_rect(&mut canvas, width, height, frame);
-                }
-                gif::DisposalMethod::Previous => {
-                    canvas = before_frame;
-                }
-                _ => {}
-            }
-        }
-
-        if frames.is_empty() {
-            None
-        } else {
-            Some(Self {
-                width,
-                height,
-                total_duration_ms: total_duration_ms.max(1),
-                frames,
-            })
-        }
-    }
-
-    fn frame_at_phase(&self, phase: f32) -> Option<&MikuFrame> {
-        if self.frames.is_empty() {
-            return None;
-        }
-
-        let index = phase.floor().max(0.0) as usize % self.frames.len();
-        self.frames.get(index)
-    }
-}
-
-fn miku_animation() -> &'static MikuAnimation {
-    static ANIMATION: OnceLock<MikuAnimation> = OnceLock::new();
-    ANIMATION.get_or_init(|| MikuAnimation::decode(MIKU_GIF).unwrap_or_default())
-}
-
-fn composite_miku_frame(
-    canvas: &mut [MikuPixel],
-    canvas_width: usize,
-    canvas_height: usize,
-    frame: &gif::Frame<'_>,
-) {
-    let frame_width = frame.width as usize;
-    let frame_height = frame.height as usize;
-    let left = frame.left as usize;
-    let top = frame.top as usize;
-    let buffer = frame.buffer.as_ref();
-
-    for y in 0..frame_height {
-        let canvas_y = top + y;
-        if canvas_y >= canvas_height {
-            continue;
-        }
-
-        for x in 0..frame_width {
-            let canvas_x = left + x;
-            if canvas_x >= canvas_width {
-                continue;
-            }
-
-            let source_index = (y * frame_width + x) * 4;
-            if source_index + 3 >= buffer.len() {
-                continue;
-            }
-
-            let source = MikuPixel {
-                red: buffer[source_index],
-                green: buffer[source_index + 1],
-                blue: buffer[source_index + 2],
-                alpha: buffer[source_index + 3],
-            };
-            if source.alpha == 0 {
-                continue;
-            }
-
-            let target_index = canvas_y * canvas_width + canvas_x;
-            canvas[target_index] = alpha_blend_pixel(canvas[target_index], source);
-        }
-    }
-}
-
-fn clear_miku_frame_rect(
-    canvas: &mut [MikuPixel],
-    canvas_width: usize,
-    canvas_height: usize,
-    frame: &gif::Frame<'_>,
-) {
-    let frame_width = frame.width as usize;
-    let frame_height = frame.height as usize;
-    let left = frame.left as usize;
-    let top = frame.top as usize;
-
-    for y in top..(top + frame_height).min(canvas_height) {
-        for x in left..(left + frame_width).min(canvas_width) {
-            canvas[y * canvas_width + x] = MikuPixel::default();
-        }
-    }
-}
-
-fn remove_miku_outer_matte(pixels: &mut [MikuPixel], width: usize, height: usize) {
-    if pixels.len() != width.saturating_mul(height) || width == 0 || height == 0 {
-        return;
-    }
-
-    let mut visited = vec![false; pixels.len()];
-    let mut queue = VecDeque::new();
-    for x in 0..width {
-        enqueue_miku_matte_pixel(pixels, &mut visited, &mut queue, x, 0, width);
-        enqueue_miku_matte_pixel(
-            pixels,
-            &mut visited,
-            &mut queue,
-            x,
-            height.saturating_sub(1),
-            width,
-        );
-    }
-    for y in 0..height {
-        enqueue_miku_matte_pixel(pixels, &mut visited, &mut queue, 0, y, width);
-        enqueue_miku_matte_pixel(
-            pixels,
-            &mut visited,
-            &mut queue,
-            width.saturating_sub(1),
-            y,
-            width,
-        );
-    }
-
-    while let Some(index) = queue.pop_front() {
-        let x = index % width;
-        let y = index / width;
-        for (dx, dy) in [(1_isize, 0_isize), (-1, 0), (0, 1), (0, -1)] {
-            let next_x = x as isize + dx;
-            let next_y = y as isize + dy;
-            if next_x < 0 || next_y < 0 || next_x >= width as isize || next_y >= height as isize {
-                continue;
-            }
-
-            enqueue_miku_matte_pixel(
-                pixels,
-                &mut visited,
-                &mut queue,
-                next_x as usize,
-                next_y as usize,
-                width,
-            );
-        }
-    }
-
-    for (index, pixel) in pixels.iter_mut().enumerate() {
-        if visited[index] && pixel.alpha > 0 {
-            *pixel = MikuPixel::default();
-        }
-    }
-}
-
-fn enqueue_miku_matte_pixel(
-    pixels: &[MikuPixel],
-    visited: &mut [bool],
-    queue: &mut VecDeque<usize>,
-    x: usize,
-    y: usize,
-    width: usize,
-) {
-    let index = y * width + x;
-    if visited.get(index).copied().unwrap_or(true) {
-        return;
-    }
-    let Some(pixel) = pixels.get(index).copied() else {
-        return;
-    };
-    if !is_miku_background_or_matte(pixel) {
-        return;
-    }
-
-    visited[index] = true;
-    queue.push_back(index);
-}
-
-fn is_miku_background_or_matte(pixel: MikuPixel) -> bool {
-    if pixel.alpha == 0 {
-        return true;
-    }
-
-    let max = pixel.red.max(pixel.green).max(pixel.blue) as i16;
-    let min = pixel.red.min(pixel.green).min(pixel.blue) as i16;
-    let saturation = max - min;
-    let luma = 0.299 * pixel.red as f32 + 0.587 * pixel.green as f32 + 0.114 * pixel.blue as f32;
-
-    luma > 165.0 && saturation < 55
-}
-
-fn alpha_blend_pixel(destination: MikuPixel, source: MikuPixel) -> MikuPixel {
-    if source.alpha == u8::MAX {
-        return source;
-    }
-
-    let source_alpha = source.alpha as f32 / 255.0;
-    let destination_alpha = destination.alpha as f32 / 255.0;
-    let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
-    if output_alpha <= f32::EPSILON {
-        return MikuPixel::default();
-    }
-
-    let blend_channel = |source: u8, destination: u8| {
-        ((source as f32 * source_alpha
-            + destination as f32 * destination_alpha * (1.0 - source_alpha))
-            / output_alpha)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-
-    MikuPixel {
-        red: blend_channel(source.red, destination.red),
-        green: blend_channel(source.green, destination.green),
-        blue: blend_channel(source.blue, destination.blue),
-        alpha: (output_alpha * 255.0).round().clamp(0.0, 255.0) as u8,
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct VisualColorState {
-    centroid: f32,
-    energy: f32,
-    flux: f32,
-    phase: f32,
-    chroma: [f32; 12],
-    dominant_pitch: usize,
-    pitch_hue: f32,
-    pitch_confidence: f32,
-    dominant_frequency: f32,
-    pitch_memory: [f32; 12],
-}
-
-impl Default for VisualColorState {
-    fn default() -> Self {
-        Self {
-            centroid: 0.45,
-            energy: 0.0,
-            flux: 0.0,
-            phase: 0.0,
-            chroma: [0.0; 12],
-            dominant_pitch: 0,
-            pitch_hue: pitch_class_hue(0),
-            pitch_confidence: 0.0,
-            dominant_frequency: 220.0,
-            pitch_memory: [0.0; 12],
-        }
-    }
-}
-
-impl VisualColorState {
-    fn update(&mut self, bars: &[f32], previous: &[f32], level: f32) {
-        if bars.is_empty() {
-            return;
-        }
-
-        let mut weighted_total = 0.0_f32;
-        let mut weight = 0.0_f32;
-        let mut positive_flux = 0.0_f32;
-        let mut chroma = [0.0_f32; 12];
-        let mut dominant_frequency = self.dominant_frequency;
-        let mut dominant_weight = 0.0_f32;
-        let max_index = (bars.len().saturating_sub(1)).max(1) as f32;
-
-        for (index, value) in bars.iter().copied().enumerate() {
-            let value = value.clamp(0.0, 1.0);
-            let position = index as f32 / max_index;
-            let frequency = frequency_for_position(position);
-            let emphasis = value.powf(1.2);
-            weighted_total += position * emphasis;
-            weight += emphasis;
-            let pitch_class = pitch_class_for_frequency(frequency);
-            let melody_weight = emphasis * melody_frequency_weight(frequency);
-            chroma[pitch_class] += melody_weight;
-            if melody_weight > dominant_weight {
-                dominant_weight = melody_weight;
-                dominant_frequency = frequency;
-            }
-
-            let old = previous.get(index).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            positive_flux += (value - old).max(0.0);
-        }
-
-        let centroid = if weight > 0.000_1 {
-            weighted_total / weight
-        } else {
-            self.centroid
-        };
-        let energy = (bars.iter().copied().sum::<f32>() / bars.len() as f32)
-            .max(level)
-            .clamp(0.0, 1.0);
-        let flux = (positive_flux / bars.len() as f32 * 3.0).clamp(0.0, 1.0);
-        let chroma_peak = chroma.iter().copied().fold(0.0_f32, f32::max).max(0.000_1);
-        for (current, next) in self.chroma.iter_mut().zip(chroma.into_iter()) {
-            *current = lerp(*current, (next / chroma_peak).clamp(0.0, 1.0), 0.14);
-        }
-        let (dominant_pitch, confidence) = strongest_chroma(&self.chroma);
-
-        self.centroid = lerp(self.centroid, centroid, 0.12);
-        self.energy = lerp(self.energy, energy, 0.16);
-        self.flux = if flux > self.flux {
-            lerp(self.flux, flux, 0.30)
-        } else {
-            lerp(self.flux, flux, 0.12)
-        };
-        self.phase = wrap_unit(self.phase + 0.003 + self.energy * 0.007 + self.flux * 0.010);
-        self.dominant_pitch = dominant_pitch;
-        self.pitch_hue = lerp_unit(self.pitch_hue, pitch_class_hue(dominant_pitch), 0.14);
-        self.pitch_confidence = lerp(self.pitch_confidence, confidence, 0.20);
-        self.dominant_frequency = lerp(self.dominant_frequency, dominant_frequency, 0.12);
-        for (pitch, memory) in self.pitch_memory.iter_mut().enumerate() {
-            let activation = self.chroma[pitch] * 0.88;
-            *memory = (*memory * 0.94).max(activation).clamp(0.0, 1.0);
-        }
-    }
 }
 
 impl App {
@@ -1417,7 +939,6 @@ impl App {
         let fft_size = config.settings.fft_size;
         let hop_size = config.settings.analysis_hop;
         let (tx, rx) = mpsc::channel();
-        let (album_art_tx, album_art_rx) = mpsc::channel();
 
         Self {
             config,
@@ -1433,12 +954,8 @@ impl App {
             pending_accent_trace: None,
             accent_traces: Vec::new(),
             accent_note_bursts: Vec::new(),
-            miku_trigger_times: VecDeque::new(),
-            miku_frame_phase: 0.0,
-            album_circle_rotation_phase: 0.0,
             accent_energy_baseline: 0.0,
             accent_trace_cooldown: Duration::from_millis(0),
-            color_state: VisualColorState::default(),
             level: 0.0,
             master_left: 0.0,
             master_right: 0.0,
@@ -1448,12 +965,6 @@ impl App {
             bpm_phase: 0.0,
             bpm_pulse: 0.0,
             bpm_next_beat_at: None,
-            album_artwork: None,
-            album_art_rx,
-            album_art_tx,
-            album_art_last_poll: None,
-            album_art_fetch_in_flight: false,
-            album_art_status: AlbumArtFetchStatus::Off,
             waveform: vec![0.0; WAVEFORM_SAMPLES],
             analyzer: SpectrumAnalyzer::new(fft_size, 48_000.0, bar_count, hop_size),
             visual_bar_count: bar_count,
@@ -1462,7 +973,6 @@ impl App {
             rx,
             tx,
             last_samples_at: None,
-            delayed_audio: VecDeque::new(),
         }
     }
 
@@ -1472,10 +982,6 @@ impl App {
 
     fn t(&self, key: &'static str) -> &'static str {
         tr(self.lang, key)
-    }
-
-    fn album_art_active(&self) -> bool {
-        is_album_color_mode(self.theme().color_mode)
     }
 
     fn frame_duration(&self) -> Duration {
@@ -1488,11 +994,7 @@ impl App {
     }
 
     fn tick(&mut self, elapsed: Duration) {
-        self.advance_miku_animation(elapsed);
-        self.advance_album_circle_rotation(elapsed);
         self.advance_bpm_pulse(elapsed);
-        self.drain_album_art_events();
-        self.request_album_art_if_due();
         if self.capture_state == CaptureState::Running {
             self.advance_accent_traces(elapsed);
             if let Some(last) = self.last_samples_at {
@@ -1501,18 +1003,6 @@ impl App {
                 }
             }
         }
-    }
-
-    fn advance_miku_animation(&mut self, elapsed: Duration) {
-        let fps = self.miku_playback_fps();
-        self.miku_frame_phase =
-            (self.miku_frame_phase + elapsed.as_secs_f32() * fps).rem_euclid(1_000_000.0);
-    }
-
-    fn advance_album_circle_rotation(&mut self, elapsed: Duration) {
-        self.album_circle_rotation_phase = (self.album_circle_rotation_phase
-            + elapsed.as_secs_f32() * ALBUM_CIRCLE_ROTATION_TURNS_PER_SECOND)
-            .rem_euclid(1_000_000.0);
     }
 
     fn advance_bpm_pulse(&mut self, elapsed: Duration) {
@@ -1543,92 +1033,6 @@ impl App {
         self.bpm_phase = (1.0 - until_next / beat_period.as_secs_f32()).clamp(0.0, 1.0);
     }
 
-    fn drain_album_art_events(&mut self) {
-        while let Ok(event) = self.album_art_rx.try_recv() {
-            match event {
-                AlbumArtEvent::Fetched(artwork) => {
-                    self.album_art_fetch_in_flight = false;
-                    if self.album_art_active() {
-                        match artwork {
-                            Some(next) => {
-                                let should_replace = self
-                                    .album_artwork
-                                    .as_ref()
-                                    .map(|current| current.key != next.key)
-                                    .unwrap_or(true);
-                                if should_replace {
-                                    self.album_artwork = Some(next);
-                                }
-                                self.album_art_status = AlbumArtFetchStatus::Loaded;
-                            }
-                            None => {
-                                self.album_artwork = None;
-                                self.album_art_status = AlbumArtFetchStatus::NotFound;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn request_album_art_if_due(&mut self) {
-        if !self.album_art_active() {
-            self.album_artwork = None;
-            self.album_art_fetch_in_flight = false;
-            self.album_art_status = AlbumArtFetchStatus::Off;
-            return;
-        }
-        if self.album_art_fetch_in_flight {
-            return;
-        }
-        if self
-            .album_art_last_poll
-            .map(|last| last.elapsed() < Duration::from_millis(ALBUM_ART_POLL_INTERVAL_MS))
-            .unwrap_or(false)
-        {
-            return;
-        }
-
-        self.album_art_last_poll = Some(Instant::now());
-        self.album_art_fetch_in_flight = true;
-        self.album_art_status = AlbumArtFetchStatus::Waiting;
-        let tx = self.album_art_tx.clone();
-        thread::spawn(move || {
-            let artwork = fetch_now_playing_album_artwork();
-            let _ = tx.send(AlbumArtEvent::Fetched(artwork));
-        });
-    }
-
-    fn miku_playback_fps(&self) -> f32 {
-        MIKU_BASE_FPS * (1.0 + MIKU_TRIGGER_SPEED_STEP * self.recent_miku_trigger_count() as f32)
-    }
-
-    fn recent_miku_trigger_count(&self) -> usize {
-        let window = Duration::from_millis(MIKU_TRIGGER_WINDOW_MS);
-        self.miku_trigger_times
-            .iter()
-            .filter(|triggered_at| triggered_at.elapsed() <= window)
-            .count()
-    }
-
-    fn record_miku_trigger(&mut self) {
-        self.miku_trigger_times.push_back(Instant::now());
-        self.prune_miku_trigger_times();
-    }
-
-    fn prune_miku_trigger_times(&mut self) {
-        let window = Duration::from_millis(MIKU_TRIGGER_WINDOW_MS);
-        while self
-            .miku_trigger_times
-            .front()
-            .map(|triggered_at| triggered_at.elapsed() > window)
-            .unwrap_or(false)
-        {
-            self.miku_trigger_times.pop_front();
-        }
-    }
-
     fn advance_accent_traces(&mut self, elapsed: Duration) {
         let lifetime = Duration::from_millis(ACCENT_TRACE_LIFETIME_MS);
         for trace in &mut self.accent_traces {
@@ -1641,7 +1045,6 @@ impl App {
         }
         self.accent_note_bursts
             .retain(|burst| burst.age < note_lifetime);
-        self.prune_miku_trigger_times();
         self.accent_trace_cooldown = self
             .accent_trace_cooldown
             .checked_sub(elapsed)
@@ -1653,7 +1056,7 @@ impl App {
             match event {
                 AudioEvent::Samples(capture_id, samples) => {
                     if capture_id == self.capture_id && self.audio.is_some() {
-                        self.queue_audio_samples(samples);
+                        self.process_audio_samples(samples);
                     }
                 }
                 AudioEvent::Status(capture_id, message) => {
@@ -1664,12 +1067,10 @@ impl App {
                         self.status = self.t("helper_ready").to_string();
                     } else if message.contains("permission-denied") {
                         self.audio = None;
-                        self.delayed_audio.clear();
                         self.capture_state = CaptureState::PermissionNeeded;
                         self.status = self.t("permission_needed").to_string();
                     } else if message.contains("no-display") || message.contains("capture-error") {
                         self.audio = None;
-                        self.delayed_audio.clear();
                         self.capture_state = CaptureState::Failed;
                         self.status = self.t("capture_failed").to_string();
                     }
@@ -1682,7 +1083,6 @@ impl App {
                         continue;
                     }
                     self.audio = None;
-                    self.delayed_audio.clear();
                     self.capture_state = if code == Some(2) {
                         CaptureState::PermissionNeeded
                     } else {
@@ -1698,39 +1098,9 @@ impl App {
                     if capture_id != self.capture_id || self.audio.is_none() {
                         continue;
                     }
-                    self.delayed_audio.clear();
                     self.capture_state = CaptureState::Failed;
                     self.status = message;
                 }
-            }
-        }
-        self.flush_audio_delay();
-    }
-
-    fn queue_audio_samples(&mut self, samples: AudioSamples) {
-        self.delayed_audio.push_back(DelayedAudio {
-            received_at: Instant::now(),
-            samples,
-        });
-
-        while self.delayed_audio.len() > 256 {
-            self.delayed_audio.pop_front();
-        }
-
-        self.flush_audio_delay();
-    }
-
-    fn flush_audio_delay(&mut self) {
-        let delay = self.audio_delay_duration();
-        loop {
-            let Some(front) = self.delayed_audio.front() else {
-                break;
-            };
-            if front.received_at.elapsed() < delay {
-                break;
-            }
-            if let Some(delayed) = self.delayed_audio.pop_front() {
-                self.process_audio_samples(delayed.samples);
             }
         }
     }
@@ -1755,7 +1125,6 @@ impl App {
             self.config.settings.release,
             pipeline,
         ) {
-            self.color_state.update(&bars, &self.spectrum, self.level);
             self.update_accent_trace_detector(&bars);
             update_spectrum_trail(&mut self.spectrum_trail, &bars, &self.config.settings);
             self.spectrum = bars;
@@ -1873,7 +1242,6 @@ impl App {
             AccentDisplayMode::NoteNames => self.push_accent_note_burst(bars),
             AccentDisplayMode::Off => {}
         }
-        self.record_miku_trigger();
     }
 
     fn push_accent_trace(&mut self, bars: &[f32]) {
@@ -1922,10 +1290,6 @@ impl App {
         }
     }
 
-    fn audio_delay_duration(&self) -> Duration {
-        Duration::from_millis(self.config.settings.audio_delay_ms as u64)
-    }
-
     fn start_capture(&mut self) {
         if self.audio.is_some() {
             return;
@@ -1954,7 +1318,6 @@ impl App {
         }
         self.capture_state = CaptureState::Idle;
         self.status = self.t("stopped").to_string();
-        self.delayed_audio.clear();
     }
 
     fn toggle_capture(&mut self) {
@@ -2075,7 +1438,6 @@ impl App {
                 self.cycle_refresh_rate(direction);
                 self.config.settings.mark_custom_analysis();
             }
-            "audio_delay" => self.adjust_audio_delay_unsaved(direction),
             "high_shelf" => {
                 self.config.settings.high_shelf_enabled = !self.config.settings.high_shelf_enabled
             }
@@ -2158,20 +1520,6 @@ impl App {
                     (self.config.settings.ceiling + delta).clamp(MIN_CEILING, MAX_CEILING);
             }
             _ => {}
-        }
-    }
-
-    fn adjust_audio_delay(&mut self, direction: i32) {
-        self.adjust_audio_delay_unsaved(direction);
-        self.save_config();
-    }
-
-    fn adjust_audio_delay_unsaved(&mut self, direction: i32) {
-        let current = self.config.settings.audio_delay_ms as i32;
-        let next = (current + direction * AUDIO_DELAY_STEP_MS).clamp(0, MAX_AUDIO_DELAY_MS) as u16;
-        if next != self.config.settings.audio_delay_ms {
-            self.config.settings.audio_delay_ms = next;
-            self.flush_audio_delay();
         }
     }
 
@@ -2363,11 +1711,6 @@ struct AudioSamples {
     right_level: f32,
 }
 
-struct DelayedAudio {
-    received_at: Instant,
-    samples: AudioSamples,
-}
-
 struct AudioProcess {
     child: Child,
 }
@@ -2438,21 +1781,21 @@ fn read_audio_stdout(mut stdout: impl Read, tx: Sender<AudioEvent>, capture_id: 
 
                 let bytes_to_read = frame_count * 8;
                 let mut mono = Vec::with_capacity(frame_count);
-                let mut left = Vec::with_capacity(frame_count);
-                let mut right = Vec::with_capacity(frame_count);
+                let mut left_square_sum = 0.0_f32;
+                let mut right_square_sum = 0.0_f32;
 
                 for chunk in pending[..bytes_to_read].chunks_exact(8) {
                     let left_sample = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                     let right_sample = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-                    left.push(left_sample);
-                    right.push(right_sample);
+                    left_square_sum += left_sample * left_sample;
+                    right_square_sum += right_sample * right_sample;
                     mono.push((left_sample + right_sample) * 0.5);
                 }
 
                 pending.drain(0..bytes_to_read);
                 let samples = AudioSamples {
-                    left_level: audio_level(&left),
-                    right_level: audio_level(&right),
+                    left_level: audio_level_from_square_sum(left_square_sum, frame_count),
+                    right_level: audio_level_from_square_sum(right_square_sum, frame_count),
                     mono,
                 };
 
@@ -2749,6 +2092,13 @@ fn audio_level(samples: &[f32]) -> f32 {
         .take(count)
         .map(|sample| sample * sample)
         .sum::<f32>();
+    audio_level_from_square_sum(square_sum, count)
+}
+
+fn audio_level_from_square_sum(square_sum: f32, count: usize) -> f32 {
+    if count == 0 {
+        return 0.0;
+    }
     let rms = (square_sum / count as f32).sqrt();
     let db = 20.0 * rms.max(0.000_001).log10();
     ((db + 60.0) / 54.0).clamp(0.0, 1.0).powf(0.85)
@@ -2765,40 +2115,35 @@ struct Theme {
     mid: Color,
     high: Color,
     peak: Color,
-    color_mode: ColorMode,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ColorMode {
-    Static,
-    Aurora,
-    SonicTexture,
-    NoiseWarp,
-    Miku,
-    AlbumArt,
-    AlbumArtCircle,
-}
-
-fn is_album_color_mode(color_mode: ColorMode) -> bool {
-    matches!(color_mode, ColorMode::AlbumArt | ColorMode::AlbumArtCircle)
 }
 
 fn theme(id: ThemeId) -> Theme {
     match id {
-        ThemeId::Spring | ThemeId::System | ThemeId::Graphite | ThemeId::Ocean | ThemeId::Amber => {
-            Theme {
-                title_key: "theme_spring",
-                accent: Color::Rgb(255, 164, 164),
-                text: Color::Rgb(252, 249, 234),
-                muted: Color::Rgb(186, 223, 219),
-                border: Color::Rgb(186, 223, 219),
-                low: Color::Rgb(255, 164, 164),
-                mid: Color::Rgb(255, 189, 189),
-                high: Color::Rgb(252, 249, 234),
-                peak: Color::Rgb(186, 223, 219),
-                color_mode: ColorMode::Static,
-            }
-        }
+        ThemeId::Spring
+        | ThemeId::System
+        | ThemeId::Graphite
+        | ThemeId::Ocean
+        | ThemeId::Aurora
+        | ThemeId::PitchClass
+        | ThemeId::ChromaBands
+        | ThemeId::PitchMemory
+        | ThemeId::HarmonicComb
+        | ThemeId::SonicTexture
+        | ThemeId::NoiseWarp
+        | ThemeId::Miku
+        | ThemeId::AlbumArt
+        | ThemeId::AlbumArtCircle
+        | ThemeId::Amber => Theme {
+            title_key: "theme_spring",
+            accent: Color::Rgb(255, 164, 164),
+            text: Color::Rgb(252, 249, 234),
+            muted: Color::Rgb(186, 223, 219),
+            border: Color::Rgb(186, 223, 219),
+            low: Color::Rgb(255, 164, 164),
+            mid: Color::Rgb(255, 189, 189),
+            high: Color::Rgb(252, 249, 234),
+            peak: Color::Rgb(186, 223, 219),
+        },
         ThemeId::Vintage => Theme {
             title_key: "theme_vintage",
             accent: Color::Rgb(186, 106, 76),
@@ -2809,83 +2154,6 @@ fn theme(id: ThemeId) -> Theme {
             mid: Color::Rgb(186, 106, 76),
             high: Color::Rgb(238, 224, 204),
             peak: Color::Rgb(96, 116, 86),
-            color_mode: ColorMode::Static,
-        },
-        ThemeId::Aurora => Theme {
-            title_key: "theme_aurora",
-            accent: Color::Cyan,
-            text: Color::Gray,
-            muted: Color::DarkGray,
-            border: Color::DarkGray,
-            low: Color::Blue,
-            mid: Color::Magenta,
-            high: Color::White,
-            peak: Color::LightCyan,
-            color_mode: ColorMode::Aurora,
-        },
-        ThemeId::PitchClass
-        | ThemeId::ChromaBands
-        | ThemeId::PitchMemory
-        | ThemeId::HarmonicComb
-        | ThemeId::SonicTexture => Theme {
-            title_key: "theme_sonic_texture",
-            accent: Color::LightCyan,
-            text: Color::Gray,
-            muted: Color::DarkGray,
-            border: Color::DarkGray,
-            low: Color::Blue,
-            mid: Color::LightMagenta,
-            high: Color::White,
-            peak: Color::LightCyan,
-            color_mode: ColorMode::SonicTexture,
-        },
-        ThemeId::NoiseWarp => Theme {
-            title_key: "theme_noise_warp",
-            accent: Color::LightMagenta,
-            text: Color::Gray,
-            muted: Color::DarkGray,
-            border: Color::DarkGray,
-            low: Color::Magenta,
-            mid: Color::LightBlue,
-            high: Color::White,
-            peak: Color::LightMagenta,
-            color_mode: ColorMode::NoiseWarp,
-        },
-        ThemeId::Miku => Theme {
-            title_key: "theme_miku",
-            accent: Color::LightCyan,
-            text: Color::Gray,
-            muted: Color::DarkGray,
-            border: Color::DarkGray,
-            low: Color::Cyan,
-            mid: Color::LightCyan,
-            high: Color::White,
-            peak: Color::LightCyan,
-            color_mode: ColorMode::Miku,
-        },
-        ThemeId::AlbumArt => Theme {
-            title_key: "theme_album_art",
-            accent: Color::White,
-            text: Color::Gray,
-            muted: Color::DarkGray,
-            border: Color::DarkGray,
-            low: Color::Gray,
-            mid: Color::Gray,
-            high: Color::White,
-            peak: Color::White,
-            color_mode: ColorMode::AlbumArt,
-        },
-        ThemeId::AlbumArtCircle => Theme {
-            title_key: "theme_album_art_circle",
-            accent: Color::White,
-            text: Color::Gray,
-            muted: Color::DarkGray,
-            border: Color::DarkGray,
-            low: Color::Gray,
-            mid: Color::Gray,
-            high: Color::White,
-            peak: Color::White,
-            color_mode: ColorMode::AlbumArtCircle,
         },
         ThemeId::Mono => Theme {
             title_key: "theme_mono",
@@ -2897,7 +2165,6 @@ fn theme(id: ThemeId) -> Theme {
             mid: Color::Gray,
             high: Color::White,
             peak: Color::White,
-            color_mode: ColorMode::Static,
         },
     }
 }
@@ -2933,30 +2200,16 @@ fn spectrum_bar_color_at(
     trail: bool,
 ) -> Color {
     let theme = app.theme();
-    if theme.color_mode == ColorMode::Static {
-        if trail {
-            theme.border
-        } else {
-            bar_color(theme, height_ratio, value)
-        }
+    let _ = (index, len);
+    if trail {
+        theme.border
     } else {
-        music_color_for_position_at(
-            app,
-            spectrum_position(index, len),
-            value,
-            height_ratio,
-            trail,
-        )
+        bar_color(theme, height_ratio, value)
     }
 }
 
 fn waveform_color(app: &App, value: f32) -> Color {
-    let theme = app.theme();
-    if theme.color_mode == ColorMode::Static {
-        meter_color(theme, value)
-    } else {
-        music_color_for_position_at(app, 0.72, value, value, false)
-    }
+    meter_color(app.theme(), value)
 }
 
 fn draw(frame: &mut Frame, app: &App) {
@@ -3401,13 +2654,6 @@ fn draw_toolbar(frame: &mut Frame, app: &App, area: Rect) {
                 format!("{}Hz", app.config.settings.refresh_hz),
                 Style::default().fg(theme.text),
             ),
-            Span::raw("  "),
-            Span::styled(app.t("audio_delay"), Style::default().fg(theme.muted)),
-            Span::raw(" "),
-            Span::styled(
-                format!("{}ms", app.config.settings.audio_delay_ms),
-                Style::default().fg(theme.text),
-            ),
         ]),
         module_toggle_line(app),
         Line::from(vec![
@@ -3549,15 +2795,16 @@ fn draw_master_meter(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(spans));
     }
 
-    let mut footer_spans = Vec::with_capacity(2);
-    footer_spans.push(Span::styled(
-        master_meter_label('L', left, left_width),
-        Style::default().fg(theme.muted),
-    ));
-    footer_spans.push(Span::styled(
-        master_meter_label('R', right, right_width),
-        Style::default().fg(theme.muted),
-    ));
+    let footer_spans = vec![
+        Span::styled(
+            master_meter_label('L', left, left_width),
+            Style::default().fg(theme.muted),
+        ),
+        Span::styled(
+            master_meter_label('R', right, right_width),
+            Style::default().fg(theme.muted),
+        ),
+    ];
     lines.push(Line::from(footer_spans));
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -3631,11 +2878,6 @@ fn master_braille_cell(
 
 fn master_meter_color(app: &App, height_ratio: f32) -> Color {
     let theme = app.theme();
-    if theme.color_mode != ColorMode::Static {
-        let glow = music_color_for_position(app, 0.88, 0.75, false);
-        return blend_color(theme.border, glow, smoothstep(height_ratio.clamp(0.0, 1.0)));
-    }
-
     let fade = smoothstep(height_ratio.clamp(0.0, 1.0));
     let from = color_to_rgb(theme.border);
     let to = color_to_rgb(theme.accent);
@@ -3683,293 +2925,6 @@ fn color_to_rgb(color: Color) -> (u8, u8, u8) {
     }
 }
 
-fn spectrum_position(index: usize, len: usize) -> f32 {
-    if len <= 1 {
-        0.0
-    } else {
-        index as f32 / (len - 1) as f32
-    }
-}
-
-fn music_color_for_position(app: &App, position: f32, intensity: f32, trail: bool) -> Color {
-    music_color_for_position_at(app, position, intensity, intensity, trail)
-}
-
-fn music_color_for_position_at(
-    app: &App,
-    position: f32,
-    intensity: f32,
-    height_ratio: f32,
-    trail: bool,
-) -> Color {
-    let theme = app.theme();
-    let state = app.color_state;
-    let position = position.clamp(0.0, 1.0);
-    let height_ratio = height_ratio.clamp(0.0, 1.0);
-
-    match theme.color_mode {
-        ColorMode::Static => {
-            if trail {
-                theme.border
-            } else {
-                bar_color(theme, height_ratio, intensity)
-            }
-        }
-        ColorMode::Aurora => aurora_color(
-            theme,
-            state,
-            position,
-            (intensity * 0.80 + height_ratio * 0.20).clamp(0.0, 1.0),
-            height_ratio * 0.035 + if trail { 0.18 } else { 0.0 },
-            trail,
-        ),
-        ColorMode::SonicTexture => {
-            sonic_texture_theme_color(theme, state, position, intensity, height_ratio, trail)
-        }
-        ColorMode::NoiseWarp => {
-            noise_warp_theme_color(theme, state, position, intensity, height_ratio, trail)
-        }
-        ColorMode::Miku => miku_theme_color(theme, intensity, height_ratio, trail),
-        ColorMode::AlbumArt | ColorMode::AlbumArtCircle => {
-            album_theme_color(theme, intensity, height_ratio, trail)
-        }
-    }
-}
-
-fn sonic_texture_theme_color(
-    theme: Theme,
-    state: VisualColorState,
-    position: f32,
-    intensity: f32,
-    height_ratio: f32,
-    trail: bool,
-) -> Color {
-    let dominant = state.dominant_pitch;
-    let confidence = state.pitch_confidence.clamp(0.0, 1.0);
-    let (left_pitch, right_pitch, mix) = regional_pitch_pair(position, 4);
-    let pitch_seed = dominant as f32 * 0.055 + state.pitch_hue;
-    let frequency_scale = lerp(1.8, 4.8, smoothstep(position));
-    let x = position * frequency_scale + state.centroid * 0.55 + pitch_seed * 0.35;
-    let y = height_ratio * (2.35 + state.energy * 1.45) + state.phase * 1.35;
-    let cloud = fbm_2d(x * 1.35 + pitch_seed, y * 1.10 - pitch_seed, 0.19, 4);
-    let flow = fbm_2d(
-        x * 0.85 + cloud * 0.70,
-        y * 1.45 + state.flux * 1.20,
-        0.47 + dominant as f32 * 0.03,
-        3,
-    );
-    let contour_phase =
-        x * 0.65 + y * (1.05 + confidence * 0.55) + flow * 1.35 + pitch_seed + state.phase * 0.85;
-    let contour = 0.5 + 0.5 * (contour_phase * std::f32::consts::TAU).sin();
-    let surface = (1.0 - (intensity - height_ratio).abs() * 2.2).clamp(0.0, 1.0);
-    let texture = (cloud * 0.42 + flow * 0.32 + contour * 0.26).clamp(0.0, 1.0);
-    let texture = ((texture - 0.5) * 1.35 + 0.5).clamp(0.0, 1.0);
-    let hue_shift =
-        (texture - 0.5) * 0.125 + (surface - 0.5) * 0.045 + (state.centroid - 0.5) * 0.040;
-    let left = pitch_color(
-        theme,
-        left_pitch,
-        (intensity * (0.58 + state.chroma[left_pitch] * 0.18)).clamp(0.0, 1.0),
-        hue_shift,
-        height_ratio,
-    );
-    let right = pitch_color(
-        theme,
-        right_pitch,
-        (intensity * (0.58 + state.chroma[right_pitch] * 0.18)).clamp(0.0, 1.0),
-        hue_shift + 0.018,
-        height_ratio,
-    );
-    let regional = blend_color(left, right, mix);
-    let anchor = pitch_color(
-        theme,
-        dominant,
-        (intensity * 0.70 + confidence * 0.20 + texture * 0.10).clamp(0.0, 1.0),
-        hue_shift * 0.55,
-        height_ratio,
-    );
-    let pattern_hue = wrap_unit(state.pitch_hue + hue_shift + contour * 0.055);
-    let pattern = hsv_to_rgb(
-        pattern_hue,
-        (0.52 + confidence * 0.20 + flow * 0.22).clamp(0.42, 0.94),
-        (0.24 + intensity * 0.40 + height_ratio * 0.10 + texture * 0.28 + surface * 0.15)
-            .clamp(0.14, 1.0),
-    );
-    let color = blend_color(regional, anchor, 0.30 + confidence * 0.18);
-    let color = blend_color(color, pattern, 0.32 + texture * 0.26);
-    finish_music_color(
-        theme,
-        color,
-        (intensity + texture * 0.22 + surface * 0.14).clamp(0.0, 1.0),
-        height_ratio,
-        trail,
-    )
-}
-
-fn noise_warp_theme_color(
-    theme: Theme,
-    state: VisualColorState,
-    position: f32,
-    intensity: f32,
-    height_ratio: f32,
-    trail: bool,
-) -> Color {
-    let base_hue = rgb_hue(color_to_rgb(theme.accent));
-    let coarse_x = position * (2.15 + state.centroid * 1.10);
-    let coarse_y = height_ratio * (2.75 + state.energy * 1.75);
-    let drift = state.phase * (1.10 + state.flux * 1.80);
-    let warp_x = fbm_2d(coarse_x + 3.11, coarse_y - drift + 7.70, 0.61, 3) - 0.5;
-    let warp_y = fbm_2d(coarse_x - 5.30, coarse_y + drift + 2.43, 0.83, 3) - 0.5;
-    let warp_strength = 0.24 + state.energy * 0.42 + state.flux * 0.75;
-    let warped_x = coarse_x + warp_x * warp_strength;
-    let warped_y = coarse_y + warp_y * warp_strength;
-    let field = fbm_2d(warped_x * 1.25, warped_y * 1.18, 0.29, 5);
-    let ridges = (1.0 - (field * 2.0 - 1.0).abs()).powf(1.18);
-    let veins = 0.5
-        + 0.5
-            * ((warped_x * 0.75 + warped_y * 1.45 + field * 1.90 + drift) * std::f32::consts::TAU)
-                .sin();
-    let texture = (field * 0.48 + ridges * 0.32 + veins * 0.20).clamp(0.0, 1.0);
-    let texture = ((texture - 0.5) * 1.45 + 0.5).clamp(0.0, 1.0);
-    let surface = (1.0 - (intensity - height_ratio).abs() * 1.8).clamp(0.0, 1.0);
-    let hue = wrap_unit(
-        base_hue
-            + (state.centroid - 0.5) * 0.13
-            + position * 0.12
-            + (field - 0.5) * 0.30
-            + (veins - 0.5) * 0.090,
-    );
-    let saturation =
-        (0.48 + texture * 0.36 + state.energy * 0.14 + state.flux * 0.10).clamp(0.38, 0.96);
-    let value = (0.20
-        + intensity * 0.40
-        + height_ratio * 0.09
-        + texture * 0.28
-        + surface * 0.16
-        + state.flux * 0.08)
-        .clamp(0.12, 1.0);
-    let color = hsv_to_rgb(hue, saturation, value);
-    let accent = aurora_color(
-        theme,
-        state,
-        position * 0.45 + texture * 0.35,
-        intensity,
-        (field - 0.5) * 0.08,
-        false,
-    );
-    let color = blend_color(color, accent, 0.14 + ridges * 0.14);
-    finish_music_color(
-        theme,
-        color,
-        (intensity + texture * 0.22 + surface * 0.12).clamp(0.0, 1.0),
-        height_ratio,
-        trail,
-    )
-}
-
-fn finish_music_color(
-    theme: Theme,
-    color: Color,
-    intensity: f32,
-    height_ratio: f32,
-    trail: bool,
-) -> Color {
-    let intensity = (intensity * 0.82 + height_ratio * 0.18).clamp(0.0, 1.0);
-    let color = blend_color(color, theme.high, (intensity - 0.88).max(0.0) * 1.5);
-    if trail {
-        blend_color(theme.border, color, 0.46 + intensity * 0.20)
-    } else {
-        blend_color(theme.border, color, 0.30 + intensity * 0.62)
-    }
-}
-
-fn pitch_color(
-    theme: Theme,
-    pitch_class: usize,
-    intensity: f32,
-    hue_shift: f32,
-    height_ratio: f32,
-) -> Color {
-    let hue = wrap_unit(pitch_class_hue(pitch_class) + hue_shift);
-    let saturation = (0.50 + intensity * 0.20 + height_ratio * 0.08).clamp(0.38, 0.82);
-    let value = (0.28 + intensity * 0.48 + height_ratio * 0.18).clamp(0.18, 0.96);
-    blend_color(hsv_to_rgb(hue, saturation, value), theme.accent, 0.16)
-}
-
-fn regional_pitch_pair(position: f32, regions: usize) -> (usize, usize, f32) {
-    let regions = regions.max(2);
-    let scaled = position.clamp(0.0, 1.0) * (regions - 1) as f32;
-    let left_region = scaled.floor() as usize;
-    let right_region = scaled.ceil().min((regions - 1) as f32) as usize;
-    let mix = smoothstep(scaled - left_region as f32);
-    let region_position = |region: usize| {
-        if regions <= 1 {
-            0.0
-        } else {
-            region as f32 / (regions - 1) as f32
-        }
-    };
-
-    (
-        pitch_class_for_frequency(frequency_for_position(region_position(left_region))),
-        pitch_class_for_frequency(frequency_for_position(region_position(right_region))),
-        mix,
-    )
-}
-
-fn fbm_2d(x: f32, y: f32, seed: f32, octaves: usize) -> f32 {
-    let mut value = 0.0_f32;
-    let mut amplitude = 0.5_f32;
-    let mut frequency = 1.0_f32;
-    let mut total = 0.0_f32;
-
-    for octave in 0..octaves.max(1) {
-        value +=
-            value_noise_2d(x * frequency, y * frequency, seed + octave as f32 * 9.17) * amplitude;
-        total += amplitude;
-        frequency *= 2.0;
-        amplitude *= 0.5;
-    }
-
-    (value / total.max(0.000_1)).clamp(0.0, 1.0)
-}
-
-fn value_noise_2d(x: f32, y: f32, seed: f32) -> f32 {
-    let x0 = x.floor();
-    let y0 = y.floor();
-    let xf = x - x0;
-    let yf = y - y0;
-    let u = smootherstep(xf);
-    let v = smootherstep(yf);
-    let n00 = hash_unit(x0, y0, seed);
-    let n10 = hash_unit(x0 + 1.0, y0, seed);
-    let n01 = hash_unit(x0, y0 + 1.0, seed);
-    let n11 = hash_unit(x0 + 1.0, y0 + 1.0, seed);
-    let x1 = lerp(n00, n10, u);
-    let x2 = lerp(n01, n11, u);
-
-    lerp(x1, x2, v)
-}
-
-fn hash_unit(x: f32, y: f32, seed: f32) -> f32 {
-    let value = (x * 127.1 + y * 311.7 + seed * 74.7).sin() * 43_758.547;
-    value - value.floor()
-}
-
-fn smootherstep(value: f32) -> f32 {
-    let value = value.clamp(0.0, 1.0);
-    value * value * value * (value * (value * 6.0 - 15.0) + 10.0)
-}
-
-fn pitch_class_hue(pitch_class: usize) -> f32 {
-    const FIFTHS: [usize; 12] = [0, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10, 5];
-    let rank = FIFTHS
-        .iter()
-        .position(|pitch| *pitch == pitch_class % 12)
-        .unwrap_or(0);
-    wrap_unit(rank as f32 / 12.0 + 0.02)
-}
-
 fn blend_color(from: Color, to: Color, amount: f32) -> Color {
     let amount = amount.clamp(0.0, 1.0);
     let from = color_to_rgb(from);
@@ -3987,595 +2942,6 @@ fn blend_color(from: Color, to: Color, amount: f32) -> Color {
     )
 }
 
-fn miku_block_sample(
-    app: &App,
-    virtual_width: usize,
-    virtual_height: usize,
-    col: usize,
-    row: usize,
-) -> Option<MikuSample> {
-    miku_cell_sample(
-        app,
-        MikuSampleGrid {
-            virtual_width,
-            virtual_height,
-            base_x: col,
-            base_y: row,
-            dot_width: 1,
-            dot_height: 1,
-            x_aspect: TERMINAL_CELL_ASPECT,
-        },
-    )
-    .map(|(_, sample)| sample)
-}
-
-fn miku_braille_sample(
-    app: &App,
-    virtual_width: usize,
-    virtual_height: usize,
-    cell_col: usize,
-    cell_row: usize,
-) -> Option<(u8, MikuSample)> {
-    miku_cell_sample(
-        app,
-        MikuSampleGrid {
-            virtual_width,
-            virtual_height,
-            base_x: cell_col * 2,
-            base_y: cell_row * 4,
-            dot_width: 2,
-            dot_height: 4,
-            x_aspect: 1.0,
-        },
-    )
-}
-
-fn miku_cell_sample(app: &App, grid: MikuSampleGrid) -> Option<(u8, MikuSample)> {
-    let frame = miku_animation().frame_at_phase(app.miku_frame_phase)?;
-    let mut mask = 0_u8;
-    let mut alpha_sum = 0.0_f32;
-    let mut red_sum = 0.0_f32;
-    let mut green_sum = 0.0_f32;
-    let mut blue_sum = 0.0_f32;
-    let dot_count = (grid.dot_width * grid.dot_height).max(1) as f32;
-
-    for (dot_col, dot_row, bit) in braille_dot_bits()
-        .filter(|(dot_col, dot_row, _)| *dot_col < grid.dot_width && *dot_row < grid.dot_height)
-    {
-        let Some(sample) = miku_virtual_sample(
-            frame,
-            grid.virtual_width,
-            grid.virtual_height,
-            grid.base_x + dot_col,
-            grid.base_y + dot_row,
-            grid.x_aspect,
-        ) else {
-            continue;
-        };
-        if sample.alpha <= 0.02 {
-            continue;
-        }
-
-        alpha_sum += sample.alpha;
-        red_sum += sample.red as f32 * sample.alpha;
-        green_sum += sample.green as f32 * sample.alpha;
-        blue_sum += sample.blue as f32 * sample.alpha;
-
-        if sample.alpha > 0.08 {
-            if grid.dot_width == 2 && grid.dot_height == 4 {
-                mask |= bit;
-            } else {
-                mask = u8::MAX;
-            }
-        }
-    }
-
-    if alpha_sum <= 0.02 || mask == 0 {
-        return None;
-    }
-
-    Some((
-        mask,
-        MikuSample {
-            red: (red_sum / alpha_sum).round().clamp(0.0, 255.0) as u8,
-            green: (green_sum / alpha_sum).round().clamp(0.0, 255.0) as u8,
-            blue: (blue_sum / alpha_sum).round().clamp(0.0, 255.0) as u8,
-            alpha: (alpha_sum / dot_count).clamp(0.0, 1.0),
-        },
-    ))
-}
-
-fn miku_virtual_sample(
-    frame: &MikuFrame,
-    virtual_width: usize,
-    virtual_height: usize,
-    virtual_x: usize,
-    virtual_y: usize,
-    x_aspect: f32,
-) -> Option<MikuSample> {
-    let (left, top, scale) = miku_layout(frame, virtual_width, virtual_height, x_aspect)?;
-    let x = virtual_x as f32 + 0.5;
-    let y = virtual_y as f32 + 0.5;
-    let right = left + frame.width as f32 * scale / x_aspect.max(f32::EPSILON);
-    let bottom = top + frame.height as f32 * scale;
-    if x < left || x >= right || y < top || y >= bottom {
-        return None;
-    }
-
-    let source_x = ((x - left) * x_aspect.max(f32::EPSILON) / scale).floor() as usize;
-    let source_y = ((y - top) / scale).floor() as usize;
-    let source_x = source_x.min(frame.width.saturating_sub(1));
-    let source_y = source_y.min(frame.height.saturating_sub(1));
-    let pixel = frame
-        .pixels
-        .get(source_y * frame.width + source_x)
-        .copied()?;
-    if pixel.alpha == 0 {
-        return None;
-    }
-
-    Some(MikuSample {
-        red: pixel.red,
-        green: pixel.green,
-        blue: pixel.blue,
-        alpha: pixel.alpha as f32 / 255.0,
-    })
-}
-
-fn miku_layout(
-    frame: &MikuFrame,
-    virtual_width: usize,
-    virtual_height: usize,
-    x_aspect: f32,
-) -> Option<(f32, f32, f32)> {
-    let animation = miku_animation();
-    let source_width = animation.width.max(frame.width);
-    let source_height = animation.height.max(frame.height);
-    let _duration_ms = animation.total_duration_ms;
-    if source_width == 0 || source_height == 0 || virtual_width == 0 || virtual_height == 0 {
-        return None;
-    }
-
-    let x_aspect = x_aspect.max(f32::EPSILON);
-    let scale = (virtual_width as f32 * x_aspect / source_width as f32)
-        .min(virtual_height as f32 / source_height as f32);
-    if scale <= f32::EPSILON {
-        return None;
-    }
-
-    let scaled_width = source_width as f32 * scale / x_aspect;
-    let scaled_height = source_height as f32 * scale;
-    Some((
-        (virtual_width as f32 - scaled_width) * 0.5,
-        (virtual_height as f32 - scaled_height) * 0.5,
-        scale,
-    ))
-}
-
-fn miku_background_color(theme: Theme, sample: MikuSample) -> Color {
-    let background = accent_trace_background_color(theme);
-    let image = Color::Rgb(sample.red, sample.green, sample.blue);
-    blend_color(background, image, 0.12 + sample.alpha * 0.24)
-}
-
-fn miku_highlight_color(theme: Theme, sample: MikuSample, intensity: f32, trail: bool) -> Color {
-    let background = accent_trace_background_color(theme);
-    let image = Color::Rgb(sample.red, sample.green, sample.blue);
-    let lit = blend_color(image, theme.high, if trail { 0.04 } else { 0.10 });
-    let amount = if trail {
-        0.42 + sample.alpha * 0.18
-    } else {
-        0.58 + sample.alpha * 0.24 + intensity.clamp(0.0, 1.0) * 0.12
-    };
-
-    blend_color(background, lit, amount)
-}
-
-fn miku_theme_color(theme: Theme, intensity: f32, height_ratio: f32, trail: bool) -> Color {
-    let intensity = intensity.clamp(0.0, 1.0);
-    let height_ratio = height_ratio.clamp(0.0, 1.0);
-    let base = blend_color(theme.border, theme.accent, 0.18 + intensity * 0.50);
-    let glow = blend_color(base, theme.high, (intensity - 0.78).max(0.0) * 0.70);
-    let color = blend_color(base, glow, 0.35 + height_ratio * 0.20);
-
-    if trail {
-        blend_color(theme.border, color, 0.38 + intensity * 0.18)
-    } else {
-        blend_color(theme.border, color, 0.34 + intensity * 0.52)
-    }
-}
-
-fn album_theme_color(theme: Theme, intensity: f32, height_ratio: f32, trail: bool) -> Color {
-    let intensity = intensity.clamp(0.0, 1.0);
-    let height_ratio = height_ratio.clamp(0.0, 1.0);
-    let foreground = if trail {
-        blend_color(theme.border, theme.high, 0.46 + intensity * 0.22)
-    } else {
-        blend_color(theme.text, theme.high, 0.82 + intensity * 0.16)
-    };
-    let amount = if trail {
-        0.56 + intensity * 0.12
-    } else {
-        0.78 + height_ratio * 0.08 + intensity * 0.12
-    };
-
-    blend_color(theme.border, foreground, amount.clamp(0.0, 0.96))
-}
-
-fn album_braille_sample(
-    app: &App,
-    virtual_width: usize,
-    virtual_height: usize,
-    cell_col: usize,
-    cell_row: usize,
-) -> Option<(u8, AlbumSample)> {
-    let artwork = app.album_artwork.as_ref()?;
-    match app.theme().color_mode {
-        ColorMode::AlbumArt => {
-            album_artwork_image_cell(artwork, cell_col, cell_row, virtual_width, virtual_height)
-        }
-        ColorMode::AlbumArtCircle => album_artwork_circle_cell(
-            artwork,
-            cell_col,
-            cell_row,
-            virtual_width,
-            virtual_height,
-            app.album_circle_rotation_phase,
-        ),
-        _ => None,
-    }
-}
-
-fn album_artwork_image_cell(
-    artwork: &AlbumArtwork,
-    cell_col: usize,
-    cell_row: usize,
-    virtual_width: usize,
-    virtual_height: usize,
-) -> Option<(u8, AlbumSample)> {
-    let mut mask = 0_u8;
-    let mut red_sum = 0.0_f32;
-    let mut green_sum = 0.0_f32;
-    let mut blue_sum = 0.0_f32;
-    let mut luma_sum = 0.0_f32;
-    let mut edge_sum = 0.0_f32;
-    let mut weight_sum = 0.0_f32;
-
-    for (dot_col, dot_row, bit) in braille_dot_bits() {
-        let x = cell_col * 2 + dot_col;
-        let y = cell_row * 4 + dot_row;
-        let Some(sample) = sample_album_artwork_image(artwork, x, y, virtual_width, virtual_height)
-        else {
-            continue;
-        };
-
-        mask |= bit;
-
-        let weight = (0.20 + sample.luma * 0.55 + sample.edge * 0.25).clamp(0.05, 1.0);
-        red_sum += sample.red as f32 * weight;
-        green_sum += sample.green as f32 * weight;
-        blue_sum += sample.blue as f32 * weight;
-        luma_sum += sample.luma * weight;
-        edge_sum += sample.edge * weight;
-        weight_sum += weight;
-    }
-
-    if weight_sum <= 0.0 {
-        return None;
-    }
-
-    Some((
-        mask,
-        AlbumSample {
-            red: (red_sum / weight_sum).round().clamp(0.0, 255.0) as u8,
-            green: (green_sum / weight_sum).round().clamp(0.0, 255.0) as u8,
-            blue: (blue_sum / weight_sum).round().clamp(0.0, 255.0) as u8,
-            luma: (luma_sum / weight_sum).clamp(0.0, 1.0),
-            edge: (edge_sum / weight_sum).clamp(0.0, 1.0),
-        },
-    ))
-}
-
-fn album_artwork_circle_cell(
-    artwork: &AlbumArtwork,
-    cell_col: usize,
-    cell_row: usize,
-    virtual_width: usize,
-    virtual_height: usize,
-    rotation_phase: f32,
-) -> Option<(u8, AlbumSample)> {
-    let mut mask = 0_u8;
-    let mut red_sum = 0.0_f32;
-    let mut green_sum = 0.0_f32;
-    let mut blue_sum = 0.0_f32;
-    let mut luma_sum = 0.0_f32;
-    let mut edge_sum = 0.0_f32;
-    let mut weight_sum = 0.0_f32;
-
-    for (dot_col, dot_row, bit) in braille_dot_bits() {
-        let x = cell_col * 2 + dot_col;
-        let y = cell_row * 4 + dot_row;
-        let Some(sample) = sample_album_artwork_circle(
-            artwork,
-            x,
-            y,
-            virtual_width,
-            virtual_height,
-            rotation_phase,
-        ) else {
-            continue;
-        };
-
-        mask |= bit;
-
-        let weight = (0.22 + sample.luma * 0.58 + sample.edge * 0.20).clamp(0.05, 1.0);
-        red_sum += sample.red as f32 * weight;
-        green_sum += sample.green as f32 * weight;
-        blue_sum += sample.blue as f32 * weight;
-        luma_sum += sample.luma * weight;
-        edge_sum += sample.edge * weight;
-        weight_sum += weight;
-    }
-
-    if weight_sum <= 0.0 {
-        return None;
-    }
-
-    Some((
-        mask,
-        AlbumSample {
-            red: (red_sum / weight_sum).round().clamp(0.0, 255.0) as u8,
-            green: (green_sum / weight_sum).round().clamp(0.0, 255.0) as u8,
-            blue: (blue_sum / weight_sum).round().clamp(0.0, 255.0) as u8,
-            luma: (luma_sum / weight_sum).clamp(0.0, 1.0),
-            edge: (edge_sum / weight_sum).clamp(0.0, 1.0),
-        },
-    ))
-}
-
-fn sample_album_artwork_image(
-    artwork: &AlbumArtwork,
-    x: usize,
-    y: usize,
-    virtual_width: usize,
-    virtual_height: usize,
-) -> Option<AlbumSample> {
-    if virtual_width <= 1 || virtual_height <= 1 || artwork.width <= 1 || artwork.height <= 1 {
-        return None;
-    }
-
-    let (left, top, scale) = album_artwork_layout(artwork, virtual_width, virtual_height)?;
-    let x = x as f32 + 0.5;
-    let y = y as f32 + 0.5;
-    let right = left + artwork.width as f32 * scale;
-    let bottom = top + artwork.height as f32 * scale;
-    if x < left || x >= right || y < top || y >= bottom {
-        return None;
-    }
-
-    let u = ((x - left) / scale / (artwork.width - 1) as f32).clamp(0.0, 1.0);
-    let v = ((y - top) / scale / (artwork.height - 1) as f32).clamp(0.0, 1.0);
-    sample_album_artwork_image_uv(artwork, u, v)
-}
-
-fn sample_album_artwork_circle(
-    artwork: &AlbumArtwork,
-    x: usize,
-    y: usize,
-    virtual_width: usize,
-    virtual_height: usize,
-    rotation_phase: f32,
-) -> Option<AlbumSample> {
-    if virtual_width <= 1 || virtual_height <= 1 || artwork.width <= 1 || artwork.height <= 1 {
-        return None;
-    }
-
-    let diameter = virtual_width.min(virtual_height) as f32;
-    if diameter <= 1.0 {
-        return None;
-    }
-
-    let center_x = (virtual_width as f32 - 1.0) * 0.5;
-    let center_y = (virtual_height as f32 - 1.0) * 0.5;
-    let radius = diameter * 0.5;
-    let local_x = (x as f32 + 0.5 - center_x) / radius;
-    let local_y = (y as f32 + 0.5 - center_y) / radius;
-    let radius_squared = local_x * local_x + local_y * local_y;
-    if radius_squared > 1.0 {
-        return None;
-    }
-
-    let rotation = rotation_phase * std::f32::consts::TAU;
-    let (sin, cos) = rotation.sin_cos();
-    let source_x = local_x * cos - local_y * sin;
-    let source_y = local_x * sin + local_y * cos;
-    let u = (0.5 + source_x * 0.5).clamp(0.0, 1.0);
-    let v = (0.5 + source_y * 0.5).clamp(0.0, 1.0);
-    let mut sample = sample_album_artwork_image_uv(artwork, u, v)?;
-    let circle_edge = smoothstep(((radius_squared.sqrt() - 0.93) / 0.07).clamp(0.0, 1.0));
-    sample.edge = sample.edge.max(circle_edge);
-    Some(sample)
-}
-
-fn album_artwork_layout(
-    artwork: &AlbumArtwork,
-    virtual_width: usize,
-    virtual_height: usize,
-) -> Option<(f32, f32, f32)> {
-    if artwork.width == 0 || artwork.height == 0 || virtual_width == 0 || virtual_height == 0 {
-        return None;
-    }
-
-    let scale = (virtual_width as f32 / artwork.width as f32)
-        .min(virtual_height as f32 / artwork.height as f32);
-    if scale <= f32::EPSILON {
-        return None;
-    }
-
-    let scaled_width = artwork.width as f32 * scale;
-    let scaled_height = artwork.height as f32 * scale;
-    Some((
-        (virtual_width as f32 - scaled_width) * 0.5,
-        (virtual_height as f32 - scaled_height) * 0.5,
-        scale,
-    ))
-}
-
-fn sample_album_artwork_image_uv(artwork: &AlbumArtwork, u: f32, v: f32) -> Option<AlbumSample> {
-    let x = u.clamp(0.0, 1.0) * (artwork.width - 1) as f32;
-    let y = v.clamp(0.0, 1.0) * (artwork.height - 1) as f32;
-    let x0 = x.floor() as usize;
-    let y0 = y.floor() as usize;
-    let x1 = x.ceil().min((artwork.width - 1) as f32) as usize;
-    let y1 = y.ceil().min((artwork.height - 1) as f32) as usize;
-    let mix_x = x - x0 as f32;
-    let mix_y = y - y0 as f32;
-
-    let sample_pixel = |x: usize, y: usize| artwork.pixels[y * artwork.width + x];
-    let sample_luma = |x: usize, y: usize| artwork.luma[y * artwork.width + x];
-    let sample_edge = |x: usize, y: usize| artwork.edges[y * artwork.width + x];
-    let blend_value = |top_left: f32, top_right: f32, bottom_left: f32, bottom_right: f32| {
-        let top = lerp(top_left, top_right, mix_x);
-        let bottom = lerp(bottom_left, bottom_right, mix_x);
-        lerp(top, bottom, mix_y).clamp(0.0, 1.0)
-    };
-    let blend_channel = |channel: fn(AlbumPixel) -> u8| {
-        let top = lerp(
-            channel(sample_pixel(x0, y0)) as f32,
-            channel(sample_pixel(x1, y0)) as f32,
-            mix_x,
-        );
-        let bottom = lerp(
-            channel(sample_pixel(x0, y1)) as f32,
-            channel(sample_pixel(x1, y1)) as f32,
-            mix_x,
-        );
-        lerp(top, bottom, mix_y).round().clamp(0.0, 255.0) as u8
-    };
-
-    Some(AlbumSample {
-        red: blend_channel(|pixel| pixel.red),
-        green: blend_channel(|pixel| pixel.green),
-        blue: blend_channel(|pixel| pixel.blue),
-        luma: blend_value(
-            sample_luma(x0, y0),
-            sample_luma(x1, y0),
-            sample_luma(x0, y1),
-            sample_luma(x1, y1),
-        ),
-        edge: blend_value(
-            sample_edge(x0, y0),
-            sample_edge(x1, y0),
-            sample_edge(x0, y1),
-            sample_edge(x1, y1),
-        ),
-    })
-}
-
-fn album_background_color(theme: Theme, sample: AlbumSample) -> Color {
-    let background = accent_trace_background_color(theme);
-    let image = Color::Rgb(sample.red, sample.green, sample.blue);
-    let amount = (0.24 + sample.luma * 0.22 + sample.edge * 0.14).clamp(0.22, 0.58);
-    blend_color(background, image, amount)
-}
-
-fn album_highlight_color(theme: Theme, sample: AlbumSample, intensity: f32, trail: bool) -> Color {
-    let background = album_background_color(theme, sample);
-    let image = Color::Rgb(sample.red, sample.green, sample.blue);
-    let intensity = intensity.clamp(0.0, 1.0);
-    let image_lift = if trail {
-        0.58 + intensity * 0.14
-    } else {
-        0.70 + intensity * 0.18
-    };
-    let whitening = if trail {
-        0.08 + sample.edge * 0.04 + intensity * 0.04
-    } else {
-        0.14 + sample.edge * 0.05 + intensity * 0.08
-    };
-    let colored = blend_color(background, image, image_lift.clamp(0.0, 0.92));
-    blend_color(colored, theme.high, whitening.clamp(0.0, 0.28))
-}
-
-fn aurora_color(
-    theme: Theme,
-    state: VisualColorState,
-    position: f32,
-    intensity: f32,
-    hue_offset: f32,
-    trail: bool,
-) -> Color {
-    let base_hue = rgb_hue(color_to_rgb(theme.accent));
-    let hue = wrap_unit(
-        base_hue
-            + position.clamp(0.0, 1.0) * 0.58
-            + (state.centroid - 0.5) * 0.20
-            + state.phase
-            + hue_offset,
-    );
-    let intensity = intensity.clamp(0.0, 1.0);
-    let saturation = (0.54 + state.energy * 0.26 + intensity * 0.18).clamp(0.42, 0.96);
-    let value =
-        (0.24 + intensity * 0.50 + state.energy * 0.22 + state.flux * 0.24).clamp(0.18, 1.0);
-    let color = hsv_to_rgb(hue, saturation, value);
-    let theme_mix = if trail { 0.08 } else { 0.16 };
-    let color = blend_color(color, theme.accent, theme_mix);
-
-    if trail {
-        blend_color(theme.border, color, 0.58)
-    } else {
-        color
-    }
-}
-
-fn rgb_hue((red, green, blue): (u8, u8, u8)) -> f32 {
-    let red = red as f32 / 255.0;
-    let green = green as f32 / 255.0;
-    let blue = blue as f32 / 255.0;
-    let max = red.max(green).max(blue);
-    let min = red.min(green).min(blue);
-    let delta = max - min;
-
-    if delta <= f32::EPSILON {
-        return 0.0;
-    }
-
-    let hue = if (max - red).abs() <= f32::EPSILON {
-        (green - blue) / delta
-    } else if (max - green).abs() <= f32::EPSILON {
-        (blue - red) / delta + 2.0
-    } else {
-        (red - green) / delta + 4.0
-    };
-
-    wrap_unit(hue / 6.0)
-}
-
-fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> Color {
-    let hue = wrap_unit(hue) * 6.0;
-    let saturation = saturation.clamp(0.0, 1.0);
-    let value = value.clamp(0.0, 1.0);
-    let chroma = value * saturation;
-    let x = chroma * (1.0 - ((hue % 2.0) - 1.0).abs());
-    let m = value - chroma;
-    let (red, green, blue) = if hue < 1.0 {
-        (chroma, x, 0.0)
-    } else if hue < 2.0 {
-        (x, chroma, 0.0)
-    } else if hue < 3.0 {
-        (0.0, chroma, x)
-    } else if hue < 4.0 {
-        (0.0, x, chroma)
-    } else if hue < 5.0 {
-        (x, 0.0, chroma)
-    } else {
-        (chroma, 0.0, x)
-    };
-    let to_byte = |channel: f32| ((channel + m) * 255.0).round().clamp(0.0, 255.0) as u8;
-
-    Color::Rgb(to_byte(red), to_byte(green), to_byte(blue))
-}
-
 fn lerp(from: f32, to: f32, amount: f32) -> f32 {
     from + (to - from) * amount.clamp(0.0, 1.0)
 }
@@ -4586,15 +2952,6 @@ fn normalize_unit(value: f32, min: f32, max: f32) -> f32 {
     } else {
         ((value - min) / (max - min)).clamp(0.0, 1.0)
     }
-}
-
-fn lerp_unit(from: f32, to: f32, amount: f32) -> f32 {
-    let delta = (to - from + 0.5).rem_euclid(1.0) - 0.5;
-    wrap_unit(from + delta * amount.clamp(0.0, 1.0))
-}
-
-fn wrap_unit(value: f32) -> f32 {
-    value.rem_euclid(1.0)
 }
 
 fn frequency_for_position(position: f32) -> f32 {
@@ -4737,8 +3094,6 @@ fn draw_block_spectrum(frame: &mut Frame, app: &App, area: Rect) {
     let virtual_width = area.width as usize * 2;
     let virtual_height = chart_height * 4;
     let accent_traces = display_accent_traces(app, virtual_width, virtual_height);
-    let miku_enabled = theme.color_mode == ColorMode::Miku;
-    let album_enabled = is_album_color_mode(theme.color_mode);
     let mut lines = Vec::with_capacity(chart_height);
 
     for row in 0..chart_height {
@@ -4760,63 +3115,33 @@ fn draw_block_spectrum(frame: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or(0.0);
             let filled = value >= threshold;
             let trail_filled = !filled && trail_value > value && trail_value >= threshold;
-            let miku_sample = if miku_enabled {
-                miku_block_sample(app, bars.len(), chart_height, index, row)
-            } else {
-                None
-            };
-            let album_sample = if album_enabled {
-                album_braille_sample(app, virtual_width, virtual_height, index, row)
-            } else {
-                None
-            };
-            let base_symbol = if let Some((mask, _)) = album_sample {
-                braille_pattern(mask).to_string()
-            } else if filled {
+            let base_symbol = if filled {
                 "█".to_string()
             } else if trail_filled {
                 "░".to_string()
-            } else if miku_sample.is_some() {
-                "█".to_string()
             } else {
                 " ".to_string()
             };
             let base_color = if filled {
-                Some(
-                    album_sample
-                        .map(|(_, sample)| album_highlight_color(theme, sample, value, false))
-                        .or_else(|| {
-                            miku_sample
-                                .map(|sample| miku_highlight_color(theme, sample, value, false))
-                        })
-                        .unwrap_or_else(|| {
-                            spectrum_bar_color_at(app, index, bars.len(), value, threshold, false)
-                        }),
-                )
+                Some(spectrum_bar_color_at(
+                    app,
+                    index,
+                    bars.len(),
+                    value,
+                    threshold,
+                    false,
+                ))
             } else if trail_filled {
-                Some(
-                    album_sample
-                        .map(|(_, sample)| album_highlight_color(theme, sample, trail_value, true))
-                        .or_else(|| {
-                            miku_sample.map(|sample| {
-                                miku_highlight_color(theme, sample, trail_value, true)
-                            })
-                        })
-                        .unwrap_or_else(|| {
-                            spectrum_bar_color_at(
-                                app,
-                                index,
-                                bars.len(),
-                                trail_value,
-                                threshold,
-                                true,
-                            )
-                        }),
-                )
+                Some(spectrum_bar_color_at(
+                    app,
+                    index,
+                    bars.len(),
+                    trail_value,
+                    threshold,
+                    true,
+                ))
             } else {
-                album_sample
-                    .map(|(_, sample)| album_background_color(theme, sample))
-                    .or_else(|| miku_sample.map(|sample| miku_background_color(theme, sample)))
+                None
             };
             let (symbol, color) = if let Some(overlay) = accent_trace {
                 if let Some(base_color) = base_color {
@@ -4836,7 +3161,7 @@ fn draw_block_spectrum(frame: &mut Frame, app: &App, area: Rect) {
                 row,
                 bars.len(),
                 chart_height,
-                !filled && !trail_filled && miku_sample.is_none() && album_sample.is_none(),
+                !filled && !trail_filled,
             ) {
                 (note.label.to_string(), note.color)
             } else {
@@ -4869,8 +3194,6 @@ fn draw_cava_spectrum(frame: &mut Frame, app: &App, area: Rect) {
     let virtual_height = chart_height * 8;
     let accent_virtual_height = chart_height * 4;
     let accent_traces = display_accent_traces(app, area.width as usize * 2, accent_virtual_height);
-    let miku_enabled = theme.color_mode == ColorMode::Miku;
-    let album_enabled = is_album_color_mode(theme.color_mode);
     let mut lines = Vec::with_capacity(chart_height);
 
     for row in 0..chart_height {
@@ -4889,22 +3212,6 @@ fn draw_cava_spectrum(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 1.0 - ((row * 8 + 4) as f32 / virtual_height as f32)
             };
-            let miku_sample = if miku_enabled {
-                miku_block_sample(app, bars.len(), chart_height, index, row)
-            } else {
-                None
-            };
-            let album_sample = if album_enabled {
-                album_braille_sample(
-                    app,
-                    area.width as usize * 2,
-                    accent_virtual_height,
-                    index,
-                    row,
-                )
-            } else {
-                None
-            };
             let accent_trace = accent_trace_overlay_cell(
                 app,
                 &accent_traces,
@@ -4919,18 +3226,11 @@ fn draw_cava_spectrum(frame: &mut Frame, app: &App, area: Rect) {
                 row,
                 bars.len(),
                 chart_height,
-                visible_level == 0
-                    && miku_sample.is_none()
-                    && album_sample.is_none()
-                    && accent_trace.is_none(),
+                visible_level == 0 && accent_trace.is_none(),
             );
 
-            let symbol = if let Some((mask, _)) = album_sample {
-                braille_pattern(mask).to_string()
-            } else if visible_level > 0 {
+            let symbol = if visible_level > 0 {
                 cava_block_symbol(visible_level).to_string()
-            } else if miku_sample.is_some() {
-                "█".to_string()
             } else if accent_trace.is_some() {
                 "⠂".to_string()
             } else if let Some(note) = accent_note {
@@ -4944,34 +3244,16 @@ fn draw_cava_spectrum(frame: &mut Frame, app: &App, area: Rect) {
                 0.0
             };
             let base_color = if visible_level > 0 {
-                Some(
-                    album_sample
-                        .map(|(_, sample)| {
-                            album_highlight_color(theme, sample, intensity, trail_only)
-                        })
-                        .or_else(|| {
-                            miku_sample.map(|sample| {
-                                miku_highlight_color(theme, sample, intensity, trail_only)
-                            })
-                        })
-                        .unwrap_or_else(|| {
-                            spectrum_bar_color_at(
-                                app,
-                                index,
-                                bars.len(),
-                                intensity,
-                                height_ratio,
-                                trail_only,
-                            )
-                        }),
-                )
+                Some(spectrum_bar_color_at(
+                    app,
+                    index,
+                    bars.len(),
+                    intensity,
+                    height_ratio,
+                    trail_only,
+                ))
             } else {
-                accent_note
-                    .map(|note| note.color)
-                    .or_else(|| {
-                        album_sample.map(|(_, sample)| album_background_color(theme, sample))
-                    })
-                    .or_else(|| miku_sample.map(|sample| miku_background_color(theme, sample)))
+                accent_note.map(|note| note.color)
             };
             let color = if let Some(overlay) = accent_trace {
                 accent_trace_overlay_color(theme, base_color, overlay)
@@ -5006,8 +3288,6 @@ fn draw_braille_spectrum(frame: &mut Frame, app: &App, area: Rect) {
         Vec::new()
     };
     let accent_traces = display_accent_traces(app, virtual_width, virtual_height);
-    let miku_enabled = theme.color_mode == ColorMode::Miku;
-    let album_enabled = is_album_color_mode(theme.color_mode);
     let mut lines = Vec::with_capacity(chart_height);
 
     for row in 0..chart_height {
@@ -5025,96 +3305,33 @@ fn draw_braille_spectrum(frame: &mut Frame, app: &App, area: Rect) {
                 virtual_height,
             );
             let combined_mask = mask | (trail_mask & !mask);
-            let miku_sample = if miku_enabled {
-                miku_braille_sample(app, virtual_width, virtual_height, col, row)
-            } else {
-                None
-            };
-            let album_sample = if album_enabled {
-                album_braille_sample(app, virtual_width, virtual_height, col, row)
-            } else {
-                None
-            };
             if let Some(overlay) = accent_trace {
                 if combined_mask == 0 {
-                    let background_mask = album_sample
-                        .map(|(background_mask, _)| background_mask)
-                        .or_else(|| miku_sample.map(|(background_mask, _)| background_mask))
-                        .unwrap_or(0);
-                    let background_color = album_sample
-                        .map(|(_, sample)| album_background_color(theme, sample))
-                        .or_else(|| {
-                            miku_sample.map(|(_, sample)| miku_background_color(theme, sample))
-                        });
                     spans.push(Span::styled(
-                        braille_pattern(overlay.mask | background_mask).to_string(),
-                        Style::default().fg(accent_trace_overlay_color(
-                            theme,
-                            background_color,
-                            overlay,
-                        )),
+                        braille_pattern(overlay.mask).to_string(),
+                        Style::default().fg(accent_trace_overlay_color(theme, None, overlay)),
                     ));
                 } else {
                     let base_color = if mask == 0 {
-                        album_sample
-                            .map(|(_, sample)| {
-                                album_highlight_color(theme, sample, trail_value, true)
-                            })
-                            .or_else(|| {
-                                miku_sample.map(|(_, sample)| {
-                                    miku_highlight_color(theme, sample, trail_value, true)
-                                })
-                            })
-                            .unwrap_or(theme.border)
+                        theme.border
                     } else {
-                        album_sample
-                            .map(|(_, sample)| {
-                                album_highlight_color(theme, sample, value.max(trail_value), false)
-                            })
-                            .or_else(|| {
-                                miku_sample.map(|(_, sample)| {
-                                    miku_highlight_color(
-                                        theme,
-                                        sample,
-                                        value.max(trail_value),
-                                        false,
-                                    )
-                                })
-                            })
-                            .unwrap_or_else(|| {
-                                spectrum_bar_color_at(
-                                    app,
-                                    col * 2,
-                                    virtual_width,
-                                    value.max(trail_value),
-                                    height_ratio,
-                                    false,
-                                )
-                            })
+                        spectrum_bar_color_at(
+                            app,
+                            col * 2,
+                            virtual_width,
+                            value.max(trail_value),
+                            height_ratio,
+                            false,
+                        )
                     };
-                    let background_mask = album_sample
-                        .map(|(background_mask, _)| background_mask)
-                        .or_else(|| miku_sample.map(|(background_mask, _)| background_mask))
-                        .unwrap_or(0);
                     let color = accent_trace_overlay_color(theme, Some(base_color), overlay);
                     spans.push(Span::styled(
-                        braille_pattern(combined_mask | overlay.mask | background_mask).to_string(),
+                        braille_pattern(combined_mask | overlay.mask).to_string(),
                         Style::default().fg(color),
                     ));
                 }
             } else if combined_mask == 0 {
-                if let Some((background_mask, sample)) = album_sample {
-                    let color = album_background_color(theme, sample);
-                    spans.push(Span::styled(
-                        braille_pattern(background_mask).to_string(),
-                        Style::default().fg(color),
-                    ));
-                } else if let Some((background_mask, sample)) = miku_sample {
-                    spans.push(Span::styled(
-                        braille_pattern(background_mask).to_string(),
-                        Style::default().fg(miku_background_color(theme, sample)),
-                    ));
-                } else if let Some(note) =
+                if let Some(note) =
                     accent_note_overlay_cell(app, col, row, cell_width, chart_height, true)
                 {
                     spans.push(Span::styled(
@@ -5125,42 +3342,20 @@ fn draw_braille_spectrum(frame: &mut Frame, app: &App, area: Rect) {
                     spans.push(Span::raw(" "));
                 }
             } else {
-                let background_mask = album_sample
-                    .map(|(background_mask, _)| background_mask)
-                    .or_else(|| miku_sample.map(|(background_mask, _)| background_mask))
-                    .unwrap_or(0);
                 let color = if mask == 0 {
-                    album_sample
-                        .map(|(_, sample)| album_highlight_color(theme, sample, trail_value, true))
-                        .or_else(|| {
-                            miku_sample.map(|(_, sample)| {
-                                miku_highlight_color(theme, sample, trail_value, true)
-                            })
-                        })
-                        .unwrap_or(theme.border)
+                    theme.border
                 } else {
-                    album_sample
-                        .map(|(_, sample)| {
-                            album_highlight_color(theme, sample, value.max(trail_value), false)
-                        })
-                        .or_else(|| {
-                            miku_sample.map(|(_, sample)| {
-                                miku_highlight_color(theme, sample, value.max(trail_value), false)
-                            })
-                        })
-                        .unwrap_or_else(|| {
-                            spectrum_bar_color_at(
-                                app,
-                                col * 2,
-                                virtual_width,
-                                value.max(trail_value),
-                                height_ratio,
-                                false,
-                            )
-                        })
+                    spectrum_bar_color_at(
+                        app,
+                        col * 2,
+                        virtual_width,
+                        value.max(trail_value),
+                        height_ratio,
+                        false,
+                    )
                 };
                 spans.push(Span::styled(
-                    braille_pattern(combined_mask | background_mask).to_string(),
+                    braille_pattern(combined_mask).to_string(),
                     Style::default().fg(color),
                 ));
             }
@@ -5350,267 +3545,6 @@ fn next_random_unit(seed: &mut u64) -> f32 {
     ((value >> 40) as f32 / 0x01_00_00_00_u32 as f32).clamp(0.0, 1.0)
 }
 
-fn fetch_now_playing_album_artwork() -> Option<AlbumArtwork> {
-    fetch_mediaremote_album_artwork()
-        .or_else(fetch_music_album_artwork)
-        .or_else(fetch_spotify_album_artwork)
-}
-
-const MEDIAREMOTE_ADAPTER_ARCHIVE: &[u8] =
-    include_bytes!("../assets/mediaremote/mediaremote-adapter.tar.gz");
-const MEDIAREMOTE_ADAPTER_DIR: &str = "terb-mediaremote-adapter-v1";
-
-fn fetch_mediaremote_album_artwork() -> Option<AlbumArtwork> {
-    let adapter_dir = mediaremote_adapter_dir()?;
-    let script = adapter_dir.join("mediaremote-adapter.pl");
-    let framework = adapter_dir.join("MediaRemoteAdapter.framework");
-    let output = Command::new("/usr/bin/perl")
-        .arg(script)
-        .arg(framework)
-        .arg("get")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    let artwork = payload.get("artworkData")?.as_str()?.replace('\n', "");
-    let bytes = general_purpose::STANDARD.decode(artwork.as_bytes()).ok()?;
-    let bundle = json_string_field(&payload, "bundleIdentifier");
-    let artist = json_string_field(&payload, "artist");
-    let album = json_string_field(&payload, "album");
-    let title = json_string_field(&payload, "title");
-    let key = format!("MediaRemote|{bundle}|{artist}|{album}|{title}");
-
-    decode_album_artwork_edges(key, &bytes)
-}
-
-fn mediaremote_adapter_dir() -> Option<PathBuf> {
-    let dir = env::temp_dir().join(MEDIAREMOTE_ADAPTER_DIR);
-    let script = dir.join("mediaremote-adapter.pl");
-    let framework = dir.join("MediaRemoteAdapter.framework");
-    if script.exists() && framework.exists() {
-        return Some(dir);
-    }
-
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).ok()?;
-    let archive = dir.join("mediaremote-adapter.tar.gz");
-    fs::write(&archive, MEDIAREMOTE_ADAPTER_ARCHIVE).ok()?;
-    let status = Command::new("/usr/bin/tar")
-        .arg("-xzf")
-        .arg(&archive)
-        .arg("-C")
-        .arg(&dir)
-        .status()
-        .ok()?;
-    let _ = fs::remove_file(&archive);
-    if status.success() && script.exists() && framework.exists() {
-        Some(dir)
-    } else {
-        let _ = fs::remove_dir_all(&dir);
-        None
-    }
-}
-
-fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> &'a str {
-    value
-        .get(key)
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-}
-
-fn fetch_music_album_artwork() -> Option<AlbumArtwork> {
-    let path = env::temp_dir().join("terb-now-playing-music-artwork.bin");
-    let path_literal = applescript_string_literal(&path.to_string_lossy());
-    let script = format!(
-        r#"
-set outputPath to "{}"
-tell application "System Events"
-    set musicRunning to exists process "Music"
-end tell
-if musicRunning then
-    tell application "Music"
-        if player state is playing or player state is paused then
-            set currentTrack to current track
-            if (count of artworks of currentTrack) > 0 then
-                set artData to data of artwork 1 of currentTrack
-                set fileRef to open for access (POSIX file outputPath) with write permission
-                set eof of fileRef to 0
-                write artData to fileRef
-                close access fileRef
-                return "Music|" & (artist of currentTrack) & "|" & (album of currentTrack) & "|" & (name of currentTrack)
-            end if
-        end if
-    end tell
-end if
-return ""
-"#,
-        path_literal
-    );
-    let key = run_osascript(&script)?;
-    if key.is_empty() {
-        let _ = fs::remove_file(&path);
-        return None;
-    }
-
-    load_album_artwork_file(&path, key)
-}
-
-fn fetch_spotify_album_artwork() -> Option<AlbumArtwork> {
-    let script = r#"
-tell application "System Events"
-    set spotifyRunning to exists process "Spotify"
-end tell
-if spotifyRunning then
-    tell application "Spotify"
-        if player state is playing or player state is paused then
-            set currentTrack to current track
-            set artworkUrl to artwork url of currentTrack
-            if artworkUrl is not "" then
-                return "Spotify|" & (artist of currentTrack) & "|" & (album of currentTrack) & "|" & (name of currentTrack) & "|" & artworkUrl
-            end if
-        end if
-    end tell
-end if
-return ""
-"#;
-    let output = run_osascript(script)?;
-    let mut parts = output.splitn(5, '|');
-    let source = parts.next()?;
-    let artist = parts.next()?;
-    let album = parts.next()?;
-    let track = parts.next()?;
-    let url = parts.next()?.trim();
-    if source != "Spotify" || url.is_empty() {
-        return None;
-    }
-
-    let path = env::temp_dir().join("terb-now-playing-spotify-artwork.bin");
-    let status = Command::new("curl")
-        .args(["--location", "--silent", "--show-error", "--max-time", "3"])
-        .arg("--output")
-        .arg(&path)
-        .arg(url)
-        .status()
-        .ok()?;
-    if !status.success() {
-        let _ = fs::remove_file(&path);
-        return None;
-    }
-
-    load_album_artwork_file(&path, format!("{source}|{artist}|{album}|{track}"))
-}
-
-fn run_osascript(script: &str) -> Option<String> {
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn applescript_string_literal(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn load_album_artwork_file(path: &PathBuf, key: String) -> Option<AlbumArtwork> {
-    let bytes = fs::read(path).ok()?;
-    let _ = fs::remove_file(path);
-    decode_album_artwork_edges(key, &bytes)
-}
-
-fn decode_album_artwork_edges(key: String, bytes: &[u8]) -> Option<AlbumArtwork> {
-    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
-    let width = image.width() as usize;
-    let height = image.height() as usize;
-    let mut pixels = Vec::with_capacity(width * height);
-    let mut luma = Vec::with_capacity(width * height);
-
-    for chunk in image.as_raw().chunks_exact(4) {
-        let red = chunk[0];
-        let green = chunk[1];
-        let blue = chunk[2];
-        pixels.push(AlbumPixel { red, green, blue });
-        luma.push((red as f32 * 0.2126 + green as f32 * 0.7152 + blue as f32 * 0.0722) / 255.0);
-    }
-
-    album_artwork_from_luma_and_pixels(key, width, height, pixels, luma)
-}
-
-fn album_artwork_edges_from_luma(
-    key: String,
-    width: usize,
-    height: usize,
-    luma: &[f32],
-) -> Option<AlbumArtwork> {
-    let pixels = luma
-        .iter()
-        .map(|value| {
-            let channel = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-            AlbumPixel {
-                red: channel,
-                green: channel,
-                blue: channel,
-            }
-        })
-        .collect();
-    album_artwork_from_luma_and_pixels(key, width, height, pixels, luma.to_vec())
-}
-
-fn album_artwork_from_luma_and_pixels(
-    key: String,
-    width: usize,
-    height: usize,
-    pixels: Vec<AlbumPixel>,
-    luma: Vec<f32>,
-) -> Option<AlbumArtwork> {
-    if width < 2 || height < 2 || luma.len() != width * height {
-        return None;
-    }
-    if pixels.len() != width * height {
-        return None;
-    }
-
-    let mut edges = vec![0.0_f32; width * height];
-    let sample = |x: usize, y: usize| luma[y * width + x].clamp(0.0, 1.0);
-    for y in 0..height {
-        let top = y.saturating_sub(1);
-        let bottom = (y + 1).min(height - 1);
-        for x in 0..width {
-            let left = x.saturating_sub(1);
-            let right = (x + 1).min(width - 1);
-            let tl = sample(left, top);
-            let tc = sample(x, top);
-            let tr = sample(right, top);
-            let ml = sample(left, y);
-            let mr = sample(right, y);
-            let bl = sample(left, bottom);
-            let bc = sample(x, bottom);
-            let br = sample(right, bottom);
-            let gx = -tl - 2.0 * ml - bl + tr + 2.0 * mr + br;
-            let gy = -tl - 2.0 * tc - tr + bl + 2.0 * bc + br;
-            let edge = ((gx * gx + gy * gy).sqrt() / 4.0).clamp(0.0, 1.0);
-            edges[y * width + x] = smoothstep(((edge - 0.055) / 0.22).clamp(0.0, 1.0));
-        }
-    }
-
-    Some(AlbumArtwork {
-        key,
-        width,
-        height,
-        pixels,
-        luma,
-        edges,
-    })
-}
-
 fn accent_trigger_thresholds(threshold: f32) -> AccentTriggerThresholds {
     let threshold = normalize_unit(
         threshold.clamp(MIN_ACCENT_TRACE_THRESHOLD, MAX_ACCENT_TRACE_THRESHOLD),
@@ -5701,13 +3635,7 @@ fn accent_note_overlay_cell(
                 continue;
             }
 
-            let base = pitch_color(
-                theme,
-                note.pitch_class,
-                (0.42 + note.intensity * 0.40).clamp(0.0, 1.0),
-                0.0,
-                0.45,
-            );
+            let base = vertical_palette_color(theme, note.pitch_class as f32 / 11.0);
             best = Some(AccentNoteOverlay {
                 label: note.label,
                 color: blend_color(
@@ -6403,30 +4331,24 @@ fn settings_rows(app: &App) -> Vec<SettingRow> {
         ),
         setting_row(
             10,
-            "audio_delay",
-            SettingCategory::Processing,
-            format!("{}ms", app.config.settings.audio_delay_ms),
-        ),
-        setting_row(
-            11,
             "high_shelf",
             SettingCategory::Processing,
             on_off_label(app, app.config.settings.high_shelf_enabled),
         ),
         setting_row(
-            12,
+            11,
             "high_shelf_db",
             SettingCategory::Processing,
             format!("{:.0}dB", app.config.settings.high_shelf_db),
         ),
         setting_row(
-            13,
+            12,
             "auto_sensitivity",
             SettingCategory::Processing,
             on_off_label(app, app.config.settings.auto_sensitivity_enabled),
         ),
         setting_row(
-            14,
+            13,
             "noise_reduction",
             SettingCategory::Processing,
             format!(
@@ -6435,43 +4357,43 @@ fn settings_rows(app: &App) -> Vec<SettingRow> {
             ),
         ),
         setting_row(
-            15,
+            14,
             "bpm_analysis",
             SettingCategory::Analysis,
             on_off_label(app, app.config.settings.bpm_enabled),
         ),
         setting_row(
-            16,
+            15,
             "visual_curve",
             SettingCategory::Visual,
             on_off_label(app, app.config.settings.visual_curve_enabled),
         ),
         setting_row(
-            17,
+            16,
             "curve_power",
             SettingCategory::Visual,
             format!("{:.2}", app.config.settings.visual_curve),
         ),
         setting_row(
-            18,
+            17,
             "trail",
             SettingCategory::Visual,
             on_off_label(app, app.config.settings.trail_enabled),
         ),
         setting_row(
-            19,
+            18,
             "trail_decay",
             SettingCategory::Visual,
             format!("{:>3}%", (app.config.settings.trail_decay * 100.0) as u16),
         ),
         setting_row(
-            20,
+            19,
             "accent_display",
             SettingCategory::Visual,
             accent_display_label(app, app.config.settings.accent_display_mode),
         ),
         setting_row(
-            21,
+            20,
             "accent_threshold",
             SettingCategory::Visual,
             format!(
@@ -6480,7 +4402,7 @@ fn settings_rows(app: &App) -> Vec<SettingRow> {
             ),
         ),
         setting_row(
-            22,
+            21,
             "ceiling",
             SettingCategory::Processing,
             format!("{:>3}%", (app.config.settings.ceiling * 100.0) as u16),
@@ -6546,11 +4468,6 @@ fn setting_range(app: &App, key: &'static str) -> String {
             .map(|rate| format!("{}Hz", rate))
             .collect::<Vec<_>>()
             .join(" / "),
-        "audio_delay" => range_with_step(
-            app,
-            format!("0-{}ms", MAX_AUDIO_DELAY_MS),
-            format!("{}ms", AUDIO_DELAY_STEP_MS),
-        ),
         "high_shelf" | "auto_sensitivity" | "bpm_analysis" | "visual_curve" | "trail" => {
             format!("{} / {}", app.t("on"), app.t("off"))
         }
@@ -6603,22 +4520,6 @@ fn accent_display_label(app: &App, mode: AccentDisplayMode) -> &'static str {
     })
 }
 
-fn album_art_value_label(app: &App) -> &'static str {
-    if !app.album_art_active() {
-        return app.t("off");
-    }
-    app.t(album_art_status_key(app.album_art_status))
-}
-
-fn album_art_status_key(status: AlbumArtFetchStatus) -> &'static str {
-    match status {
-        AlbumArtFetchStatus::Off => "off",
-        AlbumArtFetchStatus::Waiting => "album_art_waiting",
-        AlbumArtFetchStatus::Loaded => "album_art_loaded",
-        AlbumArtFetchStatus::NotFound => "album_art_not_found",
-    }
-}
-
 fn range_with_step(app: &App, range: String, step: String) -> String {
     format!("{} · {} {}", range, app.t("setting_step"), step)
 }
@@ -6652,7 +4553,6 @@ fn setting_help_key(key: &'static str) -> &'static str {
         "fft_size" => "help_setting_fft_size",
         "analysis_hop" => "help_setting_analysis_hop",
         "refresh_rate" => "help_setting_refresh_rate",
-        "audio_delay" => "help_setting_audio_delay",
         "high_shelf" => "help_setting_high_shelf",
         "high_shelf_db" => "help_setting_high_shelf_db",
         "auto_sensitivity" => "help_setting_auto_sensitivity",
@@ -6714,11 +4614,6 @@ fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "bpm off".to_string()
     };
-    let album_art = if app.album_art_active() {
-        format!("album {}", album_art_value_label(app))
-    } else {
-        "album off".to_string()
-    };
     let beat = beat_phase_bar(app, 8);
     let lines = vec![
         Line::from(vec![
@@ -6732,15 +4627,11 @@ fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
         Line::from(vec![
-            pipeline_stage(theme, "SYNC"),
+            pipeline_stage(theme, "PRE"),
             Span::styled(
-                format!("delay {}ms -> mono bus", settings.audio_delay_ms),
+                "stereo -> mono -> DC trim -> Hann",
                 Style::default().fg(theme.text),
             ),
-        ]),
-        Line::from(vec![
-            pipeline_stage(theme, "PRE"),
-            Span::styled("mono -> DC trim -> Hann", Style::default().fg(theme.text)),
         ]),
         Line::from(vec![
             pipeline_stage(theme, "FFT"),
@@ -6778,10 +4669,6 @@ fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
                 ),
                 Style::default().fg(theme.text),
             ),
-        ]),
-        Line::from(vec![
-            pipeline_stage(theme, "ART"),
-            Span::styled(album_art, Style::default().fg(theme.text)),
         ]),
         Line::from(vec![
             pipeline_stage(theme, "TEMPO"),
@@ -7137,7 +5024,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "beat") => "节拍",
         (Lang::Zh, "language") => "语言",
         (Lang::Zh, "theme") => "主题",
-        (Lang::Zh, "smoothing") => "平滑",
         (Lang::Zh, "analysis_preset") => "分析预设",
         (Lang::Zh, "attack") => "Attack",
         (Lang::Zh, "release") => "Release",
@@ -7146,7 +5032,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "renderer") => "渲染",
         (Lang::Zh, "fft_size") => "FFT",
         (Lang::Zh, "refresh_rate") => "刷新率",
-        (Lang::Zh, "audio_delay") => "音频延迟",
         (Lang::Zh, "high_shelf") => "高频补偿",
         (Lang::Zh, "high_shelf_db") => "补偿强度",
         (Lang::Zh, "auto_sensitivity") => "自动灵敏度",
@@ -7163,10 +5048,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "accent_display_note_names") => "音名",
         (Lang::Zh, "accent_display_off") => "关",
         (Lang::Zh, "accent_threshold") => "重音阈值",
-        (Lang::Zh, "album_art") => "专辑封面",
-        (Lang::Zh, "album_art_waiting") => "抓取中",
-        (Lang::Zh, "album_art_loaded") => "已加载",
-        (Lang::Zh, "album_art_not_found") => "未发现",
         (Lang::Zh, "ceiling") => "上限",
         (Lang::Zh, "pipeline") => "音频链路",
         (Lang::Zh, "toolbar") => "工具栏",
@@ -7186,13 +5067,13 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "help_1") => "↑/↓ 或 j/k 移动选择。",
         (Lang::Zh, "help_2") => "Enter 执行；Space 开始或停止捕获。",
         (Lang::Zh, "help_3") => "频谱页按 s/p/t/m/w 显示或隐藏设置、链路、工具栏、master、波形。",
-        (Lang::Zh, "help_4") => "↑/↓ 选择设置，Tab 切分类，←/→ 调整；-/= 调整音频延迟；S 打开全屏设置。",
+        (Lang::Zh, "help_4") => "↑/↓ 选择设置，Tab 切分类，←/→ 调整；S 打开全屏设置。",
         (Lang::Zh, "help_5") => "窗口较小时模块会自动隐藏，仍可用快捷键操作；主菜单 q/Esc 退出。",
         (Lang::Zh, "permission_note") => "首次捕获会触发 macOS 屏幕与系统音频录制授权；Terb 只实时分析，不保存音频。",
         (Lang::Zh, "menu_hint") => "↑/↓ 选择 · Enter 确认 · Space 捕获 · ? 帮助 · q 退出",
-        (Lang::Zh, "spectrum_hint") => "Space 捕获 · -/= 延迟 · s/p/t/m/w 模块 · S 设置 · q 菜单",
-        (Lang::Zh, "sidebar_hint") => "Space 开关捕获\n-/= 音频延迟\ns/p/t/m/w 模块\nTab 分类\n↑/↓ 选择设置\n←/→ 调整\nS 设置\nq 菜单\n? 帮助",
-        (Lang::Zh, "compact_hint") => "-/= 延迟 · s/p/t/m/w 模块 · S 设置 · q 菜单",
+        (Lang::Zh, "spectrum_hint") => "Space 捕获 · s/p/t/m/w 模块 · S 设置 · q 菜单",
+        (Lang::Zh, "sidebar_hint") => "Space 开关捕获\ns/p/t/m/w 模块\nTab 分类\n↑/↓ 选择设置\n←/→ 调整\nS 设置\nq 菜单\n? 帮助",
+        (Lang::Zh, "compact_hint") => "s/p/t/m/w 模块 · S 设置 · q 菜单",
         (Lang::Zh, "ready") => "准备就绪。",
         (Lang::Zh, "starting") => "正在启动系统音频捕获...",
         (Lang::Zh, "helper_ready") => "捕获进程已就绪，等待音频。",
@@ -7208,17 +5089,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "state_failed") => "错误",
         (Lang::Zh, "too_small") => "窗口太小，请放大终端。",
         (Lang::Zh, "theme_spring") => "Spring",
-        (Lang::Zh, "theme_system") => "系统",
-        (Lang::Zh, "theme_graphite") => "石墨",
-        (Lang::Zh, "theme_ocean") => "海蓝",
         (Lang::Zh, "theme_vintage") => "vintage",
-        (Lang::Zh, "theme_aurora") => "奥罗拉",
-        (Lang::Zh, "theme_sonic_texture") => "音纹场",
-        (Lang::Zh, "theme_noise_warp") => "流纹噪声",
-        (Lang::Zh, "theme_miku") => "初音",
-        (Lang::Zh, "theme_album_art") => "方形专辑",
-        (Lang::Zh, "theme_album_art_circle") => "圆形专辑",
-        (Lang::Zh, "theme_amber") => "琥珀",
         (Lang::Zh, "theme_mono") => "单色",
         (Lang::Zh, "renderer_blocks") => "方块",
         (Lang::Zh, "renderer_braille") => "盲文",
@@ -7237,7 +5108,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "help_setting_fft_size") => "FFT 窗口长度。越大低频越稳，延迟和惯性也越高。",
         (Lang::Zh, "help_setting_analysis_hop") => "分析跳步。越小刷新越密，CPU 使用会略升。",
         (Lang::Zh, "help_setting_refresh_rate") => "终端绘制刷新率。高刷新更顺滑，也更吃终端性能。",
-        (Lang::Zh, "help_setting_audio_delay") => "视觉相对音频的延迟校正，可用 -/= 快速调整。",
         (Lang::Zh, "help_setting_high_shelf") => "启用高频补偿，让高频段不被低频能量长期压住。",
         (Lang::Zh, "help_setting_high_shelf_db") => "高频补偿强度。过高会让齿音和噪声偏亮。",
         (Lang::Zh, "help_setting_auto_sensitivity") => "自动调整显示增益，兼顾安静和响亮片段。",
@@ -7252,9 +5122,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
             "选择重音显示方式：轮廓线，或在空白区域淡入淡出当前重音音名。"
         }
         (Lang::Zh, "help_setting_accent_threshold") => "重音触发阈值。越高越克制，越低越敏感。",
-        (Lang::Zh, "help_setting_album_art") => {
-            "专辑主题会从系统正在播放卡片抓取封面，抓不到时回退 Music/Spotify，并在整个频谱画布用盲文渲染封面。"
-        }
         (Lang::Zh, "help_setting_ceiling") => "分析显示上限。降低后更少触顶，升高后动态空间更大。",
         (Lang::Zh, "help_setting_default") => "使用左右方向键调整该设置。",
 
@@ -7275,7 +5142,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "config") => "Config",
         (Lang::En, "settings") => "Settings",
         (Lang::En, "settings_general") => "general",
-        (Lang::En, "settings_analysis") => "analysis",
         (Lang::En, "settings_processing") => "processing",
         (Lang::En, "settings_visual") => "visual",
         (Lang::En, "setting_adjust") => "adjust",
@@ -7286,7 +5152,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "beat") => "Beat",
         (Lang::En, "language") => "Language",
         (Lang::En, "theme") => "Theme",
-        (Lang::En, "smoothing") => "Smoothing",
         (Lang::En, "analysis_preset") => "Preset",
         (Lang::En, "attack") => "Attack",
         (Lang::En, "release") => "Release",
@@ -7295,7 +5160,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "renderer") => "Render",
         (Lang::En, "fft_size") => "FFT",
         (Lang::En, "refresh_rate") => "Refresh",
-        (Lang::En, "audio_delay") => "Audio Delay",
         (Lang::En, "high_shelf") => "High-shelf",
         (Lang::En, "high_shelf_db") => "Shelf Gain",
         (Lang::En, "auto_sensitivity") => "Autosens",
@@ -7312,10 +5176,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "accent_display_note_names") => "Note Names",
         (Lang::En, "accent_display_off") => "Off",
         (Lang::En, "accent_threshold") => "Accent Threshold",
-        (Lang::En, "album_art") => "Album Art",
-        (Lang::En, "album_art_waiting") => "Fetching",
-        (Lang::En, "album_art_loaded") => "Loaded",
-        (Lang::En, "album_art_not_found") => "Not Found",
         (Lang::En, "ceiling") => "Ceiling",
         (Lang::En, "pipeline") => "Pipeline",
         (Lang::En, "toolbar") => "Toolbar",
@@ -7335,13 +5195,13 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "help_1") => "Use ↑/↓ or j/k to move.",
         (Lang::En, "help_2") => "Enter activates; Space starts or stops capture.",
         (Lang::En, "help_3") => "In Spectrum, press s/p/t/m/w to show or hide settings, pipeline, toolbar, master, and waveform.",
-        (Lang::En, "help_4") => "Use ↑/↓ to select settings, Tab for groups, and ←/→ to adjust. -/= adjusts audio delay; S opens full-screen settings.",
+        (Lang::En, "help_4") => "Use ↑/↓ to select settings, Tab for groups, and ←/→ to adjust. S opens full-screen settings.",
         (Lang::En, "help_5") => "Small terminals hide modules automatically, but shortcuts still work. q/Esc quits from the main menu.",
         (Lang::En, "permission_note") => "First capture may trigger macOS Screen & System Audio Recording permission. Terb analyzes live audio only and does not save it.",
         (Lang::En, "menu_hint") => "↑/↓ select · Enter confirm · Space capture · ? help · q quit",
-        (Lang::En, "spectrum_hint") => "Space capture · -/= delay · s/p/t/m/w modules · S settings · q menu",
-        (Lang::En, "sidebar_hint") => "Space toggle capture\n-/= audio delay\ns/p/t/m/w modules\nTab groups\n↑/↓ select setting\n←/→ adjust\nS settings\nq menu\n? help",
-        (Lang::En, "compact_hint") => "-/= delay · s/p/t/m/w modules · S settings · q menu",
+        (Lang::En, "spectrum_hint") => "Space capture · s/p/t/m/w modules · S settings · q menu",
+        (Lang::En, "sidebar_hint") => "Space toggle capture\ns/p/t/m/w modules\nTab groups\n↑/↓ select setting\n←/→ adjust\nS settings\nq menu\n? help",
+        (Lang::En, "compact_hint") => "s/p/t/m/w modules · S settings · q menu",
         (Lang::En, "ready") => "Ready.",
         (Lang::En, "starting") => "Starting system-audio capture...",
         (Lang::En, "helper_ready") => "Capture helper is ready; waiting for audio.",
@@ -7357,17 +5217,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "state_failed") => "Error",
         (Lang::En, "too_small") => "Terminal window is too small.",
         (Lang::En, "theme_spring") => "Spring",
-        (Lang::En, "theme_system") => "System",
-        (Lang::En, "theme_graphite") => "Graphite",
-        (Lang::En, "theme_ocean") => "Ocean",
         (Lang::En, "theme_vintage") => "Vintage",
-        (Lang::En, "theme_aurora") => "Aurora",
-        (Lang::En, "theme_sonic_texture") => "Sonic Texture",
-        (Lang::En, "theme_noise_warp") => "Noise Warp",
-        (Lang::En, "theme_miku") => "Miku",
-        (Lang::En, "theme_album_art") => "Square Album",
-        (Lang::En, "theme_album_art_circle") => "Circle Album",
-        (Lang::En, "theme_amber") => "Amber",
         (Lang::En, "theme_mono") => "Mono",
         (Lang::En, "renderer_blocks") => "Blocks",
         (Lang::En, "renderer_braille") => "Braille",
@@ -7386,7 +5236,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "help_setting_fft_size") => "FFT window size. Larger windows improve low-end stability but add inertia.",
         (Lang::En, "help_setting_analysis_hop") => "Analysis hop size. Smaller hops update more often and cost slightly more CPU.",
         (Lang::En, "help_setting_refresh_rate") => "Terminal draw rate. Higher values feel smoother if the terminal keeps up.",
-        (Lang::En, "help_setting_audio_delay") => "Visual delay compensation; -/= adjusts it directly while playing.",
         (Lang::En, "help_setting_high_shelf") => "Enables high-frequency compensation so treble is not buried by bass energy.",
         (Lang::En, "help_setting_high_shelf_db") => "High-shelf gain. Too much can make hiss and sibilance too prominent.",
         (Lang::En, "help_setting_auto_sensitivity") => "Adapts display gain across quiet and loud passages.",
@@ -7401,9 +5250,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
             "Chooses accent display: envelope trace, or fading note names in empty spectrum space."
         }
         (Lang::En, "help_setting_accent_threshold") => "Accent trigger threshold. Higher is more restrained.",
-        (Lang::En, "help_setting_album_art") => {
-            "The Album theme fetches artwork from the system now-playing card, falls back to Music/Spotify, and renders the cover across the full spectrum canvas in Braille."
-        }
         (Lang::En, "help_setting_ceiling") => "Display ceiling for analysis headroom and peak mapping.",
         (Lang::En, "help_setting_default") => "Use left and right to adjust this setting.",
 
@@ -7425,7 +5271,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "settings") => "設定",
         (Lang::Ja, "settings_general") => "一般",
         (Lang::Ja, "settings_analysis") => "解析",
-        (Lang::Ja, "settings_processing") => "処理",
         (Lang::Ja, "settings_visual") => "表示",
         (Lang::Ja, "setting_adjust") => "調整",
         (Lang::Ja, "setting_select") => "選択",
@@ -7435,7 +5280,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "beat") => "拍",
         (Lang::Ja, "language") => "言語",
         (Lang::Ja, "theme") => "テーマ",
-        (Lang::Ja, "smoothing") => "平滑化",
         (Lang::Ja, "analysis_preset") => "解析プリセット",
         (Lang::Ja, "attack") => "Attack",
         (Lang::Ja, "release") => "Release",
@@ -7444,7 +5288,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "renderer") => "描画",
         (Lang::Ja, "fft_size") => "FFT",
         (Lang::Ja, "refresh_rate") => "更新率",
-        (Lang::Ja, "audio_delay") => "音声遅延",
         (Lang::Ja, "high_shelf") => "高域補正",
         (Lang::Ja, "high_shelf_db") => "補正量",
         (Lang::Ja, "auto_sensitivity") => "自動感度",
@@ -7461,10 +5304,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "accent_display_note_names") => "音名",
         (Lang::Ja, "accent_display_off") => "オフ",
         (Lang::Ja, "accent_threshold") => "アクセント閾値",
-        (Lang::Ja, "album_art") => "アルバム画像",
-        (Lang::Ja, "album_art_waiting") => "取得中",
-        (Lang::Ja, "album_art_loaded") => "読込済み",
-        (Lang::Ja, "album_art_not_found") => "未検出",
         (Lang::Ja, "ceiling") => "上限",
         (Lang::Ja, "pipeline") => "音声チェーン",
         (Lang::Ja, "toolbar") => "ツールバー",
@@ -7484,13 +5323,13 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "help_1") => "↑/↓ または j/k で移動します。",
         (Lang::Ja, "help_2") => "Enter で実行、Space でキャプチャ開始/停止。",
         (Lang::Ja, "help_3") => "スペクトラム画面では s/p/t/m/w で設定、チェーン、ツールバー、master、波形を表示/非表示にします。",
-        (Lang::Ja, "help_4") => "↑/↓ で設定選択、Tab で分類切替、←/→ で変更。-/= で音声遅延を調整、S で全画面設定。",
+        (Lang::Ja, "help_4") => "↑/↓ で設定選択、Tab で分類切替、←/→ で変更。S で全画面設定。",
         (Lang::Ja, "help_5") => "小さいウィンドウではモジュールを自動で隠しますが、ショートカットは使えます。メインメニューでは q/Esc で終了します。",
         (Lang::Ja, "permission_note") => "初回キャプチャでは macOS の画面とシステム音声録音権限が必要です。Terb はリアルタイム解析のみ行い、音声を保存しません。",
         (Lang::Ja, "menu_hint") => "↑/↓ 選択 · Enter 決定 · Space キャプチャ · ? ヘルプ · q 終了",
-        (Lang::Ja, "spectrum_hint") => "Space キャプチャ · -/= 遅延 · s/p/t/m/w モジュール · S 設定 · q メニュー",
-        (Lang::Ja, "sidebar_hint") => "Space キャプチャ切替\n-/= 音声遅延\ns/p/t/m/w モジュール\nTab 分類\n↑/↓ 設定選択\n←/→ 変更\nS 設定\nq メニュー\n? ヘルプ",
-        (Lang::Ja, "compact_hint") => "-/= 遅延 · s/p/t/m/w モジュール · S 設定 · q メニュー",
+        (Lang::Ja, "spectrum_hint") => "Space キャプチャ · s/p/t/m/w モジュール · S 設定 · q メニュー",
+        (Lang::Ja, "sidebar_hint") => "Space キャプチャ切替\ns/p/t/m/w モジュール\nTab 分類\n↑/↓ 設定選択\n←/→ 変更\nS 設定\nq メニュー\n? ヘルプ",
+        (Lang::Ja, "compact_hint") => "s/p/t/m/w モジュール · S 設定 · q メニュー",
         (Lang::Ja, "ready") => "準備完了。",
         (Lang::Ja, "starting") => "システム音声キャプチャを開始しています...",
         (Lang::Ja, "helper_ready") => "キャプチャヘルパーは準備完了。音声を待っています。",
@@ -7506,17 +5345,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "state_failed") => "エラー",
         (Lang::Ja, "too_small") => "ターミナルウィンドウが小さすぎます。",
         (Lang::Ja, "theme_spring") => "Spring",
-        (Lang::Ja, "theme_system") => "システム",
-        (Lang::Ja, "theme_graphite") => "グラファイト",
-        (Lang::Ja, "theme_ocean") => "オーシャン",
         (Lang::Ja, "theme_vintage") => "ヴィンテージ",
-        (Lang::Ja, "theme_aurora") => "オーロラ",
-        (Lang::Ja, "theme_sonic_texture") => "音紋フィールド",
-        (Lang::Ja, "theme_noise_warp") => "ノイズワープ",
-        (Lang::Ja, "theme_miku") => "ミク",
-        (Lang::Ja, "theme_album_art") => "四角アルバム",
-        (Lang::Ja, "theme_album_art_circle") => "円形アルバム",
-        (Lang::Ja, "theme_amber") => "アンバー",
         (Lang::Ja, "theme_mono") => "モノ",
         (Lang::Ja, "renderer_blocks") => "ブロック",
         (Lang::Ja, "renderer_braille") => "点字",
@@ -7535,7 +5364,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "help_setting_fft_size") => "FFT 窓長です。大きいほど低域は安定し、慣性も増えます。",
         (Lang::Ja, "help_setting_analysis_hop") => "解析ホップです。小さいほど更新が細かくなります。",
         (Lang::Ja, "help_setting_refresh_rate") => "端末描画の更新率です。高いほど滑らかですが負荷も増えます。",
-        (Lang::Ja, "help_setting_audio_delay") => "映像の遅延補正です。再生中も -/= で調整できます。",
         (Lang::Ja, "help_setting_high_shelf") => "低域に埋もれやすい高域を補正します。",
         (Lang::Ja, "help_setting_high_shelf_db") => "高域補正量です。上げすぎるとノイズが目立ちます。",
         (Lang::Ja, "help_setting_auto_sensitivity") => "静かな部分と大きい部分に合わせて表示ゲインを調整します。",
@@ -7550,9 +5378,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
             "アクセント表示を選びます。輪郭線、または空白部にフェードする音名です。"
         }
         (Lang::Ja, "help_setting_accent_threshold") => "アクセント検出の閾値です。高いほど控えめです。",
-        (Lang::Ja, "help_setting_album_art") => {
-            "アルバムテーマはシステムの再生中カードからアートワークを取得し、失敗時は Music/Spotify に戻して、スペクトラム全体に点字で描画します。"
-        }
         (Lang::Ja, "help_setting_ceiling") => "解析表示の上限です。ヘッドルームとピーク表示を調整します。",
         (Lang::Ja, "help_setting_default") => "左右キーでこの設定を調整します。",
 
@@ -7581,14 +5406,6 @@ mod tests {
             .map(|y| buffer_row(buf, y, width))
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    fn color_delta(left: Color, right: Color) -> u16 {
-        let left = color_to_rgb(left);
-        let right = color_to_rgb(right);
-        (left.0.abs_diff(right.0) as u16)
-            + (left.1.abs_diff(right.1) as u16)
-            + (left.2.abs_diff(right.2) as u16)
     }
 
     #[test]
@@ -7628,10 +5445,8 @@ mod tests {
 
         assert_eq!(next_setting_index(1, &rows), 2);
         assert_eq!(previous_setting_index(2, &rows), 1);
-        assert_eq!(
-            next_setting_index(22, &rows),
-            rows.last().expect("settings rows").index
-        );
+        let last = rows.last().expect("settings rows").index;
+        assert_eq!(next_setting_index(last, &rows), last);
     }
 
     #[test]
@@ -7650,7 +5465,7 @@ mod tests {
         let mut config = Config::default();
         config.settings.language = "en".to_string();
         let mut app = App::new(config);
-        app.setting_index = 22;
+        app.setting_index = settings_rows(&app).last().expect("settings row").index;
         let backend = TestBackend::new(35, 22);
         let mut terminal = Terminal::new(backend).expect("test backend");
 
@@ -7972,251 +5787,14 @@ mod tests {
     }
 
     #[test]
-    fn aurora_theme_enables_music_reactive_spectrum_color() {
-        let mut app = App::new(Config::default());
-        app.theme_id = ThemeId::Aurora;
-        app.color_state = VisualColorState {
-            centroid: 0.20,
-            energy: 0.25,
-            flux: 0.10,
-            phase: 0.0,
-            ..VisualColorState::default()
-        };
-        let low_state_color = spectrum_bar_color(&app, 12, 100, 0.70, false);
-        app.color_state = VisualColorState {
-            centroid: 0.82,
-            energy: 0.80,
-            flux: 0.70,
-            phase: 0.32,
-            ..VisualColorState::default()
-        };
-        let high_state_color = spectrum_bar_color(&app, 12, 100, 0.70, false);
-
-        assert_eq!(theme(ThemeId::Aurora).color_mode, ColorMode::Aurora);
-        assert_ne!(low_state_color, high_state_color);
-    }
-
-    #[test]
-    fn music_reactive_theme_modes_are_available() {
-        assert_eq!(
-            theme(ThemeId::SonicTexture).color_mode,
-            ColorMode::SonicTexture
-        );
-        assert_eq!(theme(ThemeId::Miku).color_mode, ColorMode::Miku);
-        assert_eq!(theme(ThemeId::AlbumArt).color_mode, ColorMode::AlbumArt);
-        assert_eq!(
-            theme(ThemeId::AlbumArtCircle).color_mode,
-            ColorMode::AlbumArtCircle
-        );
-        assert!(!THEMES.contains(&ThemeId::PitchClass));
-        assert!(!THEMES.contains(&ThemeId::ChromaBands));
-        assert!(!THEMES.contains(&ThemeId::PitchMemory));
-        assert!(!THEMES.contains(&ThemeId::HarmonicComb));
-    }
-
-    #[test]
-    fn miku_animation_decodes_bundled_gif_frames() {
-        let animation = miku_animation();
-
-        assert_eq!(animation.width, 153);
-        assert_eq!(animation.height, 200);
-        assert!(animation.frames.len() >= 4);
-        assert!(animation.total_duration_ms >= 100);
-        assert!(animation.frames.iter().all(|frame| {
-            frame.width == animation.width
-                && frame.height == animation.height
-                && frame.pixels.len() == animation.width * animation.height
-        }));
-    }
-
-    #[test]
-    fn miku_outer_matte_cleanup_removes_connected_light_border_only() {
-        let matte = MikuPixel {
-            red: 230,
-            green: 230,
-            blue: 228,
-            alpha: 255,
-        };
-        let dark = MikuPixel {
-            red: 20,
-            green: 24,
-            blue: 28,
-            alpha: 255,
-        };
-        let mut pixels = vec![MikuPixel::default(); 25];
-        for pixel in pixels.iter_mut().take(5) {
-            *pixel = matte;
-        }
-        pixels[1 + 5] = matte;
-        pixels[2 + 2 * 5] = matte;
-        pixels[1 + 2 * 5] = dark;
-        pixels[3 + 2 * 5] = dark;
-        pixels[2 + 5] = dark;
-        pixels[2 + 3 * 5] = dark;
-
-        remove_miku_outer_matte(&mut pixels, 5, 5);
-
-        assert_eq!(pixels[0].alpha, 0);
-        assert_eq!(pixels[1 + 5].alpha, 0);
-        assert_eq!(pixels[2 + 2 * 5].alpha, 255);
-    }
-
-    #[test]
-    fn miku_frames_do_not_keep_exterior_light_matte_pixels() {
-        let frame = miku_animation().frames.first().expect("miku frame exists");
-        let mut connected = frame.pixels.clone();
-        remove_miku_outer_matte(&mut connected, frame.width, frame.height);
-
-        assert_eq!(connected, frame.pixels);
-    }
-
-    #[test]
-    fn miku_layout_contain_scales_without_overflow() {
-        let frame = miku_animation().frames.first().expect("miku frame exists");
-        let (left, top, scale) = miku_layout(frame, 80, 32, 1.0).expect("layout should fit");
-        let right = left + frame.width as f32 * scale;
-        let bottom = top + frame.height as f32 * scale;
-
-        assert!(left >= 0.0);
-        assert!(top >= 0.0);
-        assert!(right <= 80.0 + 0.001);
-        assert!(bottom <= 32.0 + 0.001);
-    }
-
-    #[test]
-    fn miku_block_layout_accounts_for_terminal_cell_aspect() {
-        let frame = miku_animation().frames.first().expect("miku frame exists");
-        let (_, _, scale) =
-            miku_layout(frame, 80, 32, TERMINAL_CELL_ASPECT).expect("layout should fit");
-        let physical_width = frame.width as f32 * scale;
-        let physical_height = frame.height as f32 * scale;
-        let physical_ratio = physical_width / physical_height;
-        let source_ratio = frame.width as f32 / frame.height as f32;
-
-        assert!((physical_ratio - source_ratio).abs() < 0.001);
-    }
-
-    #[test]
-    fn miku_theme_fallback_color_does_not_rainbow_by_position() {
-        let mut app = App::new(Config::default());
-        app.theme_id = ThemeId::Miku;
-        app.color_state = VisualColorState {
-            centroid: 0.90,
-            energy: 0.80,
-            flux: 0.70,
-            phase: 0.48,
-            ..VisualColorState::default()
-        };
-
-        let left = music_color_for_position_at(&app, 0.10, 0.72, 0.50, false);
-        let right = music_color_for_position_at(&app, 0.90, 0.72, 0.50, false);
-
-        assert_eq!(left, right);
-    }
-
-    #[test]
-    fn miku_playback_fps_scales_with_recent_accent_triggers() {
-        let mut app = App::new(Config::default());
-        let now = Instant::now();
-        app.miku_trigger_times
-            .push_back(now - Duration::from_millis(500));
-        app.miku_trigger_times
-            .push_back(now - Duration::from_millis(2_500));
-        app.miku_trigger_times
-            .push_back(now - Duration::from_millis(3_500));
-
-        assert_eq!(
-            app.miku_playback_fps(),
-            MIKU_BASE_FPS * (1.0 + MIKU_TRIGGER_SPEED_STEP * 2.0)
-        );
-    }
-
-    #[test]
-    fn miku_animation_phase_advances_at_trigger_scaled_fps() {
-        let mut app = App::new(Config::default());
-
-        app.advance_miku_animation(Duration::from_millis(200));
-
-        assert!((app.miku_frame_phase - 1.0).abs() < 0.001);
-
-        app.miku_trigger_times.push_back(Instant::now());
-        app.advance_miku_animation(Duration::from_millis(100));
-
-        assert!((app.miku_frame_phase - 1.6).abs() < 0.001);
-    }
-
-    #[test]
-    fn sonic_texture_theme_varies_inside_a_column_without_large_stripes() {
-        let mut app = App::new(Config::default());
-        app.theme_id = ThemeId::SonicTexture;
-        app.color_state = VisualColorState {
-            centroid: 0.34,
-            energy: 0.62,
-            flux: 0.18,
-            phase: 0.21,
-            chroma: [
-                0.18, 0.26, 0.42, 0.22, 0.71, 0.34, 0.28, 0.58, 0.37, 0.24, 0.19, 0.31,
-            ],
-            dominant_pitch: 4,
-            pitch_confidence: 0.82,
-            ..VisualColorState::default()
-        };
-
-        let lower = music_color_for_position_at(&app, 0.38, 0.72, 0.24, false);
-        let upper = music_color_for_position_at(&app, 0.38, 0.72, 0.82, false);
-        let left = music_color_for_position_at(&app, 0.380, 0.72, 0.54, false);
-        let right = music_color_for_position_at(&app, 0.386, 0.72, 0.54, false);
-
-        assert_ne!(lower, upper);
-        assert!(color_delta(left, right) < 45);
-    }
-
-    #[test]
-    fn pitch_class_for_frequency_maps_a440_to_a() {
-        assert_eq!(pitch_class_for_frequency(440.0), 9);
-        assert_eq!(pitch_class_for_frequency(261.63), 0);
-    }
-
-    #[test]
-    fn visual_color_state_tracks_frequency_centroid() {
-        let mut state = VisualColorState::default();
-        let previous = vec![0.0; 4];
-
-        state.update(&[0.0, 0.0, 0.0, 1.0], &previous, 0.0);
-
-        assert!(state.centroid > 0.45);
-        assert!(state.flux > 0.0);
-    }
-
-    #[test]
-    fn visual_color_state_filters_pitch_hue_and_flux_over_time() {
-        let mut state = VisualColorState::default();
-        let previous = vec![0.0; 12];
-        let mut bars = vec![0.0; 12];
-        bars[9] = 1.0;
-
-        state.update(&bars, &previous, 0.0);
-
-        let target_hue = pitch_class_hue(state.dominant_pitch);
-        assert_ne!(state.pitch_hue, target_hue);
-        assert!(state.flux < 1.0);
-
-        let hue_after_first_frame = state.pitch_hue;
-        state.update(&bars, &bars, 0.0);
-
-        assert!(state.flux < 0.35);
-        assert_ne!(state.pitch_hue, hue_after_first_frame);
-    }
-
-    #[test]
-    fn retired_theme_config_migrates_to_sonic_texture() {
+    fn retired_theme_config_migrates_to_spring() {
         let mut config = Config::default();
         config.settings.theme = ThemeId::HarmonicComb;
 
         let app = App::new(config);
 
-        assert_eq!(app.theme_id, ThemeId::SonicTexture);
-        assert_eq!(app.config.settings.theme, ThemeId::SonicTexture);
+        assert_eq!(app.theme_id, ThemeId::Spring);
+        assert_eq!(app.config.settings.theme, ThemeId::Spring);
     }
 
     #[test]
@@ -8492,196 +6070,6 @@ mod tests {
     }
 
     #[test]
-    fn album_artwork_layout_contains_full_cover() {
-        let artwork =
-            album_artwork_edges_from_luma("test".to_string(), 4, 8, &[0.5; 32]).expect("artwork");
-
-        let (left, top, scale) = album_artwork_layout(&artwork, 16, 16).expect("layout");
-
-        assert!((left - 4.0).abs() < 0.001);
-        assert!((top - 0.0).abs() < 0.001);
-        assert!((scale - 2.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn album_artwork_edges_from_luma_detects_square_boundary() {
-        let mut luma = vec![0.0_f32; 8 * 8];
-        for y in 2..6 {
-            for x in 2..6 {
-                luma[y * 8 + x] = 1.0;
-            }
-        }
-
-        let artwork = album_artwork_edges_from_luma("test".to_string(), 8, 8, &luma)
-            .expect("edge image should be created");
-
-        assert!(artwork.edges.iter().copied().fold(0.0_f32, f32::max) > 0.8);
-        assert!(artwork.edges[4 * 8 + 4] < 0.1);
-    }
-
-    #[test]
-    fn album_artwork_image_cell_renders_braille_from_cover_luma() {
-        let artwork =
-            album_artwork_edges_from_luma("test".to_string(), 4, 4, &[1.0; 16]).expect("artwork");
-
-        let (mask, sample) =
-            album_artwork_image_cell(&artwork, 0, 0, 4, 4).expect("visible artwork cell");
-
-        assert_ne!(mask, 0);
-        assert!(sample.luma > 0.80);
-    }
-
-    #[test]
-    fn album_artwork_black_cell_renders_dark_braille() {
-        let artwork =
-            album_artwork_edges_from_luma("test".to_string(), 4, 4, &[0.0; 16]).expect("artwork");
-
-        let (mask, sample) =
-            album_artwork_image_cell(&artwork, 0, 0, 4, 4).expect("black cover cell");
-
-        assert_eq!(mask, 0xff);
-        assert!(sample.luma < 0.01);
-    }
-
-    #[test]
-    fn album_artwork_mid_luma_cell_renders_dense_braille() {
-        let artwork =
-            album_artwork_edges_from_luma("test".to_string(), 4, 4, &[0.35; 16]).expect("artwork");
-
-        let (mask, sample) =
-            album_artwork_image_cell(&artwork, 0, 0, 4, 4).expect("mid-luma cover cell");
-
-        assert_eq!(mask, 0xff);
-        assert!((sample.luma - 0.35).abs() < 0.01);
-    }
-
-    #[test]
-    fn circle_album_crops_to_centered_disc() {
-        let artwork =
-            album_artwork_edges_from_luma("test".to_string(), 8, 8, &[1.0; 64]).expect("artwork");
-
-        assert!(
-            sample_album_artwork_circle(&artwork, 8, 8, 16, 16, 0.0).is_some(),
-            "center should sample the album art"
-        );
-        assert!(
-            sample_album_artwork_circle(&artwork, 0, 0, 16, 16, 0.0).is_none(),
-            "corner should be outside the circular crop"
-        );
-    }
-
-    #[test]
-    fn circle_album_edge_uses_partial_coverage_mask() {
-        let artwork =
-            album_artwork_edges_from_luma("test".to_string(), 8, 8, &[1.0; 64]).expect("artwork");
-
-        let (mask, _) =
-            album_artwork_circle_cell(&artwork, 7, 1, 16, 16, 0.0).expect("circle edge cell");
-
-        assert_ne!(mask, 0);
-        assert_ne!(mask, 0xff);
-    }
-
-    #[test]
-    fn circle_album_rotates_as_one_disc() {
-        let mut pixels = Vec::new();
-        let mut luma = Vec::new();
-        for y in 0..8 {
-            for x in 0..8 {
-                pixels.push(AlbumPixel {
-                    red: (x * 32) as u8,
-                    green: (y * 32) as u8,
-                    blue: 0,
-                });
-                luma.push(0.8);
-            }
-        }
-        let artwork = album_artwork_from_luma_and_pixels("test".to_string(), 8, 8, pixels, luma)
-            .expect("artwork");
-
-        let before =
-            sample_album_artwork_circle(&artwork, 12, 8, 16, 16, 0.0).expect("right-side sample");
-        let rotated =
-            sample_album_artwork_circle(&artwork, 12, 8, 16, 16, 0.25).expect("rotated sample");
-
-        assert!(before.red > before.green);
-        assert!(rotated.green > rotated.red);
-    }
-
-    #[test]
-    fn album_highlight_lifts_cover_color_without_washing_it_out() {
-        let sample = AlbumSample {
-            red: 10,
-            green: 48,
-            blue: 240,
-            luma: 0.22,
-            edge: 0.40,
-        };
-
-        let (red, green, blue) = color_to_rgb(album_highlight_color(
-            theme(ThemeId::AlbumArt),
-            sample,
-            0.90,
-            false,
-        ));
-
-        assert!(red > sample.red);
-        assert!(green > sample.green);
-        assert!(blue > sample.blue / 2);
-        assert!(blue > red);
-        assert!(blue as i16 - red as i16 > 40);
-    }
-
-    #[test]
-    fn album_background_keeps_cover_visible() {
-        let sample = AlbumSample {
-            red: 80,
-            green: 120,
-            blue: 200,
-            luma: 0.45,
-            edge: 0.20,
-        };
-
-        let (red, green, blue) =
-            color_to_rgb(album_background_color(theme(ThemeId::AlbumArt), sample));
-
-        assert!(red >= 25);
-        assert!(green >= 40);
-        assert!(blue >= 70);
-        assert!(blue > red);
-    }
-
-    #[test]
-    fn album_theme_fallback_is_neutral_not_miku_cyan() {
-        let mut app = App::new(Config::default());
-        app.theme_id = ThemeId::AlbumArt;
-
-        let (red, green, blue) =
-            color_to_rgb(music_color_for_position_at(&app, 0.35, 0.80, 0.60, false));
-
-        assert!(red > 150);
-        assert!(green > 150);
-        assert!(blue > 150);
-        assert!((blue as i16 - red as i16).abs() < 30);
-    }
-
-    #[test]
-    fn album_art_theme_controls_album_fetch_state() {
-        let mut app = App::new(Config::default());
-
-        assert!(!app.album_art_active());
-        assert_eq!(album_art_value_label(&app), app.t("off"));
-
-        app.theme_id = ThemeId::AlbumArt;
-
-        assert!(app.album_art_active());
-
-        app.theme_id = ThemeId::AlbumArtCircle;
-
-        assert!(app.album_art_active());
-    }
-
-    #[test]
     fn accent_trace_envelope_smoothing_reduces_jaggedness() {
         let mut envelope = vec![0.10_f32, 0.95, 0.12, 0.90, 0.08, 0.85, 0.10];
         let before = envelope
@@ -8798,20 +6186,6 @@ mod tests {
     }
 
     #[test]
-    fn album_theme_keeps_selected_renderer_sampling_width() {
-        let mut app = App::new(Config::default());
-        let area = Rect::new(0, 0, 100, 30);
-        app.screen = Screen::Spectrum;
-        app.theme_id = ThemeId::AlbumArt;
-
-        app.config.settings.renderer = SpectrumRenderer::Blocks;
-        assert_eq!(visual_bar_count(&app, area), Some(82));
-
-        app.config.settings.renderer = SpectrumRenderer::Cava;
-        assert_eq!(visual_bar_count(&app, area), Some(82));
-    }
-
-    #[test]
     fn visual_bar_count_resizes_spectrum_analyzer() {
         let mut app = App::new(Config::default());
 
@@ -8909,7 +6283,10 @@ mod tests {
     }
 
     #[test]
-    fn low_latency_preset_applies_realtime_analysis_defaults() {
+    fn low_latency_preset_is_default_and_applies_realtime_settings() {
+        let defaults = Config::default().settings;
+        assert_eq!(defaults.analysis_preset, AnalysisPreset::LowLatency);
+
         let mut settings = Settings {
             analysis_preset: AnalysisPreset::Balanced,
             fft_size: 4096,

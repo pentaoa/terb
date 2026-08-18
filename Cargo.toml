@@ -10,10 +10,7 @@ categories = ["command-line-utilities", "multimedia::audio"]
 build = "build.rs"
 
 [dependencies]
-base64 = "0.22"
 crossterm = "0.29"
-gif = "0.13"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
 ratatui = "0.30"
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }

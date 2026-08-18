@@ -15,6 +15,8 @@ const BPM_MIN_FREQUENCY: f32 = 40.0;
 const BPM_MAX_FREQUENCY: f32 = 9_000.0;
 const BPM_LOG_GAIN: f32 = 1_600.0;
 const BPM_HISTORY_SECONDS: f32 = 16.0;
+const BPM_MIN_HISTORY_SECONDS: f32 = 4.0;
+const BPM_ESTIMATE_INTERVAL_FRAMES: usize = 16;
 const BPM_SILENCE_GATE: f32 = 0.000_12;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -29,9 +31,14 @@ pub(crate) struct BpmAnalyzer {
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
     pending: Vec<f32>,
+    pending_start: usize,
+    fft_buffer: Vec<Complex<f32>>,
+    magnitudes: Vec<f32>,
+    current_bands: Vec<f32>,
     previous_bands: Vec<f32>,
     onset_average: f32,
     analysis_sample: u64,
+    frames_since_estimate: usize,
     envelope: VecDeque<OnsetFrame>,
     stable_bpm: Option<f32>,
     stable_confidence: f32,
@@ -59,9 +66,14 @@ impl BpmAnalyzer {
             fft,
             window,
             pending: Vec::new(),
+            pending_start: 0,
+            fft_buffer: vec![Complex::new(0.0, 0.0); BPM_FFT_SIZE],
+            magnitudes: vec![0.0; BPM_FFT_SIZE / 2],
+            current_bands: vec![0.0; BPM_BAND_COUNT],
             previous_bands: vec![0.0; BPM_BAND_COUNT],
             onset_average: 0.0,
             analysis_sample: 0,
+            frames_since_estimate: 0,
             envelope: VecDeque::new(),
             stable_bpm: None,
             stable_confidence: 0.0,
@@ -80,41 +92,45 @@ impl BpmAnalyzer {
 
         self.pending.extend_from_slice(samples);
         let mut estimate = None;
-        while self.pending.len() >= BPM_FFT_SIZE {
-            estimate = self.process_frame().or(estimate);
-            self.pending.drain(0..BPM_HOP_SIZE);
+        while self.pending.len().saturating_sub(self.pending_start) >= BPM_FFT_SIZE {
+            estimate = self.process_frame(self.pending_start).or(estimate);
+            self.pending_start += BPM_HOP_SIZE;
             self.analysis_sample = self.analysis_sample.saturating_add(BPM_HOP_SIZE as u64);
+        }
+
+        if self.pending_start >= BPM_FFT_SIZE * 2 {
+            self.pending.drain(..self.pending_start);
+            self.pending_start = 0;
         }
 
         estimate
     }
 
-    fn process_frame(&mut self) -> Option<BpmEstimate> {
-        let source = &self.pending[..BPM_FFT_SIZE];
+    fn process_frame(&mut self, start: usize) -> Option<BpmEstimate> {
+        let end = start + BPM_FFT_SIZE;
+        let source = &self.pending[start..end];
         let source_rms =
-            (source.iter().map(|sample| sample * sample).sum::<f32>() / source.len() as f32).sqrt();
+            (source.iter().map(|sample| sample * sample).sum::<f32>() / BPM_FFT_SIZE as f32).sqrt();
         if source_rms < BPM_SILENCE_GATE {
             self.push_onset_frame(0.0);
-            return self.estimate();
+            return self.estimate_if_due();
         }
 
-        let mean = source.iter().sum::<f32>() / source.len() as f32;
-        let mut buffer: Vec<Complex<f32>> = source
-            .iter()
-            .zip(self.window.iter())
-            .map(|(sample, window)| Complex::new((sample - mean) * window, 0.0))
-            .collect();
-        self.fft.process(&mut buffer);
+        let mean = source.iter().sum::<f32>() / BPM_FFT_SIZE as f32;
+        for (index, output) in self.fft_buffer.iter_mut().enumerate() {
+            output.re = (self.pending[start + index] - mean) * self.window[index];
+            output.im = 0.0;
+        }
+        self.fft.process(&mut self.fft_buffer);
 
         let half = BPM_FFT_SIZE / 2;
-        let mut magnitudes = vec![0.0_f32; half];
         for index in 1..half {
-            magnitudes[index] = buffer[index].norm();
+            self.magnitudes[index] = self.fft_buffer[index].norm();
         }
 
-        let bands = self.log_frequency_bands(&magnitudes);
-        let flux = spectral_flux(&bands, &self.previous_bands);
-        self.previous_bands = bands;
+        self.update_log_frequency_bands();
+        let flux = spectral_flux(&self.current_bands, &self.previous_bands);
+        std::mem::swap(&mut self.current_bands, &mut self.previous_bands);
         self.onset_average = if self.onset_average <= 0.0 {
             flux
         } else {
@@ -125,7 +141,7 @@ impl BpmAnalyzer {
         let strength =
             ((flux - baseline).max(0.0) / (self.onset_average + 0.000_001)).clamp(0.0, 5.0);
         self.push_onset_frame(strength);
-        self.estimate()
+        self.estimate_if_due()
     }
 
     fn push_onset_frame(&mut self, strength: f32) {
@@ -144,23 +160,29 @@ impl BpmAnalyzer {
         }
     }
 
-    fn log_frequency_bands(&self, magnitudes: &[f32]) -> Vec<f32> {
+    fn update_log_frequency_bands(&mut self) {
         let max_frequency = (self.sample_rate / 2.0).min(BPM_MAX_FREQUENCY);
         let ratio = max_frequency / BPM_MIN_FREQUENCY;
-        (0..BPM_BAND_COUNT)
-            .map(|band| {
-                let lower_t = band as f32 / BPM_BAND_COUNT as f32;
-                let upper_t = (band + 1) as f32 / BPM_BAND_COUNT as f32;
-                let lower_frequency = BPM_MIN_FREQUENCY * ratio.powf(lower_t);
-                let upper_frequency = BPM_MIN_FREQUENCY * ratio.powf(upper_t);
-                let lower_bin =
-                    ((lower_frequency / self.sample_rate) * BPM_FFT_SIZE as f32).max(1.0);
-                let upper_bin = ((upper_frequency / self.sample_rate) * BPM_FFT_SIZE as f32)
-                    .max(lower_bin + 0.5);
-                let band = sample_frequency_band(magnitudes, lower_bin, upper_bin);
-                (1.0 + band.rms * BPM_LOG_GAIN).ln()
-            })
-            .collect()
+        for band_index in 0..BPM_BAND_COUNT {
+            let lower_t = band_index as f32 / BPM_BAND_COUNT as f32;
+            let upper_t = (band_index + 1) as f32 / BPM_BAND_COUNT as f32;
+            let lower_frequency = BPM_MIN_FREQUENCY * ratio.powf(lower_t);
+            let upper_frequency = BPM_MIN_FREQUENCY * ratio.powf(upper_t);
+            let lower_bin = ((lower_frequency / self.sample_rate) * BPM_FFT_SIZE as f32).max(1.0);
+            let upper_bin =
+                ((upper_frequency / self.sample_rate) * BPM_FFT_SIZE as f32).max(lower_bin + 0.5);
+            let band = sample_frequency_band(&self.magnitudes, lower_bin, upper_bin);
+            self.current_bands[band_index] = (1.0 + band.rms * BPM_LOG_GAIN).ln();
+        }
+    }
+
+    fn estimate_if_due(&mut self) -> Option<BpmEstimate> {
+        self.frames_since_estimate += 1;
+        if self.frames_since_estimate < BPM_ESTIMATE_INTERVAL_FRAMES {
+            return None;
+        }
+        self.frames_since_estimate = 0;
+        self.estimate()
     }
 
     fn estimate(&mut self) -> Option<BpmEstimate> {
@@ -194,13 +216,17 @@ fn spectral_flux(current: &[f32], previous: &[f32]) -> f32 {
     }
 
     let count = current.len().min(previous.len());
-    let total = current
-        .iter()
-        .zip(previous.iter())
-        .take(count)
-        .map(|(current, previous)| (current - previous).max(0.0).powf(1.5))
-        .sum::<f32>();
-    (total / count as f32).powf(1.0 / 1.5)
+    let mut changes = [0.0_f32; BPM_BAND_COUNT];
+    let mut total = 0.0_f32;
+    for (index, (current, previous)) in current.iter().zip(previous).take(count).enumerate() {
+        let change = (current - previous).max(0.0);
+        changes[index] = change;
+        total += change;
+    }
+    changes[..count].sort_unstable_by(f32::total_cmp);
+    let median = changes[count / 2];
+    let mean = total / count as f32;
+    median * 0.65 + mean * 0.35
 }
 
 fn estimate_bpm_from_envelope(
@@ -208,7 +234,8 @@ fn estimate_bpm_from_envelope(
     hop_seconds: f32,
     stable_bpm: Option<f32>,
 ) -> Option<BpmEstimate> {
-    if envelope.len() < 16 {
+    let minimum_frames = (BPM_MIN_HISTORY_SECONDS / hop_seconds).ceil() as usize;
+    if envelope.len() < minimum_frames.max(16) {
         return None;
     }
 
@@ -231,8 +258,14 @@ fn estimate_bpm_from_envelope(
     if min_lag >= max_lag {
         return None;
     }
+    let mut scores = vec![0.0_f32; max_lag + 1];
 
-    for lag in min_lag..=max_lag {
+    for (lag, score_slot) in scores
+        .iter_mut()
+        .enumerate()
+        .take(max_lag + 1)
+        .skip(min_lag)
+    {
         let bpm = 60.0 / (lag as f32 * hop_seconds);
         let raw_score = autocorrelation_score(&values, lag);
         if raw_score <= 0.0 {
@@ -245,6 +278,7 @@ fn estimate_bpm_from_envelope(
         let tempo_prior = tempo_prior(bpm);
         let harmonic = harmonic_support(&values, lag);
         let score = raw_score * tempo_prior * (0.74 + harmonic * 0.26) * (0.72 + continuity * 0.28);
+        *score_slot = score;
 
         match best {
             Some(current) if score <= current.confidence => {
@@ -266,7 +300,18 @@ fn estimate_bpm_from_envelope(
         }
     }
 
-    let best = best?;
+    let mut best = best?;
+    let best_lag = (60.0 / (best.bpm * hop_seconds)).round() as usize;
+    if best_lag > min_lag && best_lag < max_lag {
+        let left = scores[best_lag - 1];
+        let center = scores[best_lag];
+        let right = scores[best_lag + 1];
+        let denominator = left - 2.0 * center + right;
+        if denominator.abs() > 0.000_001 {
+            let offset = (0.5 * (left - right) / denominator).clamp(-0.5, 0.5);
+            best.bpm = 60.0 / ((best_lag as f32 + offset) * hop_seconds);
+        }
+    }
     let separation = if best.confidence <= 0.0 {
         0.0
     } else {
@@ -290,9 +335,10 @@ fn autocorrelation_score(values: &[f32], lag: usize) -> f32 {
     for index in lag..values.len() {
         let left = values[index];
         let right = values[index - lag];
-        numerator += left * right;
-        left_energy += left * left;
-        right_energy += right * right;
+        let recency = 0.5 + 0.5 * index as f32 / values.len().max(1) as f32;
+        numerator += left * right * recency;
+        left_energy += left * left * recency;
+        right_energy += right * right * recency;
     }
 
     numerator / (left_energy.sqrt() * right_energy.sqrt() + 0.000_001)
@@ -338,6 +384,25 @@ fn lerp(from: f32, to: f32, amount: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimator_waits_for_enough_rhythm_history() {
+        let mut analyzer = BpmAnalyzer::new(48_000.0);
+        let click_period = 24_000;
+        let mut estimate = None;
+
+        for chunk_start in (0..48_000 * 3).step_by(512) {
+            let mut samples = vec![0.0; 512];
+            for (offset, sample) in samples.iter_mut().enumerate() {
+                if (chunk_start + offset) % click_period < 240 {
+                    *sample = 0.8;
+                }
+            }
+            estimate = analyzer.consume(&samples).or(estimate);
+        }
+
+        assert!(estimate.is_none());
+    }
 
     #[test]
     fn estimator_locks_to_regular_low_frequency_onsets() {
