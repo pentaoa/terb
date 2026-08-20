@@ -11,10 +11,26 @@ build = "build.rs"
 
 [dependencies]
 crossterm = "0.29"
+hound = "3.5"
 ratatui = "0.30"
+rten = { version = "0.24", features = ["fft"] }
+rten-tensor = "0.24"
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "2"
 unicode-width = "0.2"
 
+[[bin]]
+name = "terb-bpm"
+path = "src/bin/terb-bpm.rs"
+
+[[bin]]
+name = "terb-bpm-benchmark"
+path = "src/bin/terb-bpm-benchmark.rs"
+
 [build-dependencies]
+
+[[bin]]
+name = "terb-bpm-features"
+path = "src/bin/terb-bpm-features.rs"

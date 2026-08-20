@@ -12,7 +12,6 @@ use std::{
 };
 
 pub(crate) mod analysis;
-pub(crate) mod bpm;
 
 use crossterm::{
     event::{self, Event as CEvent, KeyCode, KeyEvent},
@@ -37,7 +36,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use analysis::sample_frequency_band;
 #[cfg(test)]
 use analysis::sample_magnitude;
-use bpm::{BpmAnalyzer, BPM_MAX, BPM_MIN, BPM_PULSE_DECAY_SECONDS};
+use terb::beat::AsyncBeatTracker;
+use terb::bpm::{BpmAnalyzer, BPM_MAX, BPM_MIN, BPM_PULSE_DECAY_SECONDS};
 
 const LANGUAGES: &[(&str, &str)] = &[("zh", "中文"), ("en", "English"), ("ja", "日本語")];
 const THEMES: &[ThemeId] = &[ThemeId::Spring, ThemeId::Vintage, ThemeId::Mono];
@@ -51,6 +51,7 @@ const ACCENT_DISPLAY_MODES: &[AccentDisplayMode] = &[
     AccentDisplayMode::NoteNames,
     AccentDisplayMode::Off,
 ];
+const BPM_MODES: &[BpmMode] = &[BpmMode::Onnx, BpmMode::Traditional, BpmMode::Off];
 const MENU_ITEMS: &[&str] = &[
     "menu_spectrum",
     "menu_toggle",
@@ -226,19 +227,11 @@ fn handle_spectrum_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.screen = Screen::Menu,
         KeyCode::Char(' ') => app.toggle_capture(),
-        KeyCode::Char('S') => app.screen = Screen::Settings,
-        KeyCode::Char('s') => app.toggle_settings_panel(),
-        KeyCode::Char('p') => app.toggle_pipeline_panel(),
+        KeyCode::Char('S') | KeyCode::Char('s') => app.screen = Screen::Settings,
         KeyCode::Char('t') => app.toggle_toolbar_panel(),
         KeyCode::Char('m') => app.toggle_master_panel(),
         KeyCode::Char('w') => app.toggle_waveform_panel(),
         KeyCode::Char('?') => app.screen = Screen::Help,
-        KeyCode::Up | KeyCode::Char('k') => app.prev_setting(),
-        KeyCode::Down | KeyCode::Char('j') => app.next_setting(),
-        KeyCode::BackTab => app.prev_setting_category(),
-        KeyCode::Tab => app.next_setting_category(),
-        KeyCode::Left | KeyCode::Char('h') => app.adjust_setting(-1),
-        KeyCode::Right | KeyCode::Char('l') => app.adjust_setting(1),
         _ => {}
     }
     false
@@ -336,6 +329,14 @@ enum AccentDisplayMode {
     Off,
     Trace,
     NoteNames,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BpmMode {
+    Onnx,
+    Traditional,
+    Off,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -456,7 +457,10 @@ struct Settings {
     auto_sensitivity_enabled: bool,
     #[serde(default = "default_noise_reduction")]
     noise_reduction: f32,
-    #[serde(default = "default_bpm_enabled")]
+    #[serde(default = "default_bpm_mode")]
+    bpm_mode: BpmMode,
+    #[serde(default = "default_bpm_enabled", skip_serializing)]
+    // Legacy config field. Old `false` values migrate to `bpm_mode = off`.
     bpm_enabled: bool,
     #[serde(default = "default_visual_curve_enabled")]
     visual_curve_enabled: bool,
@@ -475,10 +479,6 @@ struct Settings {
     accent_trace_enabled: bool,
     #[serde(default = "default_accent_trace_threshold")]
     accent_trace_threshold: f32,
-    #[serde(default = "default_show_settings_panel")]
-    show_settings_panel: bool,
-    #[serde(default = "default_show_pipeline_panel")]
-    show_pipeline_panel: bool,
     #[serde(default = "default_show_toolbar_panel")]
     show_toolbar_panel: bool,
     #[serde(default = "default_show_master_panel")]
@@ -535,6 +535,10 @@ fn default_bpm_enabled() -> bool {
     true
 }
 
+fn default_bpm_mode() -> BpmMode {
+    BpmMode::Onnx
+}
+
 fn default_visual_curve_enabled() -> bool {
     true
 }
@@ -565,14 +569,6 @@ fn default_accent_display_mode() -> AccentDisplayMode {
 
 fn default_accent_trace_threshold() -> f32 {
     DEFAULT_ACCENT_TRACE_THRESHOLD
-}
-
-fn default_show_settings_panel() -> bool {
-    true
-}
-
-fn default_show_pipeline_panel() -> bool {
-    true
 }
 
 fn default_show_toolbar_panel() -> bool {
@@ -606,6 +602,7 @@ impl Default for Config {
                 high_shelf_db: default_high_shelf_db(),
                 auto_sensitivity_enabled: default_auto_sensitivity_enabled(),
                 noise_reduction: default_noise_reduction(),
+                bpm_mode: default_bpm_mode(),
                 bpm_enabled: default_bpm_enabled(),
                 visual_curve_enabled: default_visual_curve_enabled(),
                 visual_curve: default_visual_curve(),
@@ -615,8 +612,6 @@ impl Default for Config {
                 accent_display_mode: default_accent_display_mode(),
                 accent_trace_enabled: default_accent_trace_enabled(),
                 accent_trace_threshold: default_accent_trace_threshold(),
-                show_settings_panel: default_show_settings_panel(),
-                show_pipeline_panel: default_show_pipeline_panel(),
                 show_toolbar_panel: default_show_toolbar_panel(),
                 show_master_panel: default_show_master_panel(),
                 show_waveform_panel: default_show_waveform_panel(),
@@ -668,6 +663,10 @@ impl Settings {
         if !self.accent_trace_enabled {
             self.accent_display_mode = AccentDisplayMode::Off;
             self.accent_trace_enabled = true;
+        }
+        if !self.bpm_enabled {
+            self.bpm_mode = BpmMode::Off;
+            self.bpm_enabled = true;
         }
         if is_removed_theme(self.theme) || is_retired_theme(self.theme) {
             self.theme = ThemeId::Spring;
@@ -779,7 +778,8 @@ struct App {
     level: f32,
     master_left: f32,
     master_right: f32,
-    bpm: BpmAnalyzer,
+    bpm: Option<AsyncBeatTracker>,
+    traditional_bpm: BpmAnalyzer,
     bpm_estimate: Option<f32>,
     bpm_confidence: f32,
     bpm_phase: f32,
@@ -939,6 +939,17 @@ impl App {
         let fft_size = config.settings.fft_size;
         let hop_size = config.settings.analysis_hop;
         let (tx, rx) = mpsc::channel();
+        let bpm = if config.settings.bpm_mode == BpmMode::Onnx {
+            match AsyncBeatTracker::new(48_000) {
+                Ok(tracker) => Some(tracker),
+                Err(error) => {
+                    eprintln!("terb: ONNX beat tracker unavailable: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Self {
             config,
@@ -959,7 +970,8 @@ impl App {
             level: 0.0,
             master_left: 0.0,
             master_right: 0.0,
-            bpm: BpmAnalyzer::new(48_000.0),
+            bpm,
+            traditional_bpm: BpmAnalyzer::new(48_000.0),
             bpm_estimate: None,
             bpm_confidence: 0.0,
             bpm_phase: 0.0,
@@ -1008,7 +1020,7 @@ impl App {
     fn advance_bpm_pulse(&mut self, elapsed: Duration) {
         self.bpm_pulse =
             (self.bpm_pulse - elapsed.as_secs_f32() / BPM_PULSE_DECAY_SECONDS).clamp(0.0, 1.0);
-        if !self.config.settings.bpm_enabled {
+        if self.config.settings.bpm_mode == BpmMode::Off {
             self.bpm_phase = 0.0;
             self.bpm_pulse = 0.0;
             self.bpm_next_beat_at = None;
@@ -1112,11 +1124,23 @@ impl App {
         self.master_left = samples.left_level;
         self.master_right = samples.right_level;
         self.update_waveform(&samples.mono);
-        if self.config.settings.bpm_enabled {
-            if let Some(estimate) = self.bpm.consume(&samples.mono) {
-                self.set_bpm_estimate(estimate.bpm);
-                self.bpm_confidence = estimate.confidence;
+        match self.config.settings.bpm_mode {
+            BpmMode::Onnx => {
+                if let Some(tracker) = &self.bpm {
+                    tracker.submit(&samples.mono);
+                }
+                if let Some(estimate) = self.bpm.as_ref().and_then(AsyncBeatTracker::latest) {
+                    self.set_bpm_estimate(estimate.bpm);
+                    self.bpm_confidence = estimate.confidence;
+                }
             }
+            BpmMode::Traditional => {
+                if let Some(estimate) = self.traditional_bpm.consume(&samples.mono) {
+                    self.set_bpm_estimate(estimate.bpm);
+                    self.bpm_confidence = estimate.confidence;
+                }
+            }
+            BpmMode::Off => {}
         }
         let pipeline = SpectrumPipeline::from_settings(&self.config.settings);
         if let Some(bars) = self.analyzer.consume(
@@ -1146,7 +1170,10 @@ impl App {
     }
 
     fn clear_bpm_state(&mut self) {
-        self.bpm.reset();
+        if let Some(tracker) = &self.bpm {
+            tracker.reset();
+        }
+        self.traditional_bpm.reset();
         self.bpm_estimate = None;
         self.bpm_confidence = 0.0;
         self.bpm_phase = 0.0;
@@ -1466,10 +1493,7 @@ impl App {
                     .clamp(MIN_NOISE_REDUCTION, MAX_NOISE_REDUCTION);
             }
             "bpm_analysis" => {
-                self.config.settings.bpm_enabled = !self.config.settings.bpm_enabled;
-                if !self.config.settings.bpm_enabled {
-                    self.clear_bpm_state();
-                }
+                self.cycle_bpm_mode(direction);
             }
             "visual_curve" => {
                 self.config.settings.visual_curve_enabled =
@@ -1632,6 +1656,28 @@ impl App {
         self.config.settings.renderer = SPECTRUM_RENDERERS[next];
     }
 
+    fn cycle_bpm_mode(&mut self, direction: i32) {
+        let current = self.config.settings.bpm_mode;
+        let index = BPM_MODES
+            .iter()
+            .position(|mode| *mode == current)
+            .unwrap_or(0);
+        let next = (index as i32 + direction).rem_euclid(BPM_MODES.len() as i32) as usize;
+        let mode = BPM_MODES[next];
+        if mode == current {
+            return;
+        }
+
+        self.clear_bpm_state();
+        self.config.settings.bpm_mode = mode;
+        if mode == BpmMode::Onnx && self.bpm.is_none() {
+            match AsyncBeatTracker::new(48_000) {
+                Ok(tracker) => self.bpm = Some(tracker),
+                Err(error) => eprintln!("terb: ONNX beat tracker unavailable: {error}"),
+            }
+        }
+    }
+
     fn cycle_accent_display_mode(&mut self, direction: i32) {
         let index = ACCENT_DISPLAY_MODES
             .iter()
@@ -1647,16 +1693,6 @@ impl App {
 
     fn save_config(&self) {
         self.config.save();
-    }
-
-    fn toggle_settings_panel(&mut self) {
-        self.config.settings.show_settings_panel = !self.config.settings.show_settings_panel;
-        self.save_config();
-    }
-
-    fn toggle_pipeline_panel(&mut self) {
-        self.config.settings.show_pipeline_panel = !self.config.settings.show_pipeline_panel;
-        self.save_config();
     }
 
     fn toggle_toolbar_panel(&mut self) {
@@ -2251,7 +2287,7 @@ fn visual_bar_count(app: &App, area: Rect) -> Option<usize> {
 fn spectrum_visual_area(app: &App, area: Rect) -> Rect {
     let settings = &app.config.settings;
     let left_height = left_module_height(settings);
-    let show_left_modules = left_height > 0 && area.width >= 96 && area.height >= left_height;
+    let show_left_modules = left_height > 0 && area.width >= 120 && area.height >= left_height;
     let mut content_area = area;
 
     if show_left_modules {
@@ -2506,7 +2542,7 @@ fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_spectrum_screen(frame: &mut Frame, app: &App, area: Rect) {
     let settings = &app.config.settings;
     let left_height = left_module_height(settings);
-    let show_left_modules = left_height > 0 && area.width >= 96 && area.height >= left_height;
+    let show_left_modules = left_height > 0 && area.width >= 120 && area.height >= left_height;
     let mut content_area = area;
 
     if show_left_modules {
@@ -2555,17 +2591,11 @@ fn draw_spectrum_screen(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn left_module_height(settings: &Settings) -> u16 {
-    let mut height = 0;
     if settings.show_toolbar_panel {
-        height += 7;
+        7
+    } else {
+        0
     }
-    if settings.show_settings_panel {
-        height += 22;
-    }
-    if settings.show_pipeline_panel {
-        height += 9;
-    }
-    height
 }
 
 fn draw_left_modules(frame: &mut Frame, app: &App, area: Rect) {
@@ -2574,12 +2604,6 @@ fn draw_left_modules(frame: &mut Frame, app: &App, area: Rect) {
 
     if settings.show_toolbar_panel {
         constraints.push(Constraint::Length(7));
-    }
-    if settings.show_settings_panel {
-        constraints.push(Constraint::Length(22));
-    }
-    if settings.show_pipeline_panel {
-        constraints.push(Constraint::Length(9));
     }
     if constraints.is_empty() {
         return;
@@ -2590,23 +2614,8 @@ fn draw_left_modules(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
-    let mut index = 0;
-
     if settings.show_toolbar_panel {
-        draw_toolbar(frame, app, chunks[index]);
-        index += 1;
-    }
-    if settings.show_settings_panel {
-        draw_settings_list(
-            frame,
-            app,
-            chunks[index],
-            module_title_line(app, 's', "settings"),
-        );
-        index += 1;
-    }
-    if settings.show_pipeline_panel {
-        draw_pipeline(frame, app, chunks[index]);
+        draw_toolbar(frame, app, chunks[0]);
     }
 }
 
@@ -2696,27 +2705,6 @@ fn beat_indicator_span(app: &App) -> Span<'static> {
         Style::default().fg(theme.muted)
     };
     Span::styled(symbol, style)
-}
-
-fn beat_phase_bar(app: &App, width: usize) -> String {
-    if width == 0 || !app.config.settings.bpm_enabled || app.bpm_estimate.is_none() {
-        return String::new();
-    }
-
-    let position = (app.bpm_phase * width as f32).floor() as usize;
-    (0..width)
-        .map(|index| {
-            if index == position.min(width - 1) {
-                if app.bpm_pulse > 0.0 {
-                    '●'
-                } else {
-                    '◆'
-                }
-            } else {
-                '─'
-            }
-        })
-        .collect()
 }
 
 fn module_toggle_line(app: &App) -> Line<'static> {
@@ -3973,16 +3961,16 @@ fn braille_pattern(mask: u8) -> char {
 }
 
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = if area.width < 70 || area.height < 24 {
+    let dashboard = if area.width < 82 || area.height < 22 {
         area
     } else {
-        centered_rect(54, 76, area)
+        centered_rect(94, 90, area)
     };
-    frame.render_widget(Clear, chunks);
+    frame.render_widget(Clear, dashboard);
     draw_settings_list(
         frame,
         app,
-        chunks,
+        dashboard,
         panel_title(app.t("settings"), app.theme()),
     );
 }
@@ -4015,20 +4003,38 @@ fn draw_settings_board(frame: &mut Frame, app: &App, area: Rect) {
     let selected_row = selected_setting_row(app.setting_index, &rows);
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(8),
+            Constraint::Length(2),
+        ])
         .split(area);
+
+    draw_setting_category_bar(frame, app, sections[0], selected_row.as_ref());
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(42),
-            Constraint::Length(1),
-            Constraint::Min(24),
-        ])
-        .split(sections[0]);
-    draw_settings_rows(frame, app, columns[0], &rows);
-    draw_vertical_divider(frame, theme, columns[1]);
-    draw_settings_description(frame, app, columns[2], selected_row.as_ref());
+        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+        .split(sections[1]);
+    let list_inner = draw_panel(
+        frame,
+        columns[0],
+        theme,
+        Some(panel_title(app.t("settings_parameters"), theme)),
+    );
+    let detail_inner = draw_panel(
+        frame,
+        columns[1],
+        theme,
+        Some(panel_title(app.t("settings_details"), theme)),
+    );
+    draw_settings_rows(frame, app, inset_rect(list_inner, 1, 0), &rows);
+    draw_settings_description(
+        frame,
+        app,
+        inset_rect(detail_inner, 1, 0),
+        selected_row.as_ref(),
+    );
 
     let footer = Line::from(vec![
         Span::styled("←", Style::default().fg(theme.accent)),
@@ -4046,18 +4052,35 @@ fn draw_settings_board(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme.muted),
         ),
     ]);
-    frame.render_widget(Paragraph::new(footer), sections[1]);
+    frame.render_widget(Paragraph::new(footer), sections[2]);
 }
 
-fn draw_vertical_divider(frame: &mut Frame, theme: Theme, area: Rect) {
-    if area.width == 0 || area.height == 0 {
-        return;
+fn draw_setting_category_bar(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    selected: Option<&SettingRow>,
+) {
+    let theme = app.theme();
+    let active = selected
+        .map(|row| row.category)
+        .unwrap_or(SettingCategory::General);
+    let mut spans = vec![Span::styled("  ", Style::default())];
+    for category in SETTING_CATEGORIES {
+        let selected = *category == active;
+        spans.push(Span::styled(
+            format!(" {} ", app.t(setting_category_key(*category))),
+            if selected {
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(theme.muted)
+            },
+        ));
+        spans.push(Span::raw(" "));
     }
-
-    let lines = (0..area.height)
-        .map(|_| Line::from(Span::styled("│", Style::default().fg(theme.border))))
-        .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_settings_compact_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -4119,8 +4142,7 @@ fn draw_settings_description(
     let Some(row) = selected else {
         return;
     };
-    let area = inset_rect(area, 2, 0);
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             app.t(row.key),
             Style::default()
@@ -4148,10 +4170,64 @@ fn draw_settings_description(
         Line::from(""),
         Line::from(Span::styled(
             app.t(setting_help_key(row.key)),
-            Style::default().fg(theme.muted),
+            Style::default().fg(theme.text),
         )),
     ];
+    if let Some(detail) = setting_runtime_detail(app, row) {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                app.t("effective_value"),
+                Style::default().fg(theme.muted),
+            )),
+            Line::from(Span::styled(detail, Style::default().fg(theme.accent))),
+        ]);
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+fn setting_category_key(category: SettingCategory) -> &'static str {
+    match category {
+        SettingCategory::General => "settings_general",
+        SettingCategory::Analysis => "settings_analysis",
+        SettingCategory::Processing => "settings_processing",
+        SettingCategory::Visual => "settings_visual",
+    }
+}
+
+fn setting_runtime_detail(app: &App, row: &SettingRow) -> Option<String> {
+    let settings = &app.config.settings;
+    match row.key {
+        "fft_size" => Some(format!(
+            "{} samples · {:.1} ms @ 48 kHz",
+            settings.fft_size,
+            settings.fft_size as f32 / 48.0
+        )),
+        "analysis_hop" => Some(format!(
+            "{} samples · {:.2} ms · {:.1} analyses/s",
+            settings.analysis_hop,
+            settings.analysis_hop as f32 / 48.0,
+            48_000.0 / settings.analysis_hop as f32
+        )),
+        "refresh_rate" => Some(format!(
+            "{} Hz · {:.2} ms/frame",
+            settings.refresh_hz,
+            1_000.0 / settings.refresh_hz as f32
+        )),
+        "bars" => Some(format!(
+            "{} {} · {} {}",
+            settings.bar_count,
+            app.t("configured_value"),
+            app.analyzer.bar_count,
+            app.t("effective_value")
+        )),
+        "bpm_analysis" => Some(match settings.bpm_mode {
+            BpmMode::Onnx => app.t("bpm_detail_onnx").to_string(),
+            BpmMode::Traditional => app.t("bpm_detail_traditional").to_string(),
+            BpmMode::Off => app.t("bpm_detail_off").to_string(),
+        }),
+        _ => None,
+    }
 }
 
 fn setting_board_line(app: &App, row: &SettingRow, width: usize) -> Line<'static> {
@@ -4360,7 +4436,7 @@ fn settings_rows(app: &App) -> Vec<SettingRow> {
             14,
             "bpm_analysis",
             SettingCategory::Analysis,
-            on_off_label(app, app.config.settings.bpm_enabled),
+            bpm_mode_label(app, app.config.settings.bpm_mode),
         ),
         setting_row(
             15,
@@ -4468,7 +4544,12 @@ fn setting_range(app: &App, key: &'static str) -> String {
             .map(|rate| format!("{}Hz", rate))
             .collect::<Vec<_>>()
             .join(" / "),
-        "high_shelf" | "auto_sensitivity" | "bpm_analysis" | "visual_curve" | "trail" => {
+        "bpm_analysis" => BPM_MODES
+            .iter()
+            .map(|mode| bpm_mode_label(app, *mode))
+            .collect::<Vec<_>>()
+            .join(" / "),
+        "high_shelf" | "auto_sensitivity" | "visual_curve" | "trail" => {
             format!("{} / {}", app.t("on"), app.t("off"))
         }
         "accent_display" => ACCENT_DISPLAY_MODES
@@ -4567,129 +4648,6 @@ fn setting_help_key(key: &'static str) -> &'static str {
         "ceiling" => "help_setting_ceiling",
         _ => "help_setting_default",
     }
-}
-
-fn draw_pipeline(frame: &mut Frame, app: &App, area: Rect) {
-    let theme = app.theme();
-    let inner = draw_panel(
-        frame,
-        area,
-        theme,
-        Some(module_title_line(app, 'p', "pipeline")),
-    );
-    let settings = &app.config.settings;
-    let shelf = if settings.high_shelf_enabled {
-        format!("HS +{:.0}dB", settings.high_shelf_db)
-    } else {
-        "HS bypass".to_string()
-    };
-    let meter = if settings.visual_curve_enabled {
-        format!("pow {:.2}", settings.visual_curve)
-    } else {
-        "linear".to_string()
-    };
-    let trail = if settings.trail_enabled {
-        format!("trail {:>2}%", (settings.trail_decay * 100.0) as u16)
-    } else {
-        "trail off".to_string()
-    };
-    let accent_trace = match settings.accent_display_mode {
-        AccentDisplayMode::Trace => format!(
-            "accent trace {:>2}%",
-            (settings.accent_trace_threshold * 100.0).round() as u16
-        ),
-        AccentDisplayMode::NoteNames => format!(
-            "accent notes {:>2}%",
-            (settings.accent_trace_threshold * 100.0).round() as u16
-        ),
-        AccentDisplayMode::Off => "accent off".to_string(),
-    };
-    let sensitivity = if settings.auto_sensitivity_enabled {
-        "autosens on"
-    } else {
-        "autosens off"
-    };
-    let bpm = if settings.bpm_enabled {
-        format!("bpm {}", bpm_label(app))
-    } else {
-        "bpm off".to_string()
-    };
-    let beat = beat_phase_bar(app, 8);
-    let lines = vec![
-        Line::from(vec![
-            pipeline_stage(theme, "SRC"),
-            Span::styled(
-                format!(
-                    "SCStream 48k/2ch | {}",
-                    preset_label(app, settings.analysis_preset)
-                ),
-                Style::default().fg(theme.text),
-            ),
-        ]),
-        Line::from(vec![
-            pipeline_stage(theme, "PRE"),
-            Span::styled(
-                "stereo -> mono -> DC trim -> Hann",
-                Style::default().fg(theme.text),
-            ),
-        ]),
-        Line::from(vec![
-            pipeline_stage(theme, "FFT"),
-            Span::styled(
-                format!(
-                    "{} hop {} log 35Hz-18k",
-                    settings.fft_size, settings.analysis_hop
-                ),
-                Style::default().fg(theme.text),
-            ),
-        ]),
-        Line::from(vec![
-            pipeline_stage(theme, "DET"),
-            Span::styled(
-                format!(
-                    "RMS+peak atk {:>2} rel {:>2} | {}",
-                    (settings.attack * 100.0) as u16,
-                    (settings.release * 100.0) as u16,
-                    sensitivity
-                ),
-                Style::default().fg(theme.text),
-            ),
-        ]),
-        Line::from(vec![
-            pipeline_stage(theme, "PROC"),
-            Span::styled(
-                format!(
-                    "{} | NR {:>2}% | lim {:>2}% | {} | {} | {}",
-                    shelf,
-                    (settings.noise_reduction * 100.0).round() as u16,
-                    (settings.ceiling * 100.0) as u16,
-                    meter,
-                    trail,
-                    accent_trace
-                ),
-                Style::default().fg(theme.text),
-            ),
-        ]),
-        Line::from(vec![
-            pipeline_stage(theme, "TEMPO"),
-            Span::styled(bpm, Style::default().fg(theme.text)),
-            Span::raw(" "),
-            beat_indicator_span(app),
-            Span::raw(" "),
-            Span::styled(beat, Style::default().fg(theme.muted)),
-        ]),
-    ];
-
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
-}
-
-fn pipeline_stage(theme: Theme, label: &'static str) -> Span<'static> {
-    Span::styled(
-        format!("{:<5}", label),
-        Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD),
-    )
 }
 
 fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
@@ -4880,7 +4838,6 @@ fn inline_hotkey_label(theme: Theme, shortcut: char, label: &'static str) -> Lin
 fn english_module_title(title_key: &'static str) -> &'static str {
     match title_key {
         "settings" => "settings",
-        "pipeline" => "pipeline",
         "toolbar" => "toolbar",
         "master" => "master",
         "waveform" => "waveform",
@@ -4968,8 +4925,16 @@ fn renderer_label(app: &App) -> &'static str {
     }
 }
 
+fn bpm_mode_label(app: &App, mode: BpmMode) -> &'static str {
+    app.t(match mode {
+        BpmMode::Onnx => "bpm_mode_onnx",
+        BpmMode::Traditional => "bpm_mode_traditional",
+        BpmMode::Off => "bpm_mode_off",
+    })
+}
+
 fn bpm_label(app: &App) -> String {
-    if !app.config.settings.bpm_enabled {
+    if app.config.settings.bpm_mode == BpmMode::Off {
         return app.t("off").to_string();
     }
 
@@ -5016,6 +4981,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "settings_analysis") => "分析",
         (Lang::Zh, "settings_processing") => "处理",
         (Lang::Zh, "settings_visual") => "视觉",
+        (Lang::Zh, "settings_parameters") => "参数",
+        (Lang::Zh, "settings_details") => "详细说明",
+        (Lang::Zh, "configured_value") => "配置",
+        (Lang::Zh, "effective_value") => "实际生效",
         (Lang::Zh, "setting_adjust") => "调整",
         (Lang::Zh, "setting_select") => "选择",
         (Lang::Zh, "current_value") => "当前值",
@@ -5036,7 +5005,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "high_shelf_db") => "补偿强度",
         (Lang::Zh, "auto_sensitivity") => "自动灵敏度",
         (Lang::Zh, "noise_reduction") => "降噪",
-        (Lang::Zh, "bpm_analysis") => "BPM 分析",
+        (Lang::Zh, "bpm_analysis") => "BPM 模式",
+        (Lang::Zh, "bpm_mode_onnx") => "ONNX（神经网络）",
+        (Lang::Zh, "bpm_mode_traditional") => "传统",
+        (Lang::Zh, "bpm_mode_off") => "关闭",
         (Lang::Zh, "bpm") => "BPM",
         (Lang::Zh, "visual_curve") => "高度曲线",
         (Lang::Zh, "curve_power") => "曲线指数",
@@ -5049,7 +5021,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "accent_display_off") => "关",
         (Lang::Zh, "accent_threshold") => "重音阈值",
         (Lang::Zh, "ceiling") => "上限",
-        (Lang::Zh, "pipeline") => "音频链路",
         (Lang::Zh, "toolbar") => "工具栏",
         (Lang::Zh, "master") => "master",
         (Lang::Zh, "waveform") => "波形",
@@ -5066,14 +5037,14 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "help_title") => "Terb 终端频谱",
         (Lang::Zh, "help_1") => "↑/↓ 或 j/k 移动选择。",
         (Lang::Zh, "help_2") => "Enter 执行；Space 开始或停止捕获。",
-        (Lang::Zh, "help_3") => "频谱页按 s/p/t/m/w 显示或隐藏设置、链路、工具栏、master、波形。",
-        (Lang::Zh, "help_4") => "↑/↓ 选择设置，Tab 切分类，←/→ 调整；S 打开全屏设置。",
+        (Lang::Zh, "help_3") => "频谱页按 s 打开独立设置；t/m/w 切换工具栏、master 和波形。",
+        (Lang::Zh, "help_4") => "设置页用 ↑/↓ 选择，Tab 切分类，←/→ 调整，q/Esc 返回。",
         (Lang::Zh, "help_5") => "窗口较小时模块会自动隐藏，仍可用快捷键操作；主菜单 q/Esc 退出。",
         (Lang::Zh, "permission_note") => "首次捕获会触发 macOS 屏幕与系统音频录制授权；Terb 只实时分析，不保存音频。",
         (Lang::Zh, "menu_hint") => "↑/↓ 选择 · Enter 确认 · Space 捕获 · ? 帮助 · q 退出",
-        (Lang::Zh, "spectrum_hint") => "Space 捕获 · s/p/t/m/w 模块 · S 设置 · q 菜单",
-        (Lang::Zh, "sidebar_hint") => "Space 开关捕获\ns/p/t/m/w 模块\nTab 分类\n↑/↓ 选择设置\n←/→ 调整\nS 设置\nq 菜单\n? 帮助",
-        (Lang::Zh, "compact_hint") => "s/p/t/m/w 模块 · S 设置 · q 菜单",
+        (Lang::Zh, "spectrum_hint") => "Space 捕获 · s 设置 · t/m/w 模块 · q 菜单",
+        (Lang::Zh, "sidebar_hint") => "Space 开关捕获\ns 打开设置\nt/m/w 显示模块\nq 返回菜单\n? 帮助",
+        (Lang::Zh, "compact_hint") => "s 设置 · t/m/w 模块 · q 菜单",
         (Lang::Zh, "ready") => "准备就绪。",
         (Lang::Zh, "starting") => "正在启动系统音频捕获...",
         (Lang::Zh, "helper_ready") => "捕获进程已就绪，等待音频。",
@@ -5112,7 +5083,12 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "help_setting_high_shelf_db") => "高频补偿强度。过高会让齿音和噪声偏亮。",
         (Lang::Zh, "help_setting_auto_sensitivity") => "自动调整显示增益，兼顾安静和响亮片段。",
         (Lang::Zh, "help_setting_noise_reduction") => "降低底噪和稳态背景对频谱高度的影响。",
-        (Lang::Zh, "help_setting_bpm_analysis") => "启用宽频谱通量节拍分析，并显示 BPM 与 beat 指示。",
+        (Lang::Zh, "help_setting_bpm_analysis") => {
+            "选择 ONNX 神经节拍模型、传统频谱通量算法，或完全关闭 BPM 分析。"
+        }
+        (Lang::Zh, "bpm_detail_onnx") => "内置因果神经网络在后台 CPU 线程运行；音频回调不会执行模型推理。",
+        (Lang::Zh, "bpm_detail_traditional") => "使用频谱通量与自相关，不加载神经网络模型，占用更低。",
+        (Lang::Zh, "bpm_detail_off") => "停止 BPM 特征、推理与解码，不产生节拍显示。",
         (Lang::Zh, "help_setting_visual_curve") => "启用高度曲线，用非线性方式重映射柱高。",
         (Lang::Zh, "help_setting_curve_power") => "高度曲线指数。越高越压低小信号，越低越抬高细节。",
         (Lang::Zh, "help_setting_trail") => "显示峰值残影，方便观察瞬态和频段运动。",
@@ -5142,8 +5118,13 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "config") => "Config",
         (Lang::En, "settings") => "Settings",
         (Lang::En, "settings_general") => "general",
+        (Lang::En, "settings_analysis") => "analysis",
         (Lang::En, "settings_processing") => "processing",
         (Lang::En, "settings_visual") => "visual",
+        (Lang::En, "settings_parameters") => "Parameters",
+        (Lang::En, "settings_details") => "Details",
+        (Lang::En, "configured_value") => "configured",
+        (Lang::En, "effective_value") => "Effective",
         (Lang::En, "setting_adjust") => "adjust",
         (Lang::En, "setting_select") => "select",
         (Lang::En, "current_value") => "Current",
@@ -5164,7 +5145,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "high_shelf_db") => "Shelf Gain",
         (Lang::En, "auto_sensitivity") => "Autosens",
         (Lang::En, "noise_reduction") => "Noise Reduce",
-        (Lang::En, "bpm_analysis") => "BPM Analyze",
+        (Lang::En, "bpm_analysis") => "BPM Mode",
+        (Lang::En, "bpm_mode_onnx") => "ONNX (Neural)",
+        (Lang::En, "bpm_mode_traditional") => "Traditional",
+        (Lang::En, "bpm_mode_off") => "Off",
         (Lang::En, "bpm") => "BPM",
         (Lang::En, "visual_curve") => "Height Curve",
         (Lang::En, "curve_power") => "Curve Power",
@@ -5177,7 +5161,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "accent_display_off") => "Off",
         (Lang::En, "accent_threshold") => "Accent Threshold",
         (Lang::En, "ceiling") => "Ceiling",
-        (Lang::En, "pipeline") => "Pipeline",
         (Lang::En, "toolbar") => "Toolbar",
         (Lang::En, "master") => "master",
         (Lang::En, "waveform") => "Waveform",
@@ -5194,14 +5177,14 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "help_title") => "Terb terminal spectrum",
         (Lang::En, "help_1") => "Use ↑/↓ or j/k to move.",
         (Lang::En, "help_2") => "Enter activates; Space starts or stops capture.",
-        (Lang::En, "help_3") => "In Spectrum, press s/p/t/m/w to show or hide settings, pipeline, toolbar, master, and waveform.",
-        (Lang::En, "help_4") => "Use ↑/↓ to select settings, Tab for groups, and ←/→ to adjust. S opens full-screen settings.",
+        (Lang::En, "help_3") => "In Spectrum, press s for standalone settings; t/m/w toggle toolbar, master, and waveform.",
+        (Lang::En, "help_4") => "In Settings, use ↑/↓ to select, Tab for groups, ←/→ to adjust, and q/Esc to return.",
         (Lang::En, "help_5") => "Small terminals hide modules automatically, but shortcuts still work. q/Esc quits from the main menu.",
         (Lang::En, "permission_note") => "First capture may trigger macOS Screen & System Audio Recording permission. Terb analyzes live audio only and does not save it.",
         (Lang::En, "menu_hint") => "↑/↓ select · Enter confirm · Space capture · ? help · q quit",
-        (Lang::En, "spectrum_hint") => "Space capture · s/p/t/m/w modules · S settings · q menu",
-        (Lang::En, "sidebar_hint") => "Space toggle capture\ns/p/t/m/w modules\nTab groups\n↑/↓ select setting\n←/→ adjust\nS settings\nq menu\n? help",
-        (Lang::En, "compact_hint") => "s/p/t/m/w modules · S settings · q menu",
+        (Lang::En, "spectrum_hint") => "Space capture · s settings · t/m/w modules · q menu",
+        (Lang::En, "sidebar_hint") => "Space toggle capture\ns open settings\nt/m/w modules\nq menu\n? help",
+        (Lang::En, "compact_hint") => "s settings · t/m/w modules · q menu",
         (Lang::En, "ready") => "Ready.",
         (Lang::En, "starting") => "Starting system-audio capture...",
         (Lang::En, "helper_ready") => "Capture helper is ready; waiting for audio.",
@@ -5240,7 +5223,12 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "help_setting_high_shelf_db") => "High-shelf gain. Too much can make hiss and sibilance too prominent.",
         (Lang::En, "help_setting_auto_sensitivity") => "Adapts display gain across quiet and loud passages.",
         (Lang::En, "help_setting_noise_reduction") => "Reduces floor noise and steady background energy in the visual output.",
-        (Lang::En, "help_setting_bpm_analysis") => "Enables wideband spectral-flux tempo tracking and beat indicators.",
+        (Lang::En, "help_setting_bpm_analysis") => {
+            "Selects the ONNX neural beat model, traditional spectral-flux tracker, or disables BPM analysis."
+        }
+        (Lang::En, "bpm_detail_onnx") => "The bundled causal neural model runs on a background CPU thread; inference never runs in the audio callback.",
+        (Lang::En, "bpm_detail_traditional") => "Uses spectral flux and autocorrelation without loading the neural model, reducing resource use.",
+        (Lang::En, "bpm_detail_off") => "Stops BPM feature extraction, inference, decoding, and beat display.",
         (Lang::En, "help_setting_visual_curve") => "Applies nonlinear height mapping to the spectrum.",
         (Lang::En, "help_setting_curve_power") => "Height curve exponent. Higher values suppress small signals more.",
         (Lang::En, "help_setting_trail") => "Shows a peak trail for transients and band movement.",
@@ -5271,7 +5259,12 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "settings") => "設定",
         (Lang::Ja, "settings_general") => "一般",
         (Lang::Ja, "settings_analysis") => "解析",
+        (Lang::Ja, "settings_processing") => "処理",
         (Lang::Ja, "settings_visual") => "表示",
+        (Lang::Ja, "settings_parameters") => "パラメータ",
+        (Lang::Ja, "settings_details") => "詳細",
+        (Lang::Ja, "configured_value") => "設定値",
+        (Lang::Ja, "effective_value") => "実効値",
         (Lang::Ja, "setting_adjust") => "調整",
         (Lang::Ja, "setting_select") => "選択",
         (Lang::Ja, "current_value") => "現在値",
@@ -5292,7 +5285,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "high_shelf_db") => "補正量",
         (Lang::Ja, "auto_sensitivity") => "自動感度",
         (Lang::Ja, "noise_reduction") => "ノイズ低減",
-        (Lang::Ja, "bpm_analysis") => "BPM 解析",
+        (Lang::Ja, "bpm_analysis") => "BPM モード",
+        (Lang::Ja, "bpm_mode_onnx") => "ONNX（ニューラル）",
+        (Lang::Ja, "bpm_mode_traditional") => "従来方式",
+        (Lang::Ja, "bpm_mode_off") => "オフ",
         (Lang::Ja, "bpm") => "BPM",
         (Lang::Ja, "visual_curve") => "高さ曲線",
         (Lang::Ja, "curve_power") => "曲線指数",
@@ -5305,7 +5301,6 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "accent_display_off") => "オフ",
         (Lang::Ja, "accent_threshold") => "アクセント閾値",
         (Lang::Ja, "ceiling") => "上限",
-        (Lang::Ja, "pipeline") => "音声チェーン",
         (Lang::Ja, "toolbar") => "ツールバー",
         (Lang::Ja, "master") => "master",
         (Lang::Ja, "waveform") => "波形",
@@ -5322,14 +5317,14 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "help_title") => "Terb ターミナルスペクトラム",
         (Lang::Ja, "help_1") => "↑/↓ または j/k で移動します。",
         (Lang::Ja, "help_2") => "Enter で実行、Space でキャプチャ開始/停止。",
-        (Lang::Ja, "help_3") => "スペクトラム画面では s/p/t/m/w で設定、チェーン、ツールバー、master、波形を表示/非表示にします。",
-        (Lang::Ja, "help_4") => "↑/↓ で設定選択、Tab で分類切替、←/→ で変更。S で全画面設定。",
+        (Lang::Ja, "help_3") => "スペクトラム画面では s で独立設定を開き、t/m/w でツールバー、master、波形を切り替えます。",
+        (Lang::Ja, "help_4") => "設定画面では ↑/↓ で選択、Tab で分類、←/→ で変更、q/Esc で戻ります。",
         (Lang::Ja, "help_5") => "小さいウィンドウではモジュールを自動で隠しますが、ショートカットは使えます。メインメニューでは q/Esc で終了します。",
         (Lang::Ja, "permission_note") => "初回キャプチャでは macOS の画面とシステム音声録音権限が必要です。Terb はリアルタイム解析のみ行い、音声を保存しません。",
         (Lang::Ja, "menu_hint") => "↑/↓ 選択 · Enter 決定 · Space キャプチャ · ? ヘルプ · q 終了",
-        (Lang::Ja, "spectrum_hint") => "Space キャプチャ · s/p/t/m/w モジュール · S 設定 · q メニュー",
-        (Lang::Ja, "sidebar_hint") => "Space キャプチャ切替\ns/p/t/m/w モジュール\nTab 分類\n↑/↓ 設定選択\n←/→ 変更\nS 設定\nq メニュー\n? ヘルプ",
-        (Lang::Ja, "compact_hint") => "s/p/t/m/w モジュール · S 設定 · q メニュー",
+        (Lang::Ja, "spectrum_hint") => "Space キャプチャ · s 設定 · t/m/w モジュール · q メニュー",
+        (Lang::Ja, "sidebar_hint") => "Space キャプチャ切替\ns 設定\nt/m/w モジュール\nq メニュー\n? ヘルプ",
+        (Lang::Ja, "compact_hint") => "s 設定 · t/m/w モジュール · q メニュー",
         (Lang::Ja, "ready") => "準備完了。",
         (Lang::Ja, "starting") => "システム音声キャプチャを開始しています...",
         (Lang::Ja, "helper_ready") => "キャプチャヘルパーは準備完了。音声を待っています。",
@@ -5368,7 +5363,12 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "help_setting_high_shelf_db") => "高域補正量です。上げすぎるとノイズが目立ちます。",
         (Lang::Ja, "help_setting_auto_sensitivity") => "静かな部分と大きい部分に合わせて表示ゲインを調整します。",
         (Lang::Ja, "help_setting_noise_reduction") => "底ノイズや定常成分の表示への影響を抑えます。",
-        (Lang::Ja, "help_setting_bpm_analysis") => "広帯域スペクトルフラックスで BPM と拍表示を解析します。",
+        (Lang::Ja, "help_setting_bpm_analysis") => {
+            "ONNX ニューラル拍モデル、従来のスペクトルフラックス方式、または BPM 解析オフを選択します。"
+        }
+        (Lang::Ja, "bpm_detail_onnx") => "内蔵の因果ニューラルモデルを CPU のバックグラウンドスレッドで実行し、音声コールバックでは推論しません。",
+        (Lang::Ja, "bpm_detail_traditional") => "ニューラルモデルを読み込まず、スペクトルフラックスと自己相関で解析します。",
+        (Lang::Ja, "bpm_detail_off") => "BPM 特徴抽出、推論、デコード、拍表示を停止します。",
         (Lang::Ja, "help_setting_visual_curve") => "スペクトラム高さに非線形カーブを適用します。",
         (Lang::Ja, "help_setting_curve_power") => "高さ曲線の指数です。高いほど小信号を抑えます。",
         (Lang::Ja, "help_setting_trail") => "ピーク残像を表示し、瞬間的な動きを見やすくします。",
@@ -5514,7 +5514,7 @@ mod tests {
 
         assert_eq!(app.bpm_pulse, 1.0);
         assert!(app.bpm_phase < 0.10);
-        assert!(beat_phase_bar(&app, 8).contains('●'));
+        assert_eq!(beat_indicator_span(&app).content.as_ref(), "●");
     }
 
     #[test]
@@ -5582,11 +5582,50 @@ mod tests {
     }
 
     #[test]
-    fn localized_module_title_uses_bracketed_hotkey() {
+    fn localized_toolbar_title_uses_bracketed_hotkey() {
         let app = App::new(Config::default());
-        let line = module_title_line(&app, 'p', "pipeline");
+        let line = module_title_line(&app, 't', "toolbar");
 
-        assert_eq!(line_text(&line), "[p] 音频链路");
+        assert_eq!(line_text(&line), "[t] 工具栏");
+    }
+
+    #[test]
+    fn removed_embedded_panels_are_ignored_by_config() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "settings": {
+                    "language": "zh",
+                    "theme": "Spring",
+                    "bar_count": 72,
+                    "show_settings_panel": true,
+                    "show_pipeline_panel": true
+                }
+            }"#,
+        )
+        .expect("old panel flags should be ignored");
+        let json = serde_json::to_string(&config).expect("config should serialize");
+
+        assert!(!json.contains("show_settings_panel"));
+        assert!(!json.contains("show_pipeline_panel"));
+        assert_eq!(left_module_height(&config.settings), 7);
+    }
+
+    #[test]
+    fn settings_details_show_effective_fft_latency() {
+        let mut config = Config::default();
+        config.settings.analysis_preset = AnalysisPreset::Custom;
+        config.settings.fft_size = 2048;
+        let app = App::new(config);
+        let row = settings_rows(&app)
+            .into_iter()
+            .find(|row| row.key == "fft_size")
+            .expect("FFT setting should exist");
+
+        assert_eq!(
+            setting_runtime_detail(&app, &row).as_deref(),
+            Some("2048 samples · 42.7 ms @ 48 kHz")
+        );
     }
 
     #[test]
@@ -6166,7 +6205,59 @@ mod tests {
         .expect("legacy config should still load");
 
         assert_eq!(config.settings.renderer, SpectrumRenderer::Blocks);
+        assert_eq!(config.settings.bpm_mode, BpmMode::Onnx);
         assert_eq!(App::new(config).theme_id, ThemeId::Spring);
+    }
+
+    #[test]
+    fn legacy_disabled_bpm_migrates_to_off_mode() {
+        let mut config: Config = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "settings": {
+                    "language": "zh",
+                    "theme": "Spring",
+                    "bar_count": 72,
+                    "bpm_enabled": false
+                }
+            }"#,
+        )
+        .expect("legacy config should still load");
+
+        config.settings.normalize();
+
+        assert_eq!(config.settings.bpm_mode, BpmMode::Off);
+        assert!(config.settings.bpm_enabled);
+    }
+
+    #[test]
+    fn bpm_mode_serializes_without_legacy_boolean() {
+        let mut config = Config::default();
+        config.settings.bpm_mode = BpmMode::Traditional;
+
+        let json = serde_json::to_string(&config).expect("config should serialize");
+
+        assert!(json.contains("\"bpm_mode\":\"traditional\""));
+        assert!(!json.contains("bpm_enabled"));
+    }
+
+    #[test]
+    fn bpm_mode_cycle_resets_estimate_without_loading_onnx() {
+        let mut config = Config::default();
+        config.settings.bpm_mode = BpmMode::Off;
+        let mut app = App::new(config);
+        app.bpm_estimate = Some(128.0);
+        app.bpm_confidence = 0.9;
+
+        app.cycle_bpm_mode(-1);
+
+        assert_eq!(app.config.settings.bpm_mode, BpmMode::Traditional);
+        assert!(app.bpm.is_none());
+        assert!(app.bpm_estimate.is_none());
+        assert_eq!(app.bpm_confidence, 0.0);
+
+        app.cycle_bpm_mode(1);
+        assert_eq!(app.config.settings.bpm_mode, BpmMode::Off);
     }
 
     #[test]

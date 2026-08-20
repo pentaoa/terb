@@ -1,0 +1,67 @@
+{
+  "model": "bounded-causal-small-transformer-v2-giantsteps-distilled",
+  "source_checkpoint": "runs/local84-small0-giantsteps-distilled-r2/epoch-001.ckpt",
+  "training_seed": 20260819,
+  "input_shape": [1, 112, 128],
+  "attention_context_per_layer": 84,
+  "past_receptive_frames": 751,
+  "future_lookahead_frames": 4,
+  "parameters": 2099960,
+  "opset": 17,
+  "model_bytes": 9333229,
+  "sha256": "4253259ff3e3f8536d106c23e3d39658a4ceef82ea0b0897802b64d19956867a",
+  "runtime": "rten-0.24-fp32",
+  "inference_hop_frames": 10,
+  "max_algorithmic_delay_ms": 260,
+  "distillation": {
+    "teacher": "Beat This! small0",
+    "giantsteps_recordings": 40,
+    "tempo_labels_used_as_beat_labels": false,
+    "teacher_loss_weight": 1.0
+  },
+  "guitarset_validation": {
+    "recordings": 27,
+    "strict_accuracy": 0.8888888888888888,
+    "metrical_accuracy": 0.9629629629629629,
+    "half_time_rate": 0.07407407407407407,
+    "wrong_rate": 0.037037037037037035,
+    "accuracy_4s": 0.8518518518518519
+  },
+  "gtzan_test": {
+    "recordings": 999,
+    "strict_accuracy": 0.7667667667667668,
+    "metrical_accuracy": 0.924924924924925,
+    "half_time_rate": 0.06306306306306306,
+    "double_time_rate": 0.09509509509509509,
+    "wrong_rate": 0.07507507507507508,
+    "accuracy_4s": 0.6446446446446447,
+    "accuracy_8s": 0.7047047047047047,
+    "accuracy_16s": 0.7417417417417418,
+    "accuracy_30s": 0.7667667667667668
+  },
+  "giantsteps_sealed_test": {
+    "recordings": 20,
+    "strict_accuracy": 0.55,
+    "metrical_accuracy": 0.55,
+    "half_time_rate": 0.0,
+    "double_time_rate": 0.0,
+    "wrong_rate": 0.45,
+    "accuracy_4s": 0.60,
+    "accuracy_8s": 0.60,
+    "accuracy_16s": 0.55,
+    "accuracy_30s": 0.55,
+    "mean_lock_seconds": 5.2992001,
+    "mean_jitter_bpm": 2.6730258
+  },
+  "cpu_smoke": {
+    "platform": "linux-x86_64",
+    "audio_seconds": 155.68975,
+    "input_sample_rate": 48000,
+    "chunk_samples": 512,
+    "realtime_factor": 0.22597744050587787,
+    "feature_seconds": 0.10770655000000004,
+    "inference_seconds": 34.53297912500004,
+    "decoder_seconds": 0.5154164219999995,
+    "peak_memory_bytes": 138260480
+  }
+}

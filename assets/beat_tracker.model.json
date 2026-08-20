@@ -1,0 +1,76 @@
+{
+  "model": "tiny-causal-tcn-guitarset-v1",
+  "created": "2026-08-18",
+  "training_dataset": "Beat This! GuitarSet spectrograms",
+  "annotation_version": "beat_this_annotations v1.1 (890407d158078527ab396b49fea3c8a83e5734ee)",
+  "split": {
+    "train_recordings": 153,
+    "validation_recordings": 27,
+    "gtzan_used_for_training": false
+  },
+  "seed": 20260818,
+  "epochs": 10,
+  "features": {
+    "sample_rate": 22050,
+    "fft": 1024,
+    "hop": 441,
+    "mel_bands": 128,
+    "fps": 50,
+    "lookahead_ms": 23.22
+  },
+  "network": {
+    "type": "causal TCN",
+    "parameters": 189378,
+    "onnx_opset": 17,
+    "beat_output": true,
+    "downbeat_output": true
+  },
+  "model_bytes": 767780,
+  "model_sha256": "b2086ee61da2ddf1e560da5efe00318a5381caa2b4ff03a8210076211e634f0a",
+  "manifest_sha256": "d59854806d0af9f158deabed86ad40e1a297ee2f7c1953cde09ca803f1e39d59",
+  "best_validation_loss": 1.9979364121401753,
+  "validation_metrics": {
+    "split": "validation",
+    "recordings": 27,
+    "beat_f1": 0.4938795873898413,
+    "downbeat_f1": 0.29481052142876085,
+    "strict_accuracy": 0.7407407407407407,
+    "metrical_accuracy": 0.8518518518518519,
+    "half_time_rate": 0.1111111111111111,
+    "double_time_rate": 0.0,
+    "wrong_rate": 0.14814814814814814,
+    "accuracy_4s": 0.5185185185185185,
+    "accuracy_8s": 0.5925925925925926,
+    "accuracy_16s": 0.6296296296296297,
+    "accuracy_30s": 0.7407407407407407
+  },
+  "cpu_smoke": {
+    "platform": "x86_64 Linux",
+    "audio_seconds": 30,
+    "input_rate": 48000,
+    "chunk": 512,
+    "realtime_factor": 0.1722,
+    "peak_rss_bytes": 20652032
+  },
+  "limitations": [
+    "Trained only on GuitarSet; GTZAN strict test accuracy is 34.3%.",
+    "High 24.5% half-time error on GTZAN.",
+    "Not integrated into the TUI and does not replace the legacy analyzer.",
+    "Legacy comparison needs real waveform audio; Zenodo distributes spectrograms."
+  ],
+  "held_out_test": {
+    "split": "test",
+    "recordings": 999,
+    "beat_f1": 0.3120699384716567,
+    "downbeat_f1": 0.12207295500220347,
+    "strict_accuracy": 0.3433433433433433,
+    "metrical_accuracy": 0.6236236236236236,
+    "half_time_rate": 0.24524524524524524,
+    "double_time_rate": 0.035035035035035036,
+    "wrong_rate": 0.3763763763763764,
+    "accuracy_4s": 0.23723723723723725,
+    "accuracy_8s": 0.26326326326326327,
+    "accuracy_16s": 0.2932932932932933,
+    "accuracy_30s": 0.34134134134134136
+  }
+}

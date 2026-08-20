@@ -2,3 +2,12 @@
 /target/
 /dist/
 *.log
+
+# Local datasets, training runs, and exported weights
+/data/
+/runs/
+*.mel.npy
+
+/.venv/
+__pycache__/
+*.pyc

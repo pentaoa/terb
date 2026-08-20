@@ -1,15 +1,11 @@
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct BandStats {
-    pub(crate) average: f32,
-    pub(crate) rms: f32,
-    pub(crate) peak: f32,
+pub struct BandStats {
+    pub average: f32,
+    pub rms: f32,
+    pub peak: f32,
 }
 
-pub(crate) fn sample_frequency_band(
-    magnitudes: &[f32],
-    lower_bin: f32,
-    upper_bin: f32,
-) -> BandStats {
+pub fn sample_frequency_band(magnitudes: &[f32], lower_bin: f32, upper_bin: f32) -> BandStats {
     if magnitudes.is_empty() {
         return BandStats {
             average: 0.0,
@@ -46,7 +42,7 @@ pub(crate) fn sample_frequency_band(
     }
 }
 
-pub(crate) fn sample_magnitude(magnitudes: &[f32], bin: f32) -> f32 {
+pub fn sample_magnitude(magnitudes: &[f32], bin: f32) -> f32 {
     if magnitudes.is_empty() {
         return 0.0;
     }

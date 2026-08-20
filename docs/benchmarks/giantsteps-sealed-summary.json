@@ -1,0 +1,23 @@
+{
+  "dataset": "GiantSteps Tempo sealed subset",
+  "selection": "20 MD5-verified previews; two sorted, previously unused IDs per each of 10 common genres",
+  "tolerance": 0.04,
+  "audio_redistributed": false,
+  "algorithms": {
+    "beat-this-small-reference": {"count":20,"strict":0.70,"metrical":0.75,"half":0.05,"double":0.0,"wrong":0.25,"unstable":0.0,"accuracy_4s":0.65,"accuracy_8s":0.60,"accuracy_16s":0.65,"accuracy_30s":0.70,"rtf":0.01792},
+    "causal-transformer": {"count":20,"strict":0.55,"metrical":0.55,"half":0.0,"double":0.0,"wrong":0.45,"unstable":0.0,"accuracy_4s":0.60,"accuracy_8s":0.60,"accuracy_16s":0.55,"accuracy_30s":0.55,"mean_lock_seconds":5.2992,"mean_jitter_bpm":2.6730,"rtf":0.21503},
+    "legacy": {"count":20,"strict":0.25,"metrical":0.55,"half":0.30,"double":0.0,"wrong":0.20,"unstable":0.25,"accuracy_4s":0.25,"accuracy_8s":0.25,"accuracy_16s":0.25,"accuracy_30s":0.25,"mean_lock_seconds":4.9244,"mean_jitter_bpm":0.0411,"rtf":0.00422}
+  },
+  "strict_by_genre": {
+    "breaks": {"beat-this-small-reference":1.0,"causal-transformer":1.0,"legacy":0.0},
+    "deep-house": {"beat-this-small-reference":0.0,"causal-transformer":0.0,"legacy":0.0},
+    "drum-and-bass": {"beat-this-small-reference":1.0,"causal-transformer":0.0,"legacy":0.0},
+    "dubstep": {"beat-this-small-reference":0.5,"causal-transformer":1.0,"legacy":0.5},
+    "electro-house": {"beat-this-small-reference":1.0,"causal-transformer":1.0,"legacy":0.0},
+    "electronica": {"beat-this-small-reference":0.0,"causal-transformer":0.0,"legacy":0.0},
+    "house": {"beat-this-small-reference":1.0,"causal-transformer":1.0,"legacy":0.0},
+    "psy-trance": {"beat-this-small-reference":1.0,"causal-transformer":1.0,"legacy":1.0},
+    "techno": {"beat-this-small-reference":0.5,"causal-transformer":0.5,"legacy":0.5},
+    "trance": {"beat-this-small-reference":1.0,"causal-transformer":0.0,"legacy":0.5}
+  }
+}
