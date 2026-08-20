@@ -4,9 +4,9 @@ use rustfft::{num_complex::Complex, Fft, FftPlanner};
 
 use crate::analysis::sample_frequency_band;
 
-pub(crate) const BPM_MIN: f32 = 60.0;
-pub(crate) const BPM_MAX: f32 = 210.0;
-pub(crate) const BPM_PULSE_DECAY_SECONDS: f32 = 0.18;
+pub const BPM_MIN: f32 = 60.0;
+pub const BPM_MAX: f32 = 210.0;
+pub const BPM_PULSE_DECAY_SECONDS: f32 = 0.18;
 
 const BPM_FFT_SIZE: usize = 2048;
 const BPM_HOP_SIZE: usize = 512;
@@ -20,13 +20,13 @@ const BPM_ESTIMATE_INTERVAL_FRAMES: usize = 16;
 const BPM_SILENCE_GATE: f32 = 0.000_12;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct BpmEstimate {
-    pub(crate) bpm: f32,
-    pub(crate) confidence: f32,
+pub struct BpmEstimate {
+    pub bpm: f32,
+    pub confidence: f32,
 }
 
 #[derive(Clone)]
-pub(crate) struct BpmAnalyzer {
+pub struct BpmAnalyzer {
     sample_rate: f32,
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
@@ -51,7 +51,7 @@ struct OnsetFrame {
 }
 
 impl BpmAnalyzer {
-    pub(crate) fn new(sample_rate: f32) -> Self {
+    pub fn new(sample_rate: f32) -> Self {
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(BPM_FFT_SIZE);
         let window: Vec<f32> = (0..BPM_FFT_SIZE)
@@ -80,12 +80,12 @@ impl BpmAnalyzer {
         }
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         let sample_rate = self.sample_rate;
         *self = Self::new(sample_rate);
     }
 
-    pub(crate) fn consume(&mut self, samples: &[f32]) -> Option<BpmEstimate> {
+    pub fn consume(&mut self, samples: &[f32]) -> Option<BpmEstimate> {
         if samples.is_empty() {
             return None;
         }
