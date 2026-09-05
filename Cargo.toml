@@ -8,11 +8,19 @@ readme = "README.md"
 keywords = ["tui", "audio", "spectrum", "macos", "terminal"]
 categories = ["command-line-utilities", "multimedia::audio"]
 build = "build.rs"
+default-run = "terb"
+
+[profile.dev]
+opt-level = 1
+
+# Keep CPU inference and FFT usable when developing with `cargo run`.
+[profile.dev.package."*"]
+opt-level = 3
 
 [dependencies]
 crossterm = "0.29"
 hound = "3.5"
-ratatui = "0.30"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 rten = { version = "0.24", features = ["fft"] }
 rten-tensor = "0.24"
 rustfft = "6"

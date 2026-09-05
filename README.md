@@ -1,54 +1,177 @@
-# Terb
+<h1 align="center">terb</h1>
 
-Terb is a restrained terminal spectrum visualizer for macOS system audio. The TUI follows the same Rust stack as `toptimer`: `ratatui`, `crossterm`, JSON config, and a single terminal-first binary.
+<p align="center">
+  <a href="README.zh-CN.md">简体中文</a> · <strong>English</strong>
+</p>
 
-System audio capture on macOS is handled by a small Swift helper compiled during `cargo build`. The helper uses ScreenCaptureKit and streams interleaved stereo `f32` PCM samples to the Rust TUI.
+<p align="center">
+  <strong>System audio, in your terminal.</strong><br>
+  Live spectrum, waveform, and beat tracking for macOS.
+</p>
 
-## Requirements
+<p align="center">
+  <img alt="macOS 14 or newer" src="https://img.shields.io/badge/macOS-14%2B-111111?style=flat-square">
+  <img alt="Rust stable" src="https://img.shields.io/badge/Rust-stable-111111?style=flat-square">
+  <img alt="Ratatui terminal interface" src="https://img.shields.io/badge/TUI-ratatui-FFA4A4?style=flat-square">
+  <img alt="ONNX inference on CPU" src="https://img.shields.io/badge/ONNX-CPU-555555?style=flat-square">
+</p>
 
-- macOS 14 or newer
-- Swift compiler from Xcode or Xcode Command Line Tools
-- Rust stable
+<p align="center">
+  <a href="#quick-start"><strong>Get started</strong></a> ·
+  <a href="#what-it-shows">Features</a> ·
+  <a href="#controls">Controls</a> ·
+  <a href="#configuration">Config</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#documentation">Docs</a>
+</p>
 
-## Run
+<p align="center">
+  <img src="assets/terb-hero.svg" alt="terb ASCII wordmark surrounded by a pastel spectrum illustration" width="100%">
+</p>
+
+`terb` turns the audio already playing on your Mac into a spectrum you can shape. A transparent terminal canvas, three restrained palettes, and a single-row toolbar keep the music in view. Audio is analyzed locally without saving a recording.
+
+## Quick Start
+
+**Requires:** macOS 14+, Rust stable, and the Swift compiler from Xcode or Xcode Command Line Tools.
 
 ```bash
-cargo run
+git clone https://github.com/pentaoa/terb.git
+cd terb
+cargo run --release --locked
 ```
 
-On first capture, macOS may ask for Screen & System Audio Recording permission. If permission is denied, open System Settings and allow the terminal or Terb helper, then start capture again.
+Play some audio, then press **Space** to start. The Swift capture helper is compiled automatically during the build. Use the release build for normal listening.
 
-## Keys
+> [!NOTE]
+> On first capture, macOS may request **Screen & System Audio Recording** permission. If capture is denied, allow your terminal or the Terb helper in System Settings, then press Space to try again.
 
-- Start screen: full-screen ASCII main menu.
-- `↑/↓` or `j/k`: move menu selection or sidebar setting selection.
-- `Enter`: activate the selected main-menu item.
-- `Space`: start/stop capture.
-- In Spectrum, `←/→` or `h/l`: adjust the selected settings row while the spectrum keeps updating.
-- In Spectrum, `s`, `p`, `t`, `m`, and `w`: show or hide Settings, Pipeline, Toolbar, Master, and Waveform modules.
-- `S`: open the compact full-screen settings panel. This is useful when the terminal is too narrow and the modules are hidden.
-- `q` or `Esc` in Spectrum: return to the main menu.
-- `?`: help.
-- `q` or `Esc` on the main menu: quit.
+Transparency follows your terminal profile. Terb leaves the background at its terminal default; set opacity in your terminal app.
 
-Refresh rate is adjustable in Settings: 12, 24, 30, 45, 60, 90, 120, 144, 165, or 240 Hz.
-Low Latency is the default analysis preset (1024-point FFT, 256-sample hop, 90 Hz refresh); Balanced and Precision remain available when steadier low-frequency resolution matters more than response time.
+## What It Shows
 
-Spectrum rendering and processing are also adjustable from the sidebar or settings panel:
-renderer mode (blocks, Braille, or CAVA-style stepped characters), frequency bands,
-FFT size, analysis hop, refresh rate, high-shelf compensation, shelf gain,
-adaptive sensitivity, noise reduction, BPM analysis, height curve, curve power,
-spectrum trail, trail decay, accent display, accent threshold, and limiter ceiling.
-The full settings panel shows the current value, valid range, and step for the selected row.
-Key adjustable ranges are: 8-256 base frequency bands, 512-16384 FFT size, 64-4096 analysis hop, 2-100% attack, 0-99.5% release, 0-36 dB shelf gain, 0-95% noise reduction, 0.25-2.50 curve power, 20-99.5% trail decay, 2-98% accent threshold, and 35-100% limiter ceiling.
-The spectrum uses dB-style band normalization plus visualizer-style adaptive sensitivity. A physically mapped spectrum can sit low and rarely touch the top, which is normal for real audio dynamics, but Terb's autosens now follows the CAVA-style rule of slowly increasing gain while bars do not peak and reducing gain faster when peaks approach the ceiling.
-Accent display detects sudden spectrum-energy lifts using the adjustable accent threshold. Trace mode waits for the rise to settle, captures a low-pass-smoothed peak envelope, glides it upward over 0.1 seconds with a height-proportional offset, and renders an interpolated Braille line that fades toward the background over 0.5 seconds. Note-name mode instead fades compact note labels into empty spectrum cells over 0.1 seconds and fades them out over 0.5 seconds; the same note class keeps the same distribution.
-Themes are deliberately static and restrained. Spring is the default soft palette, Vintage uses muted green, parchment, clay, and wine tones, and Mono stays neutral. Spectrum color changes only with bar height.
-The limiter ceiling controls analysis headroom; the meter still maps that ceiling to full height.
-The pipeline module exposes the main stages: capture, pre-analysis windowing, FFT, detector shaping, post-processing, and tempo estimation. Incoming audio is analyzed immediately without an added visual delay. BPM uses a live onset-strength envelope from wideband spectral flux, a rolling autocorrelation window, and continuity-aware tempo selection rather than simple low-frequency peak counting.
+| View | What you get |
+| --- | --- |
+| **Spectrum** | Blocks, Braille, or CAVA-style stepped bars that expand with the terminal |
+| **Waveform** | A signed waveform rendered with Braille subpixels |
+| **Stereo meter** | Separate left/right levels beside the spectrum |
+| **Beat tracking** | BPM and a beat pulse, with ONNX, Traditional, and Off modes |
+| **Trails & accents** | Fading peaks, rising accent contours, or note-name bursts |
+| **Themes** | Spring, Vintage, and Mono; all preserve the terminal background |
 
-The Spectrum view is module-based: large terminals can show settings, pipeline, toolbar, waveform, and a right-side stereo master meter at the same time. Small terminals automatically hide side modules and keep the spectrum readable.
-The waveform module always renders with Braille subpixels, sampling two virtual columns and four virtual rows per terminal cell.
-The master meter also renders with Braille subpixels, softly fading from the border/background color near the bottom toward the current theme accent near the top.
+The toolbar holds **start/pause · settings · help**, with BPM at the right when enabled. Hide it to give the row back to the spectrum. Smaller windows shorten the labels and hide meters as needed. Permission and capture errors remain visible when the toolbar is hidden.
 
-Config is stored at `~/.config/terb/config.json`.
+## Controls
+
+| Where | Key | Action |
+| --- | --- | --- |
+| Menu / Spectrum / Settings | <kbd>Space</kbd> | Start or pause capture; stays in Settings when used there |
+| Menu / Settings | <kbd>↑</kbd> <kbd>↓</kbd> or <kbd>j</kbd> <kbd>k</kbd> | Move the selection |
+| Menu | <kbd>Enter</kbd> | Open the selected item |
+| Menu / Spectrum | <kbd>s</kbd> | Open Settings |
+| Spectrum | <kbd>t</kbd> / <kbd>m</kbd> / <kbd>w</kbd> | Toggle toolbar / stereo meter / waveform |
+| Settings | <kbd>←</kbd> <kbd>→</kbd> or <kbd>h</kbd> <kbd>l</kbd> | Adjust and save the selected setting |
+| Settings | <kbd>Tab</kbd> / <kbd>Shift</kbd> + <kbd>Tab</kbd> | Next / previous category |
+| Settings | <kbd>s</kbd>, <kbd>q</kbd>, or <kbd>Esc</kbd> | Return to the page that opened Settings |
+| Any view | <kbd>?</kbd> | Open help; press again to return |
+| Help | <kbd>Enter</kbd>, <kbd>q</kbd>, or <kbd>Esc</kbd> | Return to the page that opened help |
+| Spectrum | <kbd>q</kbd> or <kbd>Esc</kbd> | Return to the main menu |
+| Menu | <kbd>q</kbd> or <kbd>Esc</kbd> | Quit |
+
+Audio analysis continues while Settings or help is open. Pausing capture holds the last visual frame.
+
+## Configuration
+
+Open **Settings** with <kbd>s</kbd>. Changes save immediately to `~/.config/terb/config.json`. The interface supports **中文 · English · 日本語**.
+
+### Analysis presets
+
+| Preset | FFT size | Analysis hop | Refresh rate |
+| --- | ---: | ---: | ---: |
+| **Low Latency** — default | 1,024 | 256 | 90 Hz |
+| Balanced | 2,048 | 512 | 60 Hz |
+| Precision | 8,192 | 2,048 | 45 Hz |
+
+Low Latency favors response; larger FFT windows give finer frequency resolution. Each preset also sets attack and release. Individual adjustments allow a custom setup.
+
+### Display & processing
+
+| Group | Settings |
+| --- | --- |
+| Appearance | Theme, renderer, frequency bands, toolbar, stereo meter, waveform |
+| Motion | Attack/release, spectrum trail and decay, accent mode and threshold |
+| Spectrum | FFT size, analysis hop, refresh rate, adaptive sensitivity, noise reduction |
+| Tone & height | High-shelf compensation and gain, height curve and power, limiter ceiling |
+| Tempo | ONNX model, traditional spectral-flux analysis, or Off |
+
+The default view uses **Spring**, **Blocks**, and **72 base frequency bands**, with the toolbar and stereo meter visible. The waveform starts hidden. Display resolution adapts to terminal width; the settings panel shows configured and effective values where they differ.
+
+<details>
+<summary>Adjustable ranges</summary>
+
+| Setting | Range |
+| --- | --- |
+| Base frequency bands | 8–256 |
+| FFT size / analysis hop | 512–16,384 / 64–4,096 samples |
+| Refresh rate | 12, 24, 30, 45, 60, 90, 120, 144, 165, 240 Hz |
+| Attack / release | 2–100% / 0–99.5% |
+| High-shelf gain | 0–36 dB |
+| Noise reduction | 0–95% |
+| Height curve power | 0.25–2.50 |
+| Trail decay | 20–99.5% |
+| Accent threshold | 2–98% |
+| Limiter ceiling | 35–100% |
+
+</details>
+
+## How It Works
+
+A small Swift helper captures system audio through **ScreenCaptureKit** and streams stereo `f32` PCM to Rust. Spectrum analysis processes every complete FFT window at the selected hop; the terminal draws the latest result at its own refresh rate.
+
+```mermaid
+flowchart LR
+    A[macOS system audio] --> B[ScreenCaptureKit]
+    B --> C[Stereo PCM]
+    C --> D[FFT + spectrum processing]
+    C --> E[BPM analysis]
+    D --> F[Ratatui display]
+    E --> F
+```
+
+The default BPM mode runs an embedded ONNX model on a bounded CPU worker using **RTen**. Inference stays off the audio/UI thread. Traditional mode uses spectral flux and rolling autocorrelation; Off skips tempo analysis. A new capture resets analysis history, and dropped BPM blocks invalidate stale history.
+
+Adaptive sensitivity lifts quiet input gradually and reduces gain when peaks approach the ceiling. Accent contours fade upward after an energy rise; note-name mode places fading labels in empty spectrum cells. Themes change foreground colors without filling the background.
+
+<details>
+<summary>Project layout</summary>
+
+```text
+assets/beat_tracker.onnx        Embedded beat model
+macos/SystemAudioHelper.swift  ScreenCaptureKit capture helper
+src/main.rs                    Terminal views, controls, spectrum processing
+src/analysis.rs                Spectrum sampling utilities
+src/beat.rs                    ONNX worker and beat decoder
+src/bpm.rs                     Traditional tempo analysis
+src/features.rs                Streaming Mel features
+src/bin/                       Offline BPM and benchmark tools
+docs/                          Model notes, data provenance, experiments
+```
+
+</details>
+
+## Development
+
+```bash
+cargo test --all-targets --locked
+cargo build --release --locked --bins
+```
+
+Development builds optimize the inference and FFT dependencies while retaining debug information. Offline tests cover signal processing, rendering, and navigation; live capture is a separate manual check.
+
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [Current beat model](docs/current-beat-model.zh-CN.md) | Model, streaming features, scheduling, and latency — 中文 |
+| [Dataset provenance](docs/beat-data.zh-CN.md) | Training/evaluation data sources and attribution — 中文 |
+| [Sealed benchmark report](docs/benchmarks/giantsteps-sealed-report.md) | Recorded GiantSteps evaluation results |

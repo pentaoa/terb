@@ -61,7 +61,6 @@ pub struct RealtimeBeatTracker {
     feature_frames: Vec<MelFrame>,
     pending_rms: VecDeque<f32>,
     decoder: ActivationDecoder,
-    output: Option<BeatEstimate>,
     feature_seconds: f64,
     inference_seconds: f64,
     decode_seconds: f64,
@@ -69,17 +68,25 @@ pub struct RealtimeBeatTracker {
     emitted_any: bool,
 }
 
-enum WorkerMessage {
-    Samples(Vec<f32>),
-    Reset,
+struct SampleBlock {
+    generation: u64,
+    samples: Vec<f32>,
 }
 
 /// Non-blocking application wrapper. Model inference always runs on its own
 /// worker thread; the producer only makes a bounded `try_send` call.
 pub struct AsyncBeatTracker {
-    sender: SyncSender<WorkerMessage>,
-    latest: Arc<Mutex<Option<BeatEstimate>>>,
+    sender: SyncSender<SampleBlock>,
+    latest: Arc<Mutex<PublishedEstimate>>,
+    generation: Arc<AtomicU64>,
     dropped_blocks: Arc<AtomicU64>,
+}
+
+#[derive(Default)]
+struct PublishedEstimate {
+    generation: u64,
+    sequence: u64,
+    estimate: Option<BeatEstimate>,
 }
 
 impl AsyncBeatTracker {
@@ -92,26 +99,28 @@ impl AsyncBeatTracker {
     }
 
     fn from_tracker(mut tracker: RealtimeBeatTracker) -> Result<Self, BeatTrackerError> {
-        let (sender, receiver) = mpsc::sync_channel::<WorkerMessage>(16);
-        let latest = Arc::new(Mutex::new(None));
+        let (sender, receiver) = mpsc::sync_channel::<SampleBlock>(16);
+        let latest = Arc::new(Mutex::new(PublishedEstimate::default()));
         let worker_latest = Arc::clone(&latest);
+        let generation = Arc::new(AtomicU64::new(0));
+        let worker_generation = Arc::clone(&generation);
         thread::Builder::new()
             .name("terb-beat-tracker".into())
             .spawn(move || {
-                while let Ok(message) = receiver.recv() {
-                    match message {
-                        WorkerMessage::Samples(samples) => {
-                            if let Some(estimate) = tracker.consume(&samples) {
-                                if let Ok(mut value) = worker_latest.lock() {
-                                    *value = Some(estimate);
-                                }
-                            }
-                        }
-                        WorkerMessage::Reset => {
-                            tracker.reset();
-                            if let Ok(mut value) = worker_latest.lock() {
-                                *value = None;
-                            }
+                let mut active_generation = 0;
+                while let Ok(block) = receiver.recv() {
+                    if block.generation != worker_generation.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    if block.generation != active_generation {
+                        tracker.reset();
+                        active_generation = block.generation;
+                    }
+                    if let Some(estimate) = tracker.consume(&block.samples) {
+                        if let Ok(mut value) = worker_latest.lock() {
+                            value.generation = block.generation;
+                            value.sequence = value.sequence.wrapping_add(1);
+                            value.estimate = Some(estimate);
                         }
                     }
                 }
@@ -120,36 +129,43 @@ impl AsyncBeatTracker {
         Ok(Self {
             sender,
             latest,
+            generation,
             dropped_blocks: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    /// Returns immediately. `false` means the bounded worker queue was full.
+    /// Returns immediately. A dropped block invalidates the previous audio
+    /// history so the next accepted stream cannot splice across missing time.
     pub fn submit(&self, samples: &[f32]) -> bool {
-        match self
-            .sender
-            .try_send(WorkerMessage::Samples(samples.to_vec()))
-        {
+        match self.sender.try_send(SampleBlock {
+            generation: self.generation.load(Ordering::Acquire),
+            samples: samples.to_vec(),
+        }) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
                 self.dropped_blocks.fetch_add(1, Ordering::Relaxed);
+                self.reset();
                 false
             }
-            Err(TrySendError::Disconnected(_)) => false,
+            Err(TrySendError::Disconnected(_)) => {
+                self.reset();
+                false
+            }
         }
     }
 
-    pub fn latest(&self) -> Option<BeatEstimate> {
-        self.latest.try_lock().ok().and_then(|value| *value)
+    pub fn latest(&self) -> Option<(u64, BeatEstimate)> {
+        self.latest
+            .try_lock()
+            .ok()
+            .filter(|value| value.generation == self.generation.load(Ordering::Acquire))
+            .and_then(|value| value.estimate.map(|estimate| (value.sequence, estimate)))
     }
 
     pub fn reset(&self) {
-        if let Ok(mut value) = self.latest.try_lock() {
-            *value = None;
-        }
-        if let Err(TrySendError::Full(_)) = self.sender.try_send(WorkerMessage::Reset) {
-            self.dropped_blocks.fetch_add(1, Ordering::Relaxed);
-        }
+        // Reset is independent of queue capacity. Old queued/in-flight results
+        // are ignored; the worker resets before consuming the new generation.
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn dropped_blocks(&self) -> u64 {
@@ -206,7 +222,6 @@ impl RealtimeBeatTracker {
             feature_frames: Vec::with_capacity(8),
             pending_rms: VecDeque::with_capacity(INFERENCE_HOP + LOOKAHEAD),
             decoder: ActivationDecoder::default(),
-            output: None,
             feature_seconds: 0.0,
             inference_seconds: 0.0,
             decode_seconds: 0.0,
@@ -221,18 +236,23 @@ impl RealtimeBeatTracker {
         self.features
             .consume(samples, |frame| self.feature_frames.push(frame));
         self.feature_seconds += started.elapsed().as_secs_f64();
+        let mut output = None;
         for index in 0..self.feature_frames.len() {
             let frame = self.feature_frames[index].clone();
             if let Some(activations) = self.infer(frame) {
                 let started = Instant::now();
+                let mut batch = None;
                 for (beat, downbeat, rms) in activations {
                     self.decoder.observe_rms(rms);
-                    self.output = self.decoder.push(beat, downbeat).or(self.output);
+                    if let Some(estimate) = self.decoder.push(beat, downbeat) {
+                        batch = Some(merge_batch_estimate(batch, estimate));
+                    }
                 }
+                output = batch.or(output);
                 self.decode_seconds += started.elapsed().as_secs_f64();
             }
         }
-        self.output
+        output
     }
 
     pub fn reset(&mut self) {
@@ -240,7 +260,6 @@ impl RealtimeBeatTracker {
         self.context.clear();
         self.decoder = ActivationDecoder::default();
         self.pending_rms.clear();
-        self.output = None;
         self.frames_since_inference = 0;
         self.emitted_any = false;
     }
@@ -306,6 +325,22 @@ impl RealtimeBeatTracker {
     }
 }
 
+fn merge_batch_estimate(previous: Option<BeatEstimate>, current: BeatEstimate) -> BeatEstimate {
+    let Some(previous) = previous else {
+        return current;
+    };
+    BeatEstimate {
+        bpm: current.bpm,
+        confidence: current.confidence,
+        beat_pulse: previous.beat_pulse.max(current.beat_pulse),
+        phase: current.phase,
+        downbeat_pulse: match (previous.downbeat_pulse, current.downbeat_pulse) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left, right) => left.or(right),
+        },
+    }
+}
+
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -341,53 +376,63 @@ impl ActivationDecoder {
         while self.rms.len() > MAX_HISTORY {
             self.rms.pop_front();
         }
-        if self.values.len() < MIN_HISTORY || self.frames % 10 != 0 {
-            return None;
-        }
-        let audible = self
-            .rms
-            .iter()
-            .rev()
-            .take(100)
-            .filter(|x| **x > SILENCE_RMS)
-            .count();
-        if audible < 25 {
-            self.confidence *= 0.8;
-            return None;
-        }
-
-        let (raw_bpm, raw_confidence) = decode_tempo(&self.values, self.stable_bpm)?;
-        if raw_confidence < 0.12 {
-            self.confidence *= 0.85;
-            return None;
-        }
-        let bpm = match self.stable_bpm {
-            None => raw_bpm,
-            Some(old) => {
-                let octave_target = octave_nearest(raw_bpm, old);
-                let delta = (octave_target / old).ln().abs();
-                let follow = if delta < 0.025 {
-                    0.28
-                } else if raw_confidence > 0.62 {
-                    0.14
-                } else {
-                    0.045
-                };
-                old + (octave_target - old) * follow
-            }
-        };
-        self.stable_bpm = Some(bpm);
-        self.confidence += (raw_confidence - self.confidence) * 0.25;
-
         let now = self.values.len() - 1;
-        let beat_pulse = if is_peak(&self.values, now) {
+        if is_peak(&self.values, now) {
             self.last_peak = Some(self.frames);
-            self.values[now]
-        } else {
-            self.last_peak
-                .map(|p| (-((self.frames - p) as f32) / 6.0).exp())
-                .unwrap_or(0.0)
-        };
+        }
+        if self.values.len() < MIN_HISTORY {
+            return None;
+        }
+
+        if self.frames % 10 == 0 {
+            let audible = self
+                .rms
+                .iter()
+                .rev()
+                .take(100)
+                .filter(|x| **x > SILENCE_RMS)
+                .count();
+            if audible < 25 {
+                self.confidence *= 0.8;
+            } else if let Some((raw_bpm, raw_confidence)) =
+                decode_tempo(&self.values, self.stable_bpm)
+            {
+                if raw_confidence < 0.12 {
+                    self.confidence *= 0.85;
+                } else {
+                    let bpm = match self.stable_bpm {
+                        None => raw_bpm,
+                        Some(old) => {
+                            let octave_target = octave_nearest(raw_bpm, old);
+                            let delta = (octave_target / old).ln().abs();
+                            let follow = if delta < 0.025 {
+                                0.28
+                            } else if raw_confidence > 0.62 {
+                                0.14
+                            } else {
+                                0.045
+                            };
+                            old + (octave_target - old) * follow
+                        }
+                    };
+                    self.stable_bpm = Some(bpm);
+                    self.confidence += (raw_confidence - self.confidence) * 0.25;
+                }
+            }
+        }
+
+        let bpm = self.stable_bpm?;
+        let beat_pulse = self
+            .last_peak
+            .map(|peak| {
+                let decay = (-((self.frames - peak) as f32) / 6.0).exp();
+                if peak == self.frames {
+                    self.values[now].max(decay)
+                } else {
+                    decay
+                }
+            })
+            .unwrap_or(0.0);
         let period = FPS * 60.0 / bpm;
         let phase = self
             .last_peak
@@ -507,6 +552,67 @@ fn is_peak(values: &VecDeque<f32>, i: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queued_tracker() -> (AsyncBeatTracker, mpsc::Receiver<SampleBlock>) {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let tracker = AsyncBeatTracker {
+            sender,
+            latest: Arc::new(Mutex::new(PublishedEstimate {
+                generation: 0,
+                sequence: 1,
+                estimate: Some(BeatEstimate {
+                    bpm: 120.0,
+                    confidence: 0.8,
+                    beat_pulse: 1.0,
+                    phase: 0.0,
+                    downbeat_pulse: None,
+                }),
+            })),
+            generation: Arc::new(AtomicU64::new(0)),
+            dropped_blocks: Arc::new(AtomicU64::new(0)),
+        };
+        (tracker, receiver)
+    }
+
+    #[test]
+    fn reset_invalidates_full_queue_and_inflight_estimates() {
+        let (tracker, receiver) = queued_tracker();
+        assert!(tracker.submit(&[0.1]));
+        assert!(tracker.submit(&[0.2]));
+        assert!(tracker.latest().is_some());
+
+        tracker.reset();
+
+        assert!(tracker.latest().is_none());
+        let old = receiver.try_recv().unwrap();
+        receiver.try_recv().unwrap();
+        // A computation that finishes after reset must not revive its result.
+        tracker.latest.lock().unwrap().generation = old.generation;
+        assert!(tracker.latest().is_none());
+        assert!(tracker.submit(&[0.3]));
+        let new = receiver.try_recv().unwrap();
+        assert_ne!(new.generation, old.generation);
+        assert_eq!(new.generation, tracker.generation.load(Ordering::Acquire));
+        assert_eq!(tracker.dropped_blocks(), 0);
+    }
+
+    #[test]
+    fn dropped_audio_starts_a_new_history() {
+        let (tracker, receiver) = queued_tracker();
+        assert!(tracker.submit(&[0.1]));
+        assert!(tracker.submit(&[0.2]));
+        assert!(!tracker.submit(&[0.3]));
+
+        assert_eq!(tracker.dropped_blocks(), 1);
+        assert!(tracker.latest().is_none());
+        let old = receiver.try_recv().unwrap();
+        receiver.try_recv().unwrap();
+        assert!(tracker.submit(&[0.4]));
+        let new = receiver.try_recv().unwrap();
+        assert_ne!(old.generation, new.generation);
+        assert_eq!(new.samples, vec![0.4]);
+    }
+
     #[test]
     fn activation_decoder_finds_120_bpm() {
         let mut d = ActivationDecoder::default();
@@ -516,5 +622,50 @@ mod tests {
             out = d.push(if i % 25 == 0 { 0.95 } else { 0.02 }, 0.01).or(out);
         }
         assert!((out.unwrap().bpm - 120.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn activation_decoder_keeps_peaks_between_tempo_updates() {
+        let mut decoder = ActivationDecoder::default();
+        for frame in 0..600 {
+            decoder.observe_rms(0.1);
+            decoder.push(if frame % 25 == 0 { 0.95 } else { 0.02 }, 0.01);
+        }
+
+        decoder.observe_rms(0.1);
+        decoder.push(0.02, 0.01);
+        decoder.observe_rms(0.1);
+        let estimate = decoder
+            .push(0.95, 0.01)
+            .expect("a known tempo should emit on every activation frame");
+
+        assert!(estimate.beat_pulse >= 0.95);
+        assert!((estimate.bpm - 120.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn inference_batch_preserves_strongest_detected_pulse() {
+        let first = BeatEstimate {
+            bpm: 120.0,
+            confidence: 0.7,
+            beat_pulse: 0.9,
+            phase: 0.0,
+            downbeat_pulse: Some(0.8),
+        };
+        let last = BeatEstimate {
+            bpm: 121.0,
+            confidence: 0.8,
+            beat_pulse: 0.2,
+            phase: 0.3,
+            downbeat_pulse: Some(0.1),
+        };
+
+        let merged = merge_batch_estimate(Some(first), last);
+
+        assert_eq!(merged.bpm, 121.0);
+        assert_eq!(merged.confidence, 0.8);
+        assert_eq!(merged.beat_pulse, 0.9);
+        assert_eq!(merged.phase, 0.3);
+        assert_eq!(merged.downbeat_pulse, Some(0.8));
     }
 }

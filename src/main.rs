@@ -36,7 +36,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use analysis::sample_frequency_band;
 #[cfg(test)]
 use analysis::sample_magnitude;
-use terb::beat::AsyncBeatTracker;
+use terb::beat::{AsyncBeatTracker, BeatEstimate};
 use terb::bpm::{BpmAnalyzer, BPM_MAX, BPM_MIN, BPM_PULSE_DECAY_SECONDS};
 
 const LANGUAGES: &[(&str, &str)] = &[("zh", "中文"), ("en", "English"), ("ja", "日本語")];
@@ -52,13 +52,7 @@ const ACCENT_DISPLAY_MODES: &[AccentDisplayMode] = &[
     AccentDisplayMode::Off,
 ];
 const BPM_MODES: &[BpmMode] = &[BpmMode::Onnx, BpmMode::Traditional, BpmMode::Off];
-const MENU_ITEMS: &[&str] = &[
-    "menu_spectrum",
-    "menu_toggle",
-    "menu_settings",
-    "menu_help",
-    "menu_quit",
-];
+const MENU_ITEMS: &[&str] = &["menu_spectrum", "menu_settings", "menu_help", "menu_quit"];
 const REFRESH_RATES: &[u16] = &[12, 24, 30, 45, 60, 90, 120, 144, 165, 240];
 const MIN_REFRESH_HZ: u16 = 12;
 const MAX_REFRESH_HZ: u16 = 240;
@@ -207,17 +201,19 @@ fn handle_menu_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('q') | KeyCode::Esc => return true,
         KeyCode::Up | KeyCode::Char('k') => app.prev_menu(),
         KeyCode::Down | KeyCode::Char('j') => app.next_menu(),
-        KeyCode::Char(' ') => app.toggle_capture(),
+        KeyCode::Char(' ') => {
+            app.toggle_capture();
+            app.screen = Screen::Spectrum;
+        }
         KeyCode::Enter => match MENU_ITEMS[app.menu_index] {
             "menu_spectrum" => app.screen = Screen::Spectrum,
-            "menu_toggle" => app.toggle_capture(),
-            "menu_settings" => app.screen = Screen::Settings,
-            "menu_help" => app.screen = Screen::Help,
+            "menu_settings" => app.open_settings(),
+            "menu_help" => app.open_help(),
             "menu_quit" => return true,
             _ => {}
         },
-        KeyCode::Char('s') => app.screen = Screen::Settings,
-        KeyCode::Char('?') => app.screen = Screen::Help,
+        KeyCode::Char('s') | KeyCode::Char('S') => app.open_settings(),
+        KeyCode::Char('?') => app.open_help(),
         _ => {}
     }
     false
@@ -227,11 +223,11 @@ fn handle_spectrum_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.screen = Screen::Menu,
         KeyCode::Char(' ') => app.toggle_capture(),
-        KeyCode::Char('S') | KeyCode::Char('s') => app.screen = Screen::Settings,
+        KeyCode::Char('S') | KeyCode::Char('s') => app.open_settings(),
         KeyCode::Char('t') => app.toggle_toolbar_panel(),
         KeyCode::Char('m') => app.toggle_master_panel(),
         KeyCode::Char('w') => app.toggle_waveform_panel(),
-        KeyCode::Char('?') => app.screen = Screen::Help,
+        KeyCode::Char('?') => app.open_help(),
         _ => {}
     }
     false
@@ -239,13 +235,8 @@ fn handle_spectrum_key(app: &mut App, key: KeyEvent) -> bool {
 
 fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            app.save_config();
-            app.screen = if app.audio.is_some() {
-                Screen::Spectrum
-            } else {
-                Screen::Menu
-            };
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') | KeyCode::Char('S') => {
+            app.screen = app.settings_origin;
         }
         KeyCode::Up | KeyCode::Char('k') => app.prev_setting(),
         KeyCode::Down | KeyCode::Char('j') => app.next_setting(),
@@ -254,7 +245,7 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Left | KeyCode::Char('h') => app.adjust_setting(-1),
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => app.adjust_setting(1),
         KeyCode::Char(' ') => app.toggle_capture(),
-        KeyCode::Char('?') => app.screen = Screen::Help,
+        KeyCode::Char('?') => app.open_help(),
         _ => {}
     }
     false
@@ -262,7 +253,9 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
 
 fn handle_help_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => app.screen = Screen::Menu,
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
+            app.screen = app.help_origin;
+        }
         _ => {}
     }
     false
@@ -764,10 +757,12 @@ struct App {
     lang: Lang,
     theme_id: ThemeId,
     screen: Screen,
+    settings_origin: Screen,
+    help_origin: Screen,
     menu_index: usize,
     setting_index: usize,
     capture_state: CaptureState,
-    status: String,
+    capture_error: String,
     spectrum: Vec<f32>,
     spectrum_trail: Vec<f32>,
     pending_accent_trace: Option<PendingAccentTrace>,
@@ -775,7 +770,6 @@ struct App {
     accent_note_bursts: Vec<AccentNoteBurst>,
     accent_energy_baseline: f32,
     accent_trace_cooldown: Duration,
-    level: f32,
     master_left: f32,
     master_right: f32,
     bpm: Option<AsyncBeatTracker>,
@@ -785,6 +779,7 @@ struct App {
     bpm_phase: f32,
     bpm_pulse: f32,
     bpm_next_beat_at: Option<Instant>,
+    bpm_update_sequence: u64,
     waveform: Vec<f32>,
     analyzer: SpectrumAnalyzer,
     visual_bar_count: usize,
@@ -792,7 +787,6 @@ struct App {
     capture_id: u64,
     rx: Receiver<AudioEvent>,
     tx: Sender<AudioEvent>,
-    last_samples_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -956,10 +950,12 @@ impl App {
             lang,
             theme_id,
             screen: Screen::Menu,
+            settings_origin: Screen::Menu,
+            help_origin: Screen::Menu,
             menu_index: 0,
             setting_index: 0,
             capture_state: CaptureState::Idle,
-            status: tr(lang, "ready").to_string(),
+            capture_error: String::new(),
             spectrum: vec![0.0; bar_count],
             spectrum_trail: vec![0.0; bar_count],
             pending_accent_trace: None,
@@ -967,7 +963,6 @@ impl App {
             accent_note_bursts: Vec::new(),
             accent_energy_baseline: 0.0,
             accent_trace_cooldown: Duration::from_millis(0),
-            level: 0.0,
             master_left: 0.0,
             master_right: 0.0,
             bpm,
@@ -977,6 +972,7 @@ impl App {
             bpm_phase: 0.0,
             bpm_pulse: 0.0,
             bpm_next_beat_at: None,
+            bpm_update_sequence: 0,
             waveform: vec![0.0; WAVEFORM_SAMPLES],
             analyzer: SpectrumAnalyzer::new(fft_size, 48_000.0, bar_count, hop_size),
             visual_bar_count: bar_count,
@@ -984,7 +980,6 @@ impl App {
             capture_id: 0,
             rx,
             tx,
-            last_samples_at: None,
         }
     }
 
@@ -1009,11 +1004,6 @@ impl App {
         self.advance_bpm_pulse(elapsed);
         if self.capture_state == CaptureState::Running {
             self.advance_accent_traces(elapsed);
-            if let Some(last) = self.last_samples_at {
-                if last.elapsed() > Duration::from_secs(3) {
-                    self.status = self.t("waiting_audio").to_string();
-                }
-            }
         }
     }
 
@@ -1024,6 +1014,16 @@ impl App {
             self.bpm_phase = 0.0;
             self.bpm_pulse = 0.0;
             self.bpm_next_beat_at = None;
+            return;
+        }
+
+        if self.config.settings.bpm_mode == BpmMode::Onnx {
+            self.bpm_next_beat_at = None;
+            if let Some(bpm) = self.bpm_estimate.filter(|bpm| *bpm > 1.0) {
+                self.bpm_phase = (self.bpm_phase + elapsed.as_secs_f32() * bpm / 60.0).fract();
+            } else {
+                self.bpm_phase = 0.0;
+            }
             return;
         }
 
@@ -1075,16 +1075,14 @@ impl App {
                     if capture_id != self.capture_id || self.audio.is_none() {
                         continue;
                     }
-                    if message.contains("ready") {
-                        self.status = self.t("helper_ready").to_string();
-                    } else if message.contains("permission-denied") {
+                    if message.contains("permission-denied") {
                         self.audio = None;
                         self.capture_state = CaptureState::PermissionNeeded;
-                        self.status = self.t("permission_needed").to_string();
+                        self.capture_error = self.t("permission_needed").to_string();
                     } else if message.contains("no-display") || message.contains("capture-error") {
                         self.audio = None;
                         self.capture_state = CaptureState::Failed;
-                        self.status = self.t("capture_failed").to_string();
+                        self.capture_error = self.t("capture_failed").to_string();
                     }
                 }
                 AudioEvent::Exit(capture_id, code) => {
@@ -1100,7 +1098,7 @@ impl App {
                     } else {
                         CaptureState::Failed
                     };
-                    self.status = if code == Some(2) {
+                    self.capture_error = if code == Some(2) {
                         self.t("permission_needed").to_string()
                     } else {
                         self.t("capture_failed").to_string()
@@ -1111,7 +1109,7 @@ impl App {
                         continue;
                     }
                     self.capture_state = CaptureState::Failed;
-                    self.status = message;
+                    self.capture_error = message;
                 }
             }
         }
@@ -1119,19 +1117,24 @@ impl App {
 
     fn process_audio_samples(&mut self, samples: AudioSamples) {
         self.capture_state = CaptureState::Running;
-        self.last_samples_at = Some(Instant::now());
-        self.level = audio_level(&samples.mono);
+        self.capture_error.clear();
         self.master_left = samples.left_level;
         self.master_right = samples.right_level;
         self.update_waveform(&samples.mono);
         match self.config.settings.bpm_mode {
             BpmMode::Onnx => {
                 if let Some(tracker) = &self.bpm {
-                    tracker.submit(&samples.mono);
+                    if !tracker.submit(&samples.mono) {
+                        self.clear_bpm_display();
+                    }
                 }
-                if let Some(estimate) = self.bpm.as_ref().and_then(AsyncBeatTracker::latest) {
-                    self.set_bpm_estimate(estimate.bpm);
-                    self.bpm_confidence = estimate.confidence;
+                if let Some((sequence, estimate)) =
+                    self.bpm.as_ref().and_then(AsyncBeatTracker::latest)
+                {
+                    if sequence != self.bpm_update_sequence {
+                        self.bpm_update_sequence = sequence;
+                        self.apply_neural_beat_estimate(estimate);
+                    }
                 }
             }
             BpmMode::Traditional => {
@@ -1153,7 +1156,6 @@ impl App {
             update_spectrum_trail(&mut self.spectrum_trail, &bars, &self.config.settings);
             self.spectrum = bars;
         }
-        self.status = self.t("running").to_string();
     }
 
     fn set_bpm_estimate(&mut self, bpm: f32) {
@@ -1169,16 +1171,37 @@ impl App {
         }
     }
 
+    fn apply_neural_beat_estimate(&mut self, estimate: BeatEstimate) {
+        self.set_bpm_estimate(estimate.bpm);
+        self.bpm_confidence = estimate.confidence;
+        self.bpm_phase = estimate.phase.clamp(0.0, 1.0);
+        self.bpm_pulse = self.bpm_pulse.max(estimate.beat_pulse.clamp(0.0, 1.0));
+        self.bpm_next_beat_at = None;
+    }
+
     fn clear_bpm_state(&mut self) {
         if let Some(tracker) = &self.bpm {
             tracker.reset();
         }
         self.traditional_bpm.reset();
+        self.clear_bpm_display();
+    }
+
+    fn clear_bpm_display(&mut self) {
         self.bpm_estimate = None;
         self.bpm_confidence = 0.0;
         self.bpm_phase = 0.0;
         self.bpm_pulse = 0.0;
         self.bpm_next_beat_at = None;
+        self.bpm_update_sequence = 0;
+    }
+
+    fn reset_capture_analysis(&mut self) {
+        self.clear_bpm_state();
+        self.analyzer.reset();
+        self.pending_accent_trace = None;
+        self.accent_energy_baseline = 0.0;
+        self.accent_trace_cooldown = Duration::ZERO;
     }
 
     fn update_accent_trace_detector(&mut self, bars: &[f32]) {
@@ -1322,8 +1345,11 @@ impl App {
             return;
         }
 
+        self.reset_capture_analysis();
+        self.accent_traces.clear();
+        self.accent_note_bursts.clear();
         self.capture_state = CaptureState::Starting;
-        self.status = self.t("starting").to_string();
+        self.capture_error.clear();
         self.capture_id = self.capture_id.wrapping_add(1);
         let capture_id = self.capture_id;
 
@@ -1333,7 +1359,7 @@ impl App {
             }
             Err(error) => {
                 self.capture_state = CaptureState::Failed;
-                self.status = format!("{}: {}", self.t("capture_failed"), error);
+                self.capture_error = format!("{}: {}", self.t("capture_failed"), error);
             }
         }
     }
@@ -1343,8 +1369,9 @@ impl App {
         if let Some(mut audio) = self.audio.take() {
             audio.stop();
         }
+        self.reset_capture_analysis();
         self.capture_state = CaptureState::Idle;
-        self.status = self.t("stopped").to_string();
+        self.capture_error.clear();
     }
 
     fn toggle_capture(&mut self) {
@@ -1352,8 +1379,17 @@ impl App {
             self.stop_capture();
         } else {
             self.start_capture();
-            self.screen = Screen::Spectrum;
         }
+    }
+
+    fn open_settings(&mut self) {
+        self.settings_origin = self.screen;
+        self.screen = Screen::Settings;
+    }
+
+    fn open_help(&mut self) {
+        self.help_origin = self.screen;
+        self.screen = Screen::Help;
     }
 
     fn prev_menu(&mut self) {
@@ -1556,12 +1592,10 @@ impl App {
         let next = (index as i32 + direction).rem_euclid(len) as usize;
         self.lang = Lang::from_code(LANGUAGES[next].0);
         self.config.settings.language = self.lang.code().to_string();
-        self.status = match self.capture_state {
-            CaptureState::Idle => self.t("ready").to_string(),
-            CaptureState::Starting => self.t("starting").to_string(),
-            CaptureState::Running => self.t("running").to_string(),
+        self.capture_error = match self.capture_state {
             CaptureState::PermissionNeeded => self.t("permission_needed").to_string(),
             CaptureState::Failed => self.t("capture_failed").to_string(),
+            _ => String::new(),
         };
     }
 
@@ -1861,14 +1895,15 @@ struct SpectrumAnalyzer {
     sample_rate: f32,
     bar_count: usize,
     fft: Arc<dyn Fft<f32>>,
+    fft_buffer: Vec<Complex<f32>>,
+    fft_scratch: Vec<Complex<f32>>,
+    magnitudes: Vec<f32>,
     window: Vec<f32>,
     window_sum: f32,
     sample_buffer: Vec<f32>,
     smoothed: Vec<f32>,
     adaptive_floor: Vec<f32>,
     adaptive_gain: f32,
-    samples_since_analysis: usize,
-    has_analysis: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1904,6 +1939,7 @@ impl SpectrumAnalyzer {
             })
             .collect();
         let window_sum = window.iter().sum::<f32>().max(1.0);
+        let fft_scratch = vec![Complex::default(); fft.get_inplace_scratch_len()];
 
         Self {
             fft_size,
@@ -1911,14 +1947,15 @@ impl SpectrumAnalyzer {
             sample_rate,
             bar_count,
             fft,
+            fft_buffer: vec![Complex::default(); fft_size],
+            fft_scratch,
+            magnitudes: vec![0.0; fft_size / 2],
             window,
             window_sum,
-            sample_buffer: Vec::new(),
+            sample_buffer: Vec::with_capacity(fft_size + AUDIO_READ_FRAMES),
             smoothed: vec![0.0; bar_count],
             adaptive_floor: vec![0.0; bar_count],
             adaptive_gain: 1.0,
-            samples_since_analysis: 0,
-            has_analysis: false,
         }
     }
 
@@ -1940,6 +1977,12 @@ impl SpectrumAnalyzer {
         self.adaptive_gain = 1.0;
     }
 
+    fn reset(&mut self) {
+        self.sample_buffer.clear();
+        self.smoothed.fill(0.0);
+        self.reset_adaptive_state();
+    }
+
     fn consume(
         &mut self,
         samples: &[f32],
@@ -1952,51 +1995,47 @@ impl SpectrumAnalyzer {
         }
 
         self.sample_buffer.extend_from_slice(samples);
-        self.samples_since_analysis = self.samples_since_analysis.saturating_add(samples.len());
-        let max_samples = self
-            .fft_size
-            .saturating_add(self.hop_size)
-            .max(self.fft_size * 2);
-        if self.sample_buffer.len() > max_samples {
-            let excess = self.sample_buffer.len() - max_samples;
-            self.sample_buffer.drain(0..excess);
+        let mut offset = 0;
+        while self.sample_buffer.len() - offset >= self.fft_size {
+            self.analyze_window(offset, attack, release, pipeline);
+            offset += self.hop_size;
         }
-
-        if self.sample_buffer.len() < self.fft_size {
+        if offset == 0 {
             return None;
         }
+        self.sample_buffer.drain(..offset);
+        Some(self.smoothed.clone())
+    }
 
-        if self.has_analysis && self.samples_since_analysis < self.hop_size {
-            return None;
-        }
-        self.samples_since_analysis %= self.hop_size;
-        self.has_analysis = true;
-
-        let source = &self.sample_buffer[self.sample_buffer.len() - self.fft_size..];
+    fn analyze_window(
+        &mut self,
+        offset: usize,
+        attack: f32,
+        release: f32,
+        pipeline: SpectrumPipeline,
+    ) {
+        let source = &self.sample_buffer[offset..offset + self.fft_size];
         let source_rms =
             (source.iter().map(|sample| sample * sample).sum::<f32>() / source.len() as f32).sqrt();
         if source_rms < SILENCE_GATE {
             self.smoothed.fill(0.0);
-            return Some(self.smoothed.clone());
+            return;
         }
 
         let mean = source.iter().sum::<f32>() / source.len() as f32;
-        let mut buffer: Vec<Complex<f32>> = source
-            .iter()
-            .zip(self.window.iter())
-            .map(|(sample, window)| Complex::new((sample - mean) * window, 0.0))
-            .collect();
-
-        self.fft.process(&mut buffer);
+        for ((output, sample), window) in self.fft_buffer.iter_mut().zip(source).zip(&self.window) {
+            *output = Complex::new((sample - mean) * window, 0.0);
+        }
+        self.fft
+            .process_with_scratch(&mut self.fft_buffer, &mut self.fft_scratch);
 
         let half = self.fft_size / 2;
         let amplitude_scale = 2.0 / self.window_sum;
-        let mut magnitudes = vec![0.0_f32; half];
         for index in 1..half {
-            magnitudes[index] = buffer[index].norm() * amplitude_scale;
+            self.magnitudes[index] = self.fft_buffer[index].norm() * amplitude_scale;
         }
 
-        let mut bars = self.make_bars(&magnitudes, pipeline);
+        let mut bars = self.make_bars(&self.magnitudes, pipeline);
         self.apply_adaptive_processing(&mut bars, source_rms, pipeline);
         let attack = attack.clamp(MIN_ATTACK, MAX_ATTACK);
         let release = release.clamp(MIN_RELEASE, MAX_RELEASE);
@@ -2013,8 +2052,6 @@ impl SpectrumAnalyzer {
                 *smoothed = smoothed.clamp(0.0, pipeline.ceiling);
             }
         }
-
-        Some(self.smoothed.clone())
     }
 
     fn make_bars(&self, magnitudes: &[f32], pipeline: SpectrumPipeline) -> Vec<f32> {
@@ -2115,20 +2152,6 @@ impl SpectrumAnalyzer {
             *value = (*value * self.adaptive_gain).clamp(0.0, pipeline.ceiling);
         }
     }
-}
-
-fn audio_level(samples: &[f32]) -> f32 {
-    let count = samples.len().min(4096);
-    if count == 0 {
-        return 0.0;
-    }
-    let square_sum = samples
-        .iter()
-        .rev()
-        .take(count)
-        .map(|sample| sample * sample)
-        .sum::<f32>();
-    audio_level_from_square_sum(square_sum, count)
 }
 
 fn audio_level_from_square_sum(square_sum: f32, count: usize) -> f32 {
@@ -2250,6 +2273,9 @@ fn waveform_color(app: &App, value: f32) -> Color {
 
 fn draw(frame: &mut Frame, app: &App) {
     let size = frame.area();
+    frame
+        .buffer_mut()
+        .set_style(size, Style::default().fg(app.theme().text).bg(Color::Reset));
     if size.width < 36 || size.height < 10 {
         let text = Paragraph::new(app.t("too_small"))
             .alignment(Alignment::Center)
@@ -2258,12 +2284,36 @@ fn draw(frame: &mut Frame, app: &App) {
         return;
     }
 
+    let (content, error) = capture_error_layout(app, size);
     match app.screen {
-        Screen::Menu => draw_menu(frame, app, size),
-        Screen::Spectrum => draw_spectrum_screen(frame, app, size),
-        Screen::Settings => draw_settings(frame, app, size),
-        Screen::Help => draw_help(frame, app, size),
+        Screen::Menu => draw_menu(frame, app, content),
+        Screen::Spectrum => draw_spectrum_screen(frame, app, content),
+        Screen::Settings => draw_settings(frame, app, content),
+        Screen::Help => draw_help(frame, app, content),
     }
+    if let Some(error) = error {
+        frame.render_widget(
+            Paragraph::new(app.capture_error.as_str())
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(app.theme().accent)),
+            error,
+        );
+    }
+}
+
+fn capture_error_layout(app: &App, area: Rect) -> (Rect, Option<Rect>) {
+    if app.capture_error.is_empty() {
+        return (area, None);
+    }
+    let height = Paragraph::new(app.capture_error.as_str())
+        .wrap(Wrap { trim: true })
+        .line_count(area.width) as u16;
+    let rows = Layout::vertical([
+        Constraint::Min(6),
+        Constraint::Length(height.min(area.height.saturating_sub(6))),
+    ])
+    .split(area);
+    (rows[0], Some(rows[1]))
 }
 
 fn visual_bar_count(app: &App, area: Rect) -> Option<usize> {
@@ -2271,7 +2321,8 @@ fn visual_bar_count(app: &App, area: Rect) -> Option<usize> {
         return None;
     }
 
-    let chart_area = spectrum_visual_area(app, area);
+    let (content, _) = capture_error_layout(app, area);
+    let chart_area = spectrum_layout(app, content).spectrum;
     let inner_width = chart_area.width.saturating_sub(2) as usize;
     if inner_width == 0 {
         return None;
@@ -2284,408 +2335,139 @@ fn visual_bar_count(app: &App, area: Rect) -> Option<usize> {
     })
 }
 
-fn spectrum_visual_area(app: &App, area: Rect) -> Rect {
-    let settings = &app.config.settings;
-    let left_height = left_module_height(settings);
-    let show_left_modules = left_height > 0 && area.width >= 120 && area.height >= left_height;
-    let mut content_area = area;
+struct SpectrumLayout {
+    spectrum: Rect,
+    waveform: Option<Rect>,
+    master: Option<Rect>,
+    toolbar: Rect,
+}
 
-    if show_left_modules {
-        content_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(35), Constraint::Min(28)])
-            .split(area)[1];
-    }
-
-    let show_master =
-        settings.show_master_panel && content_area.width >= 63 && content_area.height >= 14;
-    let mut visual_area = content_area;
-    if show_master {
-        visual_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(24), Constraint::Length(MASTER_METER_WIDTH)])
-            .split(content_area)[0];
-    }
-
-    let show_compact_footer = !show_left_modules && visual_area.height >= 9;
-    let mut chart_area = if show_compact_footer {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(6), Constraint::Length(3)])
-            .split(visual_area)[0]
+fn spectrum_layout(app: &App, area: Rect) -> SpectrumLayout {
+    let rows = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(u16::from(app.config.settings.show_toolbar_panel)),
+    ])
+    .split(area);
+    let mut chart = rows[0];
+    let master = if app.config.settings.show_master_panel && chart.width >= 63 && chart.height >= 14
+    {
+        let columns =
+            Layout::horizontal([Constraint::Min(24), Constraint::Length(MASTER_METER_WIDTH)])
+                .split(chart);
+        chart = columns[0];
+        Some(columns[1])
     } else {
-        visual_area
+        None
     };
-
-    if settings.show_waveform_panel && chart_area.width >= 28 && chart_area.height >= 16 {
-        chart_area = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(7), Constraint::Min(6)])
-            .split(chart_area)[1];
+    let waveform =
+        if app.config.settings.show_waveform_panel && chart.width >= 28 && chart.height >= 16 {
+            let rows = Layout::vertical([Constraint::Length(7), Constraint::Min(6)]).split(chart);
+            chart = rows[1];
+            Some(rows[0])
+        } else {
+            None
+        };
+    SpectrumLayout {
+        spectrum: chart,
+        waveform,
+        master,
+        toolbar: rows[1],
     }
-
-    chart_area
 }
 
 fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
-    if area.width < 62 || area.height < 22 {
-        draw_compact_menu(frame, app, area);
-        return;
-    }
-
     let theme = app.theme();
-    let panel = centered_rect(74, 82, area);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(TITLE_ART.len() as u16 + 2),
-            Constraint::Length(9),
-            Constraint::Min(3),
-            Constraint::Length(4),
-        ])
-        .split(panel);
-
-    let art_lines: Vec<Line> = TITLE_ART
-        .iter()
-        .map(|line| {
-            Line::from(Span::styled(
-                *line,
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ))
-        })
-        .collect();
-    let art_inner = draw_panel(frame, rows[0], theme, Some(panel_title("terb", theme)));
-    frame.render_widget(
-        Paragraph::new(art_lines).alignment(Alignment::Center),
-        art_inner,
-    );
-
-    draw_main_menu(frame, app, rows[1]);
-
-    let status_inner = draw_panel(
-        frame,
-        rows[2],
-        theme,
-        Some(panel_title(app.t("overview"), theme)),
-    );
-    let status = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(
-                capture_control_label(app),
-                Style::default().fg(theme.accent),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                format!("{} {:>3}%", app.t("level"), (app.level * 100.0) as u16),
-                Style::default().fg(theme.text),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!(
-                    "{} {}Hz",
-                    app.t("refresh_rate"),
-                    app.config.settings.refresh_hz
-                ),
-                Style::default().fg(theme.muted),
-            ),
-        ]),
-        Line::from(Span::styled(&app.status, Style::default().fg(theme.muted))),
-    ])
-    .wrap(Wrap { trim: true });
-    frame.render_widget(status, status_inner);
-
-    let footer = Paragraph::new(app.t("menu_hint"))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true })
-        .style(Style::default().fg(theme.muted));
-    frame.render_widget(footer, rows[3]);
-}
-
-fn draw_compact_menu(frame: &mut Frame, app: &App, area: Rect) {
-    let theme = app.theme();
-    let panel = centered_rect(92, 90, area);
     let mut lines = Vec::new();
-
-    if panel.height >= 15 {
-        for line in TITLE_ART {
-            lines.push(Line::from(Span::styled(
-                *line,
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        }
-        lines.push(Line::from(""));
-        push_compact_menu_items(app, theme, &mut lines);
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{} {}Hz · {} {:>3}%",
-                app.t("refresh_rate"),
-                app.config.settings.refresh_hz,
-                app.t("level"),
-                (app.level * 100.0) as u16
-            ),
-            Style::default().fg(theme.muted),
-        )));
-    } else if panel.height >= 12 {
-        lines.push(Line::from(Span::styled(
-            "terb",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(""));
-        push_compact_menu_items(app, theme, &mut lines);
-        lines.push(Line::from(Span::styled(
-            "Enter · Space · q",
-            Style::default().fg(theme.muted),
-        )));
+    let title_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    if area.height >= 15 {
+        lines.extend(
+            TITLE_ART
+                .iter()
+                .map(|line| Line::styled(*line, title_style)),
+        );
     } else {
-        let label = compact_menu_label(app, MENU_ITEMS[app.menu_index]);
-        lines.push(Line::from(Span::styled(
-            "terb",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            format!("> {}", app.t(label)),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            "j/k Enter q",
-            Style::default().fg(theme.muted),
-        )));
+        lines.push(Line::styled("terb", title_style));
     }
-
-    let inner = draw_panel(
-        frame,
-        panel,
-        theme,
-        Some(panel_title(app.t("main_menu"), theme)),
-    );
-    frame.render_widget(
-        Paragraph::new(lines)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true }),
-        inner,
-    );
-}
-
-fn push_compact_menu_items(app: &App, theme: Theme, lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::default());
     for (index, key) in MENU_ITEMS.iter().enumerate() {
-        let label = compact_menu_label(app, key);
         let selected = index == app.menu_index;
-        let prefix = if selected { "> " } else { "  " };
-        let style = if selected {
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.text)
-        };
-        lines.push(Line::from(Span::styled(
-            format!("{}{}", prefix, app.t(label)),
-            style,
-        )));
+        lines.push(Line::styled(
+            format!("{}{}", if selected { "› " } else { "  " }, app.t(key)),
+            if selected {
+                title_style
+            } else {
+                Style::default().fg(theme.text)
+            },
+        ));
     }
-}
-
-fn compact_menu_label(app: &App, key: &'static str) -> &'static str {
-    if key == "menu_toggle" {
-        if app.audio.is_some() {
-            "menu_stop"
-        } else {
-            "menu_start"
-        }
-    } else {
-        key
+    if area.height >= lines.len() as u16 + 2 {
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "↑↓  Enter  ·  Space",
+            Style::default().fg(theme.muted),
+        ));
     }
-}
-
-fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
-    let theme = app.theme();
-    let inner = draw_panel(
-        frame,
-        area,
-        theme,
-        Some(panel_title(app.t("main_menu"), theme)),
+    let height = (lines.len() as u16).min(area.height);
+    let content = Rect::new(
+        area.x,
+        area.y + (area.height - height) / 2,
+        area.width,
+        height,
     );
-    let items: Vec<ListItem> = MENU_ITEMS
-        .iter()
-        .map(|key| {
-            let label_key = compact_menu_label(app, key);
-            ListItem::new(Line::from(Span::styled(
-                app.t(label_key),
-                Style::default().fg(theme.text),
-            )))
-        })
-        .collect();
-
-    let mut state = ListState::default();
-    state.select(Some(app.menu_index));
-
-    let list = List::new(items).highlight_symbol("  ").highlight_style(
-        Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD),
-    );
-
-    frame.render_stateful_widget(list, inner, &mut state);
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), content);
 }
 
 fn draw_spectrum_screen(frame: &mut Frame, app: &App, area: Rect) {
-    let settings = &app.config.settings;
-    let left_height = left_module_height(settings);
-    let show_left_modules = left_height > 0 && area.width >= 120 && area.height >= left_height;
-    let mut content_area = area;
-
-    if show_left_modules {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(35), Constraint::Min(28)])
-            .split(area);
-        draw_left_modules(frame, app, chunks[0]);
-        content_area = chunks[1];
+    let layout = spectrum_layout(app, area);
+    if let Some(master) = layout.master {
+        draw_master_meter(frame, app, master);
     }
-
-    let show_master =
-        settings.show_master_panel && content_area.width >= 63 && content_area.height >= 14;
-    let mut visual_area = content_area;
-    if show_master {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(24), Constraint::Length(MASTER_METER_WIDTH)])
-            .split(content_area);
-        visual_area = chunks[0];
-        draw_master_meter(frame, app, chunks[1]);
+    if let Some(waveform) = layout.waveform {
+        draw_waveform(frame, app, waveform);
     }
-
-    let show_compact_footer = !show_left_modules && visual_area.height >= 9;
-    let chart_area = if show_compact_footer {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(6), Constraint::Length(3)])
-            .split(visual_area);
-        draw_compact_footer(frame, app, rows[1]);
-        rows[0]
-    } else {
-        visual_area
-    };
-
-    if settings.show_waveform_panel && chart_area.width >= 28 && chart_area.height >= 16 {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(7), Constraint::Min(6)])
-            .split(chart_area);
-        draw_waveform(frame, app, rows[0]);
-        draw_spectrum(frame, app, rows[1], app.t("spectrum"));
-    } else {
-        draw_spectrum(frame, app, chart_area, app.t("spectrum"));
+    draw_spectrum(frame, app, layout.spectrum, app.t("spectrum"));
+    if layout.toolbar.height > 0 {
+        frame.render_widget(
+            Paragraph::new(toolbar_line(app, layout.toolbar.width)),
+            layout.toolbar,
+        );
     }
 }
 
-fn left_module_height(settings: &Settings) -> u16 {
-    if settings.show_toolbar_panel {
-        7
-    } else {
-        0
-    }
-}
-
-fn draw_left_modules(frame: &mut Frame, app: &App, area: Rect) {
-    let settings = &app.config.settings;
-    let mut constraints = Vec::new();
-
-    if settings.show_toolbar_panel {
-        constraints.push(Constraint::Length(7));
-    }
-    if constraints.is_empty() {
-        return;
-    }
-    constraints.push(Constraint::Min(0));
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
-    if settings.show_toolbar_panel {
-        draw_toolbar(frame, app, chunks[0]);
-    }
-}
-
-fn draw_toolbar(frame: &mut Frame, app: &App, area: Rect) {
+fn toolbar_line(app: &App, width: u16) -> Line<'static> {
     let theme = app.theme();
-    let inner = draw_panel(
-        frame,
-        area,
-        theme,
-        Some(module_title_line(app, 't', "toolbar")),
-    );
-    let lines = vec![
-        Line::from(vec![
+    let mut tempo = Line::default();
+    if app.config.settings.bpm_mode != BpmMode::Off {
+        tempo.spans = vec![
             Span::styled(
-                capture_control_label(app),
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("   "),
-            Span::styled(
-                format!(
-                    "L{:>3} R{:>3}",
-                    (app.master_left * 100.0) as u16,
-                    (app.master_right * 100.0) as u16
-                ),
+                format!("BPM {} ", bpm_label(app)),
                 Style::default().fg(theme.text),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled(app.t("theme"), Style::default().fg(theme.muted)),
-            Span::raw(" "),
-            Span::styled(theme_label(app), Style::default().fg(theme.muted)),
-            Span::raw("  "),
-            Span::styled(app.t("bpm"), Style::default().fg(theme.muted)),
-            Span::raw(" "),
-            Span::styled(bpm_label(app), Style::default().fg(theme.text)),
-            Span::raw(" "),
             beat_indicator_span(app),
-        ]),
-        Line::from(vec![
-            Span::styled(app.t("refresh_rate"), Style::default().fg(theme.muted)),
-            Span::raw(" "),
-            Span::styled(
-                format!("{}Hz", app.config.settings.refresh_hz),
-                Style::default().fg(theme.text),
-            ),
-        ]),
-        module_toggle_line(app),
-        Line::from(vec![
-            Span::styled("S", Style::default().fg(theme.accent)),
-            Span::styled(
-                format!(" {}  ", app.t("settings")),
-                Style::default().fg(theme.muted),
-            ),
-            Span::styled("?", Style::default().fg(theme.accent)),
-            Span::styled(
-                format!(" {}  ", app.t("help")),
-                Style::default().fg(theme.muted),
-            ),
-            Span::styled("q", Style::default().fg(theme.accent)),
-            Span::styled(
-                format!(" {}", app.t("main_menu")),
-                Style::default().fg(theme.muted),
-            ),
-        ]),
-        Line::from(Span::styled(&app.status, Style::default().fg(theme.muted))),
-    ];
-
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+        ];
+    }
+    let mut controls = Line::from(vec![
+        Span::styled("Space ", Style::default().fg(theme.accent)),
+        Span::styled(capture_action_label(app), Style::default().fg(theme.text)),
+    ]);
+    let hints = format!("  s {}  ? {}", app.t("settings"), app.t("help"));
+    let hints = if controls.width() + hints.width() + tempo.width() + 2 <= width as usize {
+        hints
+    } else {
+        "  s  ?".to_string()
+    };
+    controls
+        .spans
+        .push(Span::styled(hints, Style::default().fg(theme.muted)));
+    if !tempo.spans.is_empty() {
+        controls.spans.push(Span::raw(
+            " ".repeat((width as usize).saturating_sub(controls.width() + tempo.width())),
+        ));
+        controls.spans.extend(tempo.spans);
+    }
+    controls
 }
 
 fn beat_indicator_span(app: &App) -> Span<'static> {
@@ -2705,30 +2487,6 @@ fn beat_indicator_span(app: &App) -> Span<'static> {
         Style::default().fg(theme.muted)
     };
     Span::styled(symbol, style)
-}
-
-fn module_toggle_line(app: &App) -> Line<'static> {
-    let theme = app.theme();
-    Line::from(vec![
-        Span::styled(
-            module_toggle_keys(app),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" {}", app.t("modules")),
-            Style::default().fg(theme.muted),
-        ),
-    ])
-}
-
-fn module_toggle_keys(app: &App) -> String {
-    if app.lang == Lang::En {
-        "s p t m w".to_string()
-    } else {
-        "[s] [p] [t] [m] [w]".to_string()
-    }
 }
 
 fn draw_master_meter(frame: &mut Frame, app: &App, area: Rect) {
@@ -3352,30 +3110,6 @@ fn draw_braille_spectrum(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(lines), area);
-}
-
-fn draw_compact_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let theme = app.theme();
-    let text = Paragraph::new(Line::from(vec![
-        Span::styled(
-            capture_control_label(app),
-            Style::default().fg(theme.accent),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!(
-                "L{:>3} R{:>3}",
-                (app.master_left * 100.0) as u16,
-                (app.master_right * 100.0) as u16
-            ),
-            Style::default().fg(theme.text),
-        ),
-        Span::raw("  "),
-        Span::styled(app.t("compact_hint"), Style::default().fg(theme.muted)),
-    ]))
-    .wrap(Wrap { trim: true });
-    let inner = draw_panel(frame, area, theme, None);
-    frame.render_widget(text, inner);
 }
 
 fn display_bars(source: &[f32], width: usize) -> Vec<f32> {
@@ -4073,7 +3807,7 @@ fn draw_setting_category_bar(
             if selected {
                 Style::default()
                     .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else {
                 Style::default().fg(theme.muted)
             },
@@ -4652,36 +4386,40 @@ fn setting_help_key(key: &'static str) -> &'static str {
 
 fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
-    let chunks = centered_rect(76, 70, area);
-    frame.render_widget(Clear, chunks);
-
-    let text = vec![
-        Line::from(Span::styled(
-            app.t("help_title"),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(app.t("help_1")),
-        Line::from(app.t("help_2")),
-        Line::from(app.t("help_3")),
-        Line::from(app.t("help_4")),
-        Line::from(app.t("help_5")),
-        Line::from(""),
-        Line::from(Span::styled(
-            app.t("permission_note"),
-            Style::default().fg(theme.muted),
-        )),
-    ];
-
-    let inner = draw_panel(
-        frame,
-        chunks,
-        theme,
-        Some(panel_title(app.t("help"), theme)),
+    let width = area.width.min(64);
+    let height = area.height.min(10);
+    let panel = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
     );
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
+    let inner = draw_panel(frame, panel, theme, Some(panel_title(app.t("help"), theme)));
+    let bindings = [
+        ("Space", "help_transport"),
+        ("s", "help_settings"),
+        ("t / m / w", "help_modules"),
+        ("↑↓  j/k", "help_select"),
+        ("←→  h/l", "help_adjust"),
+        ("Tab / ⇧Tab", "help_category"),
+        ("Enter", "help_confirm"),
+        ("Esc / q / ?", "help_return"),
+    ];
+    let mut lines: Vec<Line> = bindings
+        .iter()
+        .map(|(keys, label)| {
+            Line::from(vec![
+                Span::styled(format!("{keys:<12}"), Style::default().fg(theme.accent)),
+                Span::styled(app.t(label), Style::default().fg(theme.text)),
+            ])
+        })
+        .collect();
+    if inner.height > 0 && (inner.height as usize) < lines.len() {
+        let back = lines.pop().unwrap();
+        lines.truncate(inner.height.saturating_sub(1) as usize);
+        lines.push(back);
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 struct Panel {
@@ -4731,7 +4469,7 @@ impl Widget for Panel {
             return;
         }
 
-        let content_style = Style::default().fg(self.theme.text);
+        let content_style = Style::default().fg(self.theme.text).bg(Color::Reset);
         let border_style = border_style(self.theme);
         buf.set_style(area, content_style);
 
@@ -4907,14 +4645,16 @@ fn on_off_label(app: &App, enabled: bool) -> &'static str {
     }
 }
 
-fn capture_control_label(app: &App) -> String {
-    match app.capture_state {
-        CaptureState::Idle => format!("Space {}", app.t("transport_idle")),
-        CaptureState::Starting => format!("Space {}", app.t("transport_starting")),
-        CaptureState::Running => format!("Space {}", app.t("transport_running")),
-        CaptureState::PermissionNeeded => format!("Space {}", app.t("transport_permission")),
-        CaptureState::Failed => format!("Space {}", app.t("transport_failed")),
-    }
+fn capture_action_label(app: &App) -> &'static str {
+    app.t(if app.audio.is_some() {
+        if app.capture_state == CaptureState::Starting {
+            "action_cancel"
+        } else {
+            "action_pause"
+        }
+    } else {
+        "action_start"
+    })
 }
 
 fn renderer_label(app: &App) -> &'static str {
@@ -4934,18 +4674,8 @@ fn bpm_mode_label(app: &App, mode: BpmMode) -> &'static str {
 }
 
 fn bpm_label(app: &App) -> String {
-    if app.config.settings.bpm_mode == BpmMode::Off {
-        return app.t("off").to_string();
-    }
-
     app.bpm_estimate
-        .map(|bpm| {
-            format!(
-                "{:>3} {:.0}%",
-                bpm.round() as u16,
-                (app.bpm_confidence * 100.0).round()
-            )
-        })
+        .map(|bpm| (bpm.round() as u16).to_string())
         .unwrap_or_else(|| "--".to_string())
 }
 
@@ -4963,18 +4693,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
     match (lang, key) {
         (Lang::Zh, "main_menu") => "主菜单",
         (Lang::Zh, "menu_spectrum") => "进入频谱",
-        (Lang::Zh, "menu_toggle") => "捕获开关",
-        (Lang::Zh, "menu_start") => "开始捕获",
-        (Lang::Zh, "menu_stop") => "停止捕获",
         (Lang::Zh, "menu_settings") => "设置",
         (Lang::Zh, "menu_help") => "帮助",
         (Lang::Zh, "menu_quit") => "退出",
-        (Lang::Zh, "subtitle") => "系统音频频谱",
-        (Lang::Zh, "overview") => "概览",
-        (Lang::Zh, "preview") => "预览",
         (Lang::Zh, "spectrum") => "频谱",
-        (Lang::Zh, "status") => "状态",
-        (Lang::Zh, "level") => "电平",
         (Lang::Zh, "config") => "配置",
         (Lang::Zh, "settings") => "设置",
         (Lang::Zh, "settings_general") => "通用",
@@ -5024,40 +4746,22 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "toolbar") => "工具栏",
         (Lang::Zh, "master") => "master",
         (Lang::Zh, "waveform") => "波形",
-        (Lang::Zh, "modules") => "模块",
         (Lang::Zh, "on") => "开",
         (Lang::Zh, "off") => "关",
-        (Lang::Zh, "transport_idle") => "○ 待机",
-        (Lang::Zh, "transport_starting") => "◐ 启动",
-        (Lang::Zh, "transport_running") => "● 运行",
-        (Lang::Zh, "transport_permission") => "! 授权",
-        (Lang::Zh, "transport_failed") => "× 错误",
-        (Lang::Zh, "controls") => "控制",
+        (Lang::Zh, "action_start") => "开始",
+        (Lang::Zh, "action_pause") => "暂停",
+        (Lang::Zh, "action_cancel") => "取消",
         (Lang::Zh, "help") => "帮助",
-        (Lang::Zh, "help_title") => "Terb 终端频谱",
-        (Lang::Zh, "help_1") => "↑/↓ 或 j/k 移动选择。",
-        (Lang::Zh, "help_2") => "Enter 执行；Space 开始或停止捕获。",
-        (Lang::Zh, "help_3") => "频谱页按 s 打开独立设置；t/m/w 切换工具栏、master 和波形。",
-        (Lang::Zh, "help_4") => "设置页用 ↑/↓ 选择，Tab 切分类，←/→ 调整，q/Esc 返回。",
-        (Lang::Zh, "help_5") => "窗口较小时模块会自动隐藏，仍可用快捷键操作；主菜单 q/Esc 退出。",
-        (Lang::Zh, "permission_note") => "首次捕获会触发 macOS 屏幕与系统音频录制授权；Terb 只实时分析，不保存音频。",
-        (Lang::Zh, "menu_hint") => "↑/↓ 选择 · Enter 确认 · Space 捕获 · ? 帮助 · q 退出",
-        (Lang::Zh, "spectrum_hint") => "Space 捕获 · s 设置 · t/m/w 模块 · q 菜单",
-        (Lang::Zh, "sidebar_hint") => "Space 开关捕获\ns 打开设置\nt/m/w 显示模块\nq 返回菜单\n? 帮助",
-        (Lang::Zh, "compact_hint") => "s 设置 · t/m/w 模块 · q 菜单",
-        (Lang::Zh, "ready") => "准备就绪。",
-        (Lang::Zh, "starting") => "正在启动系统音频捕获...",
-        (Lang::Zh, "helper_ready") => "捕获进程已就绪，等待音频。",
-        (Lang::Zh, "running") => "正在分析系统音频。",
-        (Lang::Zh, "waiting_audio") => "捕获已开启，暂未收到音频；请确认系统正在播放声音。",
-        (Lang::Zh, "stopped") => "已停止。",
+        (Lang::Zh, "help_transport") => "开始 / 暂停",
+        (Lang::Zh, "help_settings") => "设置 / 返回",
+        (Lang::Zh, "help_modules") => "工具栏 / 音量 / 波形",
+        (Lang::Zh, "help_select") => "选择",
+        (Lang::Zh, "help_adjust") => "调整设置",
+        (Lang::Zh, "help_category") => "切换分类",
+        (Lang::Zh, "help_confirm") => "确认",
+        (Lang::Zh, "help_return") => "返回；菜单 q 退出",
         (Lang::Zh, "permission_needed") => "需要 macOS 授权。请在系统设置中允许屏幕与系统音频录制。",
         (Lang::Zh, "capture_failed") => "捕获失败。",
-        (Lang::Zh, "state_idle") => "待机",
-        (Lang::Zh, "state_starting") => "启动中",
-        (Lang::Zh, "state_running") => "运行中",
-        (Lang::Zh, "state_permission") => "需授权",
-        (Lang::Zh, "state_failed") => "错误",
         (Lang::Zh, "too_small") => "窗口太小，请放大终端。",
         (Lang::Zh, "theme_spring") => "Spring",
         (Lang::Zh, "theme_vintage") => "vintage",
@@ -5103,18 +4807,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
 
         (Lang::En, "main_menu") => "Main Menu",
         (Lang::En, "menu_spectrum") => "Open Spectrum",
-        (Lang::En, "menu_toggle") => "Toggle Capture",
-        (Lang::En, "menu_start") => "Start Capture",
-        (Lang::En, "menu_stop") => "Stop Capture",
         (Lang::En, "menu_settings") => "Settings",
         (Lang::En, "menu_help") => "Help",
         (Lang::En, "menu_quit") => "Quit",
-        (Lang::En, "subtitle") => "system-audio spectrum",
-        (Lang::En, "overview") => "Overview",
-        (Lang::En, "preview") => "Preview",
         (Lang::En, "spectrum") => "Spectrum",
-        (Lang::En, "status") => "Status",
-        (Lang::En, "level") => "Level",
         (Lang::En, "config") => "Config",
         (Lang::En, "settings") => "Settings",
         (Lang::En, "settings_general") => "general",
@@ -5164,40 +4860,22 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "toolbar") => "Toolbar",
         (Lang::En, "master") => "master",
         (Lang::En, "waveform") => "Waveform",
-        (Lang::En, "modules") => "modules",
         (Lang::En, "on") => "On",
         (Lang::En, "off") => "Off",
-        (Lang::En, "transport_idle") => "○ Idle",
-        (Lang::En, "transport_starting") => "◐ Start",
-        (Lang::En, "transport_running") => "● Run",
-        (Lang::En, "transport_permission") => "! Permission",
-        (Lang::En, "transport_failed") => "× Error",
-        (Lang::En, "controls") => "Controls",
+        (Lang::En, "action_start") => "Start",
+        (Lang::En, "action_pause") => "Pause",
+        (Lang::En, "action_cancel") => "Cancel",
         (Lang::En, "help") => "Help",
-        (Lang::En, "help_title") => "Terb terminal spectrum",
-        (Lang::En, "help_1") => "Use ↑/↓ or j/k to move.",
-        (Lang::En, "help_2") => "Enter activates; Space starts or stops capture.",
-        (Lang::En, "help_3") => "In Spectrum, press s for standalone settings; t/m/w toggle toolbar, master, and waveform.",
-        (Lang::En, "help_4") => "In Settings, use ↑/↓ to select, Tab for groups, ←/→ to adjust, and q/Esc to return.",
-        (Lang::En, "help_5") => "Small terminals hide modules automatically, but shortcuts still work. q/Esc quits from the main menu.",
-        (Lang::En, "permission_note") => "First capture may trigger macOS Screen & System Audio Recording permission. Terb analyzes live audio only and does not save it.",
-        (Lang::En, "menu_hint") => "↑/↓ select · Enter confirm · Space capture · ? help · q quit",
-        (Lang::En, "spectrum_hint") => "Space capture · s settings · t/m/w modules · q menu",
-        (Lang::En, "sidebar_hint") => "Space toggle capture\ns open settings\nt/m/w modules\nq menu\n? help",
-        (Lang::En, "compact_hint") => "s settings · t/m/w modules · q menu",
-        (Lang::En, "ready") => "Ready.",
-        (Lang::En, "starting") => "Starting system-audio capture...",
-        (Lang::En, "helper_ready") => "Capture helper is ready; waiting for audio.",
-        (Lang::En, "running") => "Analyzing system audio.",
-        (Lang::En, "waiting_audio") => "Capture is running, but no audio has arrived yet. Make sure audio is playing.",
-        (Lang::En, "stopped") => "Stopped.",
+        (Lang::En, "help_transport") => "Start / pause",
+        (Lang::En, "help_settings") => "Settings / back",
+        (Lang::En, "help_modules") => "Toolbar / meter / wave",
+        (Lang::En, "help_select") => "Select",
+        (Lang::En, "help_adjust") => "Adjust setting",
+        (Lang::En, "help_category") => "Category",
+        (Lang::En, "help_confirm") => "Confirm",
+        (Lang::En, "help_return") => "Back; menu q: quit",
         (Lang::En, "permission_needed") => "macOS permission is required. Allow Screen & System Audio Recording in System Settings.",
         (Lang::En, "capture_failed") => "Capture failed.",
-        (Lang::En, "state_idle") => "Idle",
-        (Lang::En, "state_starting") => "Starting",
-        (Lang::En, "state_running") => "Running",
-        (Lang::En, "state_permission") => "Permission",
-        (Lang::En, "state_failed") => "Error",
         (Lang::En, "too_small") => "Terminal window is too small.",
         (Lang::En, "theme_spring") => "Spring",
         (Lang::En, "theme_vintage") => "Vintage",
@@ -5243,18 +4921,10 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
 
         (Lang::Ja, "main_menu") => "メインメニュー",
         (Lang::Ja, "menu_spectrum") => "スペクトラムを開く",
-        (Lang::Ja, "menu_toggle") => "キャプチャ切替",
-        (Lang::Ja, "menu_start") => "キャプチャ開始",
-        (Lang::Ja, "menu_stop") => "キャプチャ停止",
         (Lang::Ja, "menu_settings") => "設定",
         (Lang::Ja, "menu_help") => "ヘルプ",
         (Lang::Ja, "menu_quit") => "終了",
-        (Lang::Ja, "subtitle") => "システム音声スペクトラム",
-        (Lang::Ja, "overview") => "概要",
-        (Lang::Ja, "preview") => "プレビュー",
         (Lang::Ja, "spectrum") => "スペクトラム",
-        (Lang::Ja, "status") => "状態",
-        (Lang::Ja, "level") => "レベル",
         (Lang::Ja, "config") => "設定ファイル",
         (Lang::Ja, "settings") => "設定",
         (Lang::Ja, "settings_general") => "一般",
@@ -5304,40 +4974,22 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "toolbar") => "ツールバー",
         (Lang::Ja, "master") => "master",
         (Lang::Ja, "waveform") => "波形",
-        (Lang::Ja, "modules") => "モジュール",
         (Lang::Ja, "on") => "オン",
         (Lang::Ja, "off") => "オフ",
-        (Lang::Ja, "transport_idle") => "○ 待機",
-        (Lang::Ja, "transport_starting") => "◐ 起動",
-        (Lang::Ja, "transport_running") => "● 実行",
-        (Lang::Ja, "transport_permission") => "! 権限",
-        (Lang::Ja, "transport_failed") => "× エラー",
-        (Lang::Ja, "controls") => "操作",
+        (Lang::Ja, "action_start") => "開始",
+        (Lang::Ja, "action_pause") => "一時停止",
+        (Lang::Ja, "action_cancel") => "中止",
         (Lang::Ja, "help") => "ヘルプ",
-        (Lang::Ja, "help_title") => "Terb ターミナルスペクトラム",
-        (Lang::Ja, "help_1") => "↑/↓ または j/k で移動します。",
-        (Lang::Ja, "help_2") => "Enter で実行、Space でキャプチャ開始/停止。",
-        (Lang::Ja, "help_3") => "スペクトラム画面では s で独立設定を開き、t/m/w でツールバー、master、波形を切り替えます。",
-        (Lang::Ja, "help_4") => "設定画面では ↑/↓ で選択、Tab で分類、←/→ で変更、q/Esc で戻ります。",
-        (Lang::Ja, "help_5") => "小さいウィンドウではモジュールを自動で隠しますが、ショートカットは使えます。メインメニューでは q/Esc で終了します。",
-        (Lang::Ja, "permission_note") => "初回キャプチャでは macOS の画面とシステム音声録音権限が必要です。Terb はリアルタイム解析のみ行い、音声を保存しません。",
-        (Lang::Ja, "menu_hint") => "↑/↓ 選択 · Enter 決定 · Space キャプチャ · ? ヘルプ · q 終了",
-        (Lang::Ja, "spectrum_hint") => "Space キャプチャ · s 設定 · t/m/w モジュール · q メニュー",
-        (Lang::Ja, "sidebar_hint") => "Space キャプチャ切替\ns 設定\nt/m/w モジュール\nq メニュー\n? ヘルプ",
-        (Lang::Ja, "compact_hint") => "s 設定 · t/m/w モジュール · q メニュー",
-        (Lang::Ja, "ready") => "準備完了。",
-        (Lang::Ja, "starting") => "システム音声キャプチャを開始しています...",
-        (Lang::Ja, "helper_ready") => "キャプチャヘルパーは準備完了。音声を待っています。",
-        (Lang::Ja, "running") => "システム音声を解析中です。",
-        (Lang::Ja, "waiting_audio") => "キャプチャ中ですが音声が届いていません。音声が再生中か確認してください。",
-        (Lang::Ja, "stopped") => "停止しました。",
+        (Lang::Ja, "help_transport") => "開始 / 一時停止",
+        (Lang::Ja, "help_settings") => "設定 / 戻る",
+        (Lang::Ja, "help_modules") => "バー / 音量 / 波形",
+        (Lang::Ja, "help_select") => "選択",
+        (Lang::Ja, "help_adjust") => "設定を変更",
+        (Lang::Ja, "help_category") => "分類を切替",
+        (Lang::Ja, "help_confirm") => "決定",
+        (Lang::Ja, "help_return") => "戻る / メニュー q 終了",
         (Lang::Ja, "permission_needed") => "macOS の権限が必要です。システム設定で画面とシステム音声録音を許可してください。",
         (Lang::Ja, "capture_failed") => "キャプチャに失敗しました。",
-        (Lang::Ja, "state_idle") => "待機",
-        (Lang::Ja, "state_starting") => "起動中",
-        (Lang::Ja, "state_running") => "実行中",
-        (Lang::Ja, "state_permission") => "権限待ち",
-        (Lang::Ja, "state_failed") => "エラー",
         (Lang::Ja, "too_small") => "ターミナルウィンドウが小さすぎます。",
         (Lang::Ja, "theme_spring") => "Spring",
         (Lang::Ja, "theme_vintage") => "ヴィンテージ",
@@ -5389,6 +5041,233 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    fn offline_app(language: &str) -> App {
+        let mut config = Config::default();
+        config.settings.language = language.to_string();
+        config.settings.bpm_mode = BpmMode::Off;
+        App::new(config)
+    }
+
+    fn visible_text(buffer: &Buffer) -> String {
+        buffer
+            .content
+            .iter()
+            .flat_map(|cell| cell.symbol().chars())
+            .filter(|ch| !ch.is_whitespace() && !('\u{2500}'..='\u{257f}').contains(ch))
+            .collect()
+    }
+
+    #[test]
+    fn settings_and_help_return_to_the_page_that_opened_them() {
+        let mut app = offline_app("zh");
+        let key = |code| KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        for origin in [Screen::Menu, Screen::Spectrum] {
+            app.screen = origin;
+            handle_key(&mut app, key(KeyCode::Char('s')));
+            assert!(app.screen == Screen::Settings);
+            handle_key(&mut app, key(KeyCode::Char('?')));
+            assert!(app.screen == Screen::Help);
+            handle_key(&mut app, key(KeyCode::Esc));
+            assert!(app.screen == Screen::Settings);
+            // Closing Settings must follow navigation history, even with audio stopped.
+            app.stop_capture();
+            assert!(app.screen == Screen::Settings);
+            handle_key(&mut app, key(KeyCode::Char('s')));
+            assert!(app.screen == origin);
+            handle_key(&mut app, key(KeyCode::Char('?')));
+            handle_key(&mut app, key(KeyCode::Char('?')));
+            assert!(app.screen == origin);
+        }
+    }
+
+    #[test]
+    fn compact_toolbar_fits_one_row_and_reclaims_space_when_hidden() {
+        for language in ["zh", "en", "ja"] {
+            let mut app = offline_app(language);
+            app.screen = Screen::Spectrum;
+            app.config.settings.bpm_mode = BpmMode::Traditional;
+            app.bpm_estimate = Some(128.0);
+            app.config.settings.show_master_panel = false;
+            app.config.settings.show_waveform_panel = false;
+            for width in [36, 80, 120] {
+                let area = Rect::new(0, 0, width, 24);
+                app.config.settings.show_toolbar_panel = true;
+                let shown = spectrum_layout(&app, area);
+                assert_eq!(shown.toolbar.height, 1);
+                let line = toolbar_line(&app, width);
+                assert!(line.width() <= width as usize);
+                let text = line_text(&line);
+                assert!(text.contains("Space"));
+                assert!(text.contains("s") && text.contains('?'));
+                assert!(text.contains("BPM 128"));
+                assert!(!text.contains('%') && !text.contains("Hz"));
+
+                app.config.settings.show_toolbar_panel = false;
+                let hidden = spectrum_layout(&app, area);
+                assert_eq!(hidden.toolbar.height, 0);
+                assert_eq!(hidden.spectrum.height, shown.spectrum.height + 1);
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                terminal.draw(|frame| draw(frame, &app)).unwrap();
+                let text = visible_text(terminal.backend().buffer());
+                assert!(!text.contains("Space") && !text.contains("BPM"));
+            }
+            app.config.settings.bpm_mode = BpmMode::Off;
+            assert!(!line_text(&toolbar_line(&app, 80)).contains("BPM"));
+        }
+    }
+
+    #[test]
+    fn capture_errors_stay_visible_when_toolbar_is_hidden() {
+        for language in ["zh", "en", "ja"] {
+            let mut app = offline_app(language);
+            app.config.settings.bpm_mode = BpmMode::Onnx;
+            app.bpm_estimate = Some(128.0);
+            app.bpm_confidence = 0.8;
+            app.capture_state = CaptureState::PermissionNeeded;
+            app.capture_error = app.t("permission_needed").to_string();
+            let error: String = app
+                .capture_error
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect();
+            for (width, height) in [(36, 10), (80, 24), (119, 30), (120, 30), (160, 45)] {
+                for toolbar in [false, true] {
+                    app.config.settings.show_toolbar_panel = toolbar;
+                    app.screen = Screen::Spectrum;
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal.draw(|frame| draw(frame, &app)).unwrap();
+                    let text = visible_text(terminal.backend().buffer());
+                    assert_eq!(
+                        text.contains("BPM128"),
+                        toolbar,
+                        "BPM visibility: {language} {width}x{height}, toolbar={toolbar}"
+                    );
+                    assert!(
+                        text.contains(&error),
+                        "missing error: {language} {width}x{height}, toolbar={toolbar}: {text}"
+                    );
+                }
+                for screen in [Screen::Menu, Screen::Settings, Screen::Help] {
+                    app.screen = screen;
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal.draw(|frame| draw(frame, &app)).unwrap();
+                    assert!(
+                        visible_text(terminal.backend().buffer()).contains(&error),
+                        "capture error: {language} {width}x{height}, screen={}",
+                        screen as u8
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wider_terminal_keeps_spectrum_width_at_old_sidebar_breakpoint() {
+        let mut app = offline_app("zh");
+        app.screen = Screen::Spectrum;
+        for toolbar in [false, true] {
+            app.config.settings.show_toolbar_panel = toolbar;
+            let narrow = spectrum_layout(&app, Rect::new(0, 0, 119, 30));
+            let wide = spectrum_layout(&app, Rect::new(0, 0, 120, 30));
+            assert_eq!(wide.spectrum.width, narrow.spectrum.width + 1);
+            assert_eq!(wide.toolbar.width, 120);
+            assert_eq!(wide.spectrum.x, 0);
+        }
+    }
+
+    #[test]
+    fn all_screens_preserve_terminal_default_background() {
+        let mut app = offline_app("zh");
+        app.config.settings.show_master_panel = true;
+        app.config.settings.show_waveform_panel = true;
+        app.spectrum.fill(0.6);
+        app.master_left = 0.5;
+        app.master_right = 0.8;
+        for theme in THEMES {
+            app.theme_id = *theme;
+            for screen in [
+                Screen::Menu,
+                Screen::Spectrum,
+                Screen::Settings,
+                Screen::Help,
+            ] {
+                app.screen = screen;
+                let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        let area = frame.area();
+                        frame
+                            .buffer_mut()
+                            .set_style(area, Style::default().bg(Color::White));
+                        draw(frame, &app);
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                for y in 0..30 {
+                    for x in 0..120 {
+                        assert_eq!(
+                            buffer[(x, y)].bg,
+                            Color::Reset,
+                            "background at ({x}, {y}), screen={}, theme={theme:?}",
+                            screen as u8
+                        );
+                        assert!(!buffer[(x, y)].modifier.contains(Modifier::REVERSED));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spectrum_processing_is_independent_of_input_block_size() {
+        let settings = Config::default().settings;
+        let pipeline = SpectrumPipeline::from_settings(&settings);
+        let samples: Vec<f32> = (0..8192)
+            .map(|i| (i as f32 * 0.071).sin() * (0.05 + 0.3 * (i as f32 * 0.003).sin().abs()))
+            .collect();
+        for hop in [64, 128, 256, 1024] {
+            let analyze = |chunk_size: usize| {
+                let mut analyzer = SpectrumAnalyzer::new(1024, 48_000.0, 32, hop);
+                for chunk in samples.chunks(chunk_size) {
+                    analyzer.consume(chunk, settings.attack, settings.release, pipeline);
+                }
+                (
+                    analyzer.smoothed,
+                    analyzer.sample_buffer,
+                    analyzer.adaptive_gain,
+                )
+            };
+            let reference = analyze(64);
+            for chunk_size in [128, 512, 2048, 8192] {
+                assert_eq!(
+                    analyze(chunk_size),
+                    reference,
+                    "hop={hop}, chunk={chunk_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stopping_capture_clears_history_before_next_audio_session() {
+        let mut app = offline_app("zh");
+        let pipeline = SpectrumPipeline::from_settings(&app.config.settings);
+        let old: Vec<f32> = (0..1536).map(|i| (i as f32 * 0.2).sin()).collect();
+        app.analyzer.consume(&old, 0.8, 0.5, pipeline);
+        app.bpm_estimate = Some(128.0);
+        app.bpm_confidence = 0.8;
+        app.bpm_pulse = 1.0;
+
+        app.stop_capture();
+
+        assert!(app.bpm_estimate.is_none());
+        assert_eq!(app.bpm_pulse, 0.0);
+        let fresh = vec![0.0; 512];
+        assert!(app.analyzer.consume(&fresh, 0.8, 0.5, pipeline).is_none());
+        let result = app.analyzer.consume(&fresh, 0.8, 0.5, pipeline).unwrap();
+        assert!(result.iter().all(|value| *value == 0.0));
+    }
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans
@@ -5506,7 +5385,9 @@ mod tests {
 
     #[test]
     fn bpm_pulse_lights_when_predicted_beat_arrives() {
-        let mut app = App::new(Config::default());
+        let mut config = Config::default();
+        config.settings.bpm_mode = BpmMode::Traditional;
+        let mut app = App::new(config);
         app.set_bpm_estimate(120.0);
         app.bpm_next_beat_at = Some(Instant::now() - Duration::from_millis(1));
 
@@ -5515,6 +5396,30 @@ mod tests {
         assert_eq!(app.bpm_pulse, 1.0);
         assert!(app.bpm_phase < 0.10);
         assert_eq!(beat_indicator_span(&app).content.as_ref(), "●");
+    }
+
+    #[test]
+    fn neural_beat_estimate_drives_indicator_phase_and_pulse() {
+        let mut app = App::new(Config::default());
+        app.apply_neural_beat_estimate(BeatEstimate {
+            bpm: 128.0,
+            confidence: 0.82,
+            beat_pulse: 0.91,
+            phase: 0.14,
+            downbeat_pulse: Some(0.2),
+        });
+
+        assert_eq!(app.bpm_estimate, Some(128.0));
+        assert_eq!(app.bpm_confidence, 0.82);
+        assert_eq!(app.bpm_pulse, 0.91);
+        assert_eq!(app.bpm_phase, 0.14);
+        assert!(app.bpm_next_beat_at.is_none());
+
+        app.advance_bpm_pulse(Duration::from_millis(20));
+
+        assert!(app.bpm_pulse < 0.91);
+        assert!(app.bpm_phase > 0.14);
+        assert!(app.bpm_next_beat_at.is_none());
     }
 
     #[test]
@@ -5608,7 +5513,7 @@ mod tests {
 
         assert!(!json.contains("show_settings_panel"));
         assert!(!json.contains("show_pipeline_panel"));
-        assert_eq!(left_module_height(&config.settings), 7);
+        assert!(config.settings.show_toolbar_panel);
     }
 
     #[test]
@@ -5858,7 +5763,6 @@ mod tests {
     #[test]
     fn stopping_capture_preserves_last_visual_frame() {
         let mut app = App::new(Config::default());
-        app.level = 0.42;
         app.master_left = 0.72;
         app.master_right = 0.38;
         app.spectrum[0] = 0.64;
@@ -5867,7 +5771,6 @@ mod tests {
 
         app.stop_capture();
 
-        assert!((app.level - 0.42).abs() < f32::EPSILON);
         assert!((app.master_left - 0.72).abs() < f32::EPSILON);
         assert!((app.master_right - 0.38).abs() < f32::EPSILON);
         assert!((app.spectrum[0] - 0.64).abs() < f32::EPSILON);
