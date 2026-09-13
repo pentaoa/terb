@@ -132,6 +132,10 @@ const TITLE_ART: &[&str] = &[
 ];
 
 fn main() -> io::Result<()> {
+    if matches!(env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+        println!("terb {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let config = Config::load();
     let mut app = App::new(config);
     run(&mut app)
@@ -1825,13 +1829,17 @@ impl Drop for AudioProcess {
 }
 
 fn helper_path() -> io::Result<PathBuf> {
+    let adjacent = env::current_exe()?.with_file_name("terb-audio-helper");
+    if adjacent.is_file() {
+        return Ok(adjacent);
+    }
     option_env!("TERB_AUDIO_HELPER")
         .map(PathBuf::from)
         .filter(|path| path.exists())
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "macOS audio helper is unavailable; rebuild with `cargo build` on macOS",
+                "macOS audio helper is unavailable; place terb-audio-helper beside terb or rebuild on macOS",
             )
         })
 }

@@ -33,6 +33,8 @@
 
 ## 快速开始
 
+Apple Silicon 预构建版本可在 [Releases 页面](https://github.com/pentaoa/terb/releases)下载。安装下载包时，请将 `terb` 和 `terb-audio-helper` 放在同一目录。运行 `terb --version` 可查看已安装版本。
+
 **需要：** macOS 14 或更新版本、Rust 稳定版，以及 Xcode 或 Xcode Command Line Tools 提供的 Swift 编译器。
 
 ```bash

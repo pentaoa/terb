@@ -13,9 +13,17 @@ fn main() {
     let helper_path = out_dir.join("terb-audio-helper");
     let source = PathBuf::from("macos/SystemAudioHelper.swift");
     let plist = PathBuf::from("macos/HelperInfo.plist");
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("target architecture");
+    let swift_arch = if target_arch == "aarch64" {
+        "arm64"
+    } else {
+        &target_arch
+    };
 
     let status = Command::new("swiftc")
         .arg(source)
+        .arg("-target")
+        .arg(format!("{swift_arch}-apple-macosx14.0"))
         .arg("-parse-as-library")
         .arg("-O")
         .arg("-framework")

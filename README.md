@@ -33,6 +33,8 @@
 
 ## Quick Start
 
+Prebuilt Apple Silicon binaries are available on the [Releases page](https://github.com/pentaoa/terb/releases). Keep `terb` and `terb-audio-helper` in the same directory when installing a download. Run `terb --version` to check the installed version.
+
 **Requires:** macOS 14+, Rust stable, and the Swift compiler from Xcode or Xcode Command Line Tools.
 
 ```bash
