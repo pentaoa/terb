@@ -6,11 +6,12 @@
 
 <p align="center">
   <strong>System audio, in your terminal.</strong><br>
-  Live spectrum, waveform, and beat tracking for macOS.
+  Live spectrum, waveform, and beat tracking for macOS and Windows.
 </p>
 
 <p align="center">
   <img alt="macOS 14 or newer" src="https://img.shields.io/badge/macOS-14%2B-111111?style=flat-square">
+  <img alt="Windows 10 or newer" src="https://img.shields.io/badge/Windows-10%2B-111111?style=flat-square">
   <img alt="Rust stable" src="https://img.shields.io/badge/Rust-stable-111111?style=flat-square">
   <img alt="Ratatui terminal interface" src="https://img.shields.io/badge/TUI-ratatui-FFA4A4?style=flat-square">
   <img alt="ONNX inference on CPU" src="https://img.shields.io/badge/ONNX-CPU-555555?style=flat-square">
@@ -29,13 +30,16 @@
   <img src="assets/terb-hero.svg" alt="terb ASCII wordmark surrounded by a pastel spectrum illustration" width="100%">
 </p>
 
-`terb` turns the audio already playing on your Mac into a spectrum you can shape. A transparent terminal canvas, three restrained palettes, and a single-row toolbar keep the music in view. Audio is analyzed locally without saving a recording.
+`terb` turns the audio already playing on your computer into a spectrum you can shape. A transparent terminal canvas, three restrained palettes, and a single-row toolbar keep the music in view. Audio is analyzed locally without saving a recording.
 
 ## Quick Start
 
-Prebuilt Apple Silicon binaries are available on the [Releases page](https://github.com/pentaoa/terb/releases). Keep `terb` and `terb-audio-helper` in the same directory when installing a download. Run `terb --version` to check the installed version.
+Prebuilt binaries are available on the [Releases page](https://github.com/pentaoa/terb/releases). Keep `terb` and `terb-audio-helper` in the same directory when installing a macOS download. The Windows package is a single `terb.exe`; place it on your PATH. Run `terb --version` to check the installed version.
 
-**Requires:** macOS 14+, Rust stable, and the Swift compiler from Xcode or Xcode Command Line Tools.
+**Requires:** Rust stable, plus:
+
+- **macOS 14+** with the Swift compiler from Xcode or Xcode Command Line Tools
+- **Windows 10+** with [Windows Terminal](https://aka.ms/terminal) or another Unicode-capable terminal
 
 ```bash
 git clone https://github.com/pentaoa/terb.git
@@ -43,10 +47,12 @@ cd terb
 cargo run --release --locked
 ```
 
-Play some audio, then press **Space** to start. The Swift capture helper is compiled automatically during the build. Use the release build for normal listening.
+Play some audio, then press **Space** to start. Use the release build for normal listening. On macOS, the Swift capture helper is compiled automatically during the build.
 
 > [!NOTE]
 > On first capture, macOS may request **Screen & System Audio Recording** permission. If capture is denied, allow your terminal or the Terb helper in System Settings, then press Space to try again.
+>
+> Windows captures the default playback device through WASAPI loopback. No extra permission prompt is shown. Exclusive-mode or protected audio may be missing from the mix.
 
 Transparency follows your terminal profile. Terb leaves the background at its terminal default; set opacity in your terminal app.
 
@@ -84,7 +90,7 @@ Audio analysis continues while Settings or help is open. Pausing capture holds t
 
 ## Configuration
 
-Open **Settings** with <kbd>s</kbd>. Changes save immediately to `~/.config/terb/config.json`. The interface supports **中文 · English · 日本語**.
+Open **Settings** with <kbd>s</kbd>. Changes save immediately to `~/.config/terb/config.json` (or `%USERPROFILE%\.config\terb\config.json` on Windows). The interface supports **中文 · English · 日本語**.
 
 ### Analysis presets
 
@@ -128,16 +134,19 @@ The default view uses **Spring**, **Blocks**, and **72 base frequency bands**, w
 
 ## How It Works
 
-A small Swift helper captures system audio through **ScreenCaptureKit** and streams stereo `f32` PCM to Rust. Spectrum analysis processes every complete FFT window at the selected hop; the terminal draws the latest result at its own refresh rate.
+On macOS, a small Swift helper captures system audio through **ScreenCaptureKit**. On Windows, WASAPI loopback records the default playback mix. Both stream stereo PCM into Rust; spectrum analysis processes every complete FFT window at the selected hop, and the terminal draws the latest result at its own refresh rate.
 
 ```mermaid
 flowchart LR
-    A[macOS system audio] --> B[ScreenCaptureKit]
-    B --> C[Stereo PCM]
-    C --> D[FFT + spectrum processing]
-    C --> E[BPM analysis]
-    D --> F[Ratatui display]
-    E --> F
+    A[System audio] --> B{Platform}
+    B -->|macOS| C[ScreenCaptureKit]
+    B -->|Windows| D[WASAPI loopback]
+    C --> E[Stereo PCM]
+    D --> E
+    E --> F[FFT + spectrum processing]
+    E --> G[BPM analysis]
+    F --> H[Ratatui display]
+    G --> H
 ```
 
 The default BPM mode runs an embedded ONNX model on a bounded CPU worker using **RTen**. Inference stays off the audio/UI thread. Traditional mode uses spectral flux and rolling autocorrelation; Off skips tempo analysis. A new capture resets analysis history, and dropped BPM blocks invalidate stale history.
@@ -150,6 +159,7 @@ Adaptive sensitivity lifts quiet input gradually and reduces gain when peaks app
 ```text
 assets/beat_tracker.onnx        Embedded beat model
 macos/SystemAudioHelper.swift  ScreenCaptureKit capture helper
+src/capture.rs                 macOS helper and Windows WASAPI capture
 src/main.rs                    Terminal views, controls, spectrum processing
 src/analysis.rs                Spectrum sampling utilities
 src/beat.rs                    ONNX worker and beat decoder

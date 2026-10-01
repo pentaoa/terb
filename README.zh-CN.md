@@ -6,11 +6,12 @@
 
 <p align="center">
   <strong>在终端里，看见正在播放的声音。</strong><br>
-  面向 macOS 系统音频的实时频谱、波形与节拍显示。
+  面向 macOS 与 Windows 系统音频的实时频谱、波形与节拍显示。
 </p>
 
 <p align="center">
   <img alt="macOS 14 或更新版本" src="https://img.shields.io/badge/macOS-14%2B-111111?style=flat-square">
+  <img alt="Windows 10 或更新版本" src="https://img.shields.io/badge/Windows-10%2B-111111?style=flat-square">
   <img alt="Rust 稳定版" src="https://img.shields.io/badge/Rust-stable-111111?style=flat-square">
   <img alt="Ratatui 终端界面" src="https://img.shields.io/badge/TUI-ratatui-FFA4A4?style=flat-square">
   <img alt="CPU 上的 ONNX 推理" src="https://img.shields.io/badge/ONNX-CPU-555555?style=flat-square">
@@ -29,13 +30,16 @@
   <img src="assets/terb-hero.svg" alt="terb ASCII 字标与柔和配色的频谱插画" width="100%">
 </p>
 
-`terb` 把 Mac 正在播放的声音变成可调节的频谱。透明背景、三套克制的配色和单行工具栏，让画面留给音乐。音频在本机分析，不保存录音。
+`terb` 把电脑正在播放的声音变成可调节的频谱。透明背景、三套克制的配色和单行工具栏，让画面留给音乐。音频在本机分析，不保存录音。
 
 ## 快速开始
 
-Apple Silicon 预构建版本可在 [Releases 页面](https://github.com/pentaoa/terb/releases)下载。安装下载包时，请将 `terb` 和 `terb-audio-helper` 放在同一目录。运行 `terb --version` 可查看已安装版本。
+预构建版本可在 [Releases 页面](https://github.com/pentaoa/terb/releases)下载。安装 macOS 下载包时，请将 `terb` 和 `terb-audio-helper` 放在同一目录。Windows 安装包只有一个 `terb.exe`，放到 PATH 中即可。运行 `terb --version` 可查看已安装版本。
 
-**需要：** macOS 14 或更新版本、Rust 稳定版，以及 Xcode 或 Xcode Command Line Tools 提供的 Swift 编译器。
+**需要：** Rust 稳定版，以及：
+
+- **macOS 14 或更新版本**，并安装 Xcode 或 Xcode Command Line Tools 提供的 Swift 编译器
+- **Windows 10 或更新版本**，建议使用 [Windows Terminal](https://aka.ms/terminal) 或其他支持 Unicode 的终端
 
 ```bash
 git clone https://github.com/pentaoa/terb.git
@@ -43,10 +47,12 @@ cd terb
 cargo run --release --locked
 ```
 
-播放一段音频，按 **空格** 开始。构建时会自动编译 Swift 采集助手。日常使用建议运行 release 版本。
+播放一段音频，按 **空格** 开始。日常使用建议运行 release 版本。在 macOS 上，构建时会自动编译 Swift 采集助手。
 
 > [!NOTE]
 > 首次采集时，macOS 可能请求**屏幕与系统音频录制**权限。如果采集被拒绝，请在系统设置中允许终端或 Terb 助手，再按空格重试。
+>
+> Windows 通过 WASAPI 环回捕获默认播放设备，通常不会弹出额外权限请求。以独占模式运行的应用，或受保护的音频，可能不会出现在混音里。
 
 透明度沿用终端配置。Terb 使用终端默认背景；背景透明度在终端应用中设置。
 
@@ -84,7 +90,7 @@ cargo run --release --locked
 
 ## 配置
 
-按 <kbd>s</kbd> 打开**设置**。修改即时保存到 `~/.config/terb/config.json`。界面支持 **中文 · English · 日本語**。
+按 <kbd>s</kbd> 打开**设置**。修改即时保存到 `~/.config/terb/config.json`（Windows 上为 `%USERPROFILE%\.config\terb\config.json`）。界面支持 **中文 · English · 日本語**。
 
 ### 分析预设
 
@@ -128,16 +134,19 @@ cargo run --release --locked
 
 ## 工作原理
 
-Swift 助手通过 **ScreenCaptureKit** 采集系统音频，把双声道 `f32` PCM 传给 Rust。频谱分析按设定步长处理每个完整 FFT 窗口，终端以独立刷新率绘制最新结果。
+macOS 上，Swift 助手通过 **ScreenCaptureKit** 采集系统音频。Windows 上，WASAPI 环回捕获默认播放混音。两者都把立体声 PCM 交给 Rust；频谱分析按设定步长处理每个完整 FFT 窗口，终端以独立刷新率绘制最新结果。
 
 ```mermaid
 flowchart LR
-    A[macOS 系统音频] --> B[ScreenCaptureKit]
-    B --> C[双声道 PCM]
-    C --> D[FFT 与频谱处理]
-    C --> E[BPM 分析]
-    D --> F[Ratatui 界面]
-    E --> F
+    A[系统音频] --> B{平台}
+    B -->|macOS| C[ScreenCaptureKit]
+    B -->|Windows| D[WASAPI 环回]
+    C --> E[双声道 PCM]
+    D --> E
+    E --> F[FFT 与频谱处理]
+    E --> G[BPM 分析]
+    F --> H[Ratatui 界面]
+    G --> H
 ```
 
 默认节拍模式使用 **RTen** 在有界 CPU 工作队列中运行内嵌 ONNX 模型，推理不占用音频/UI 线程。传统模式使用频谱通量与滚动自相关；关闭模式跳过节拍分析。开始新一轮采集会重置分析历史，BPM 音频块丢失时也会作废旧历史。
@@ -150,6 +159,7 @@ flowchart LR
 ```text
 assets/beat_tracker.onnx        内嵌节拍模型
 macos/SystemAudioHelper.swift  ScreenCaptureKit 采集助手
+src/capture.rs                 macOS 助手与 Windows WASAPI 采集
 src/main.rs                    终端界面、操作与频谱处理
 src/analysis.rs                频谱采样工具
 src/beat.rs                    ONNX 工作队列与节拍解码

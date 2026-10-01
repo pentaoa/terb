@@ -1,20 +1,18 @@
 use std::{
     env, fs, io,
-    io::{BufRead, BufReader, Read},
     path::PathBuf,
-    process::{Child, Command, Stdio},
     sync::{
         mpsc::{self, Receiver, Sender},
         Arc,
     },
-    thread,
     time::{Duration, Instant},
 };
 
 pub(crate) mod analysis;
+mod capture;
 
 use crossterm::{
-    event::{self, Event as CEvent, KeyCode, KeyEvent},
+    event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind},
     execute,
     terminal::{
         disable_raw_mode, enable_raw_mode, size as terminal_size, BeginSynchronizedUpdate,
@@ -36,6 +34,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use analysis::sample_frequency_band;
 #[cfg(test)]
 use analysis::sample_magnitude;
+use capture::{AudioEvent, AudioProcess, AudioSamples};
 use terb::beat::{AsyncBeatTracker, BeatEstimate};
 use terb::bpm::{BpmAnalyzer, BPM_MAX, BPM_MIN, BPM_PULSE_DECAY_SECONDS};
 
@@ -192,6 +191,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> bool {
+    if key.kind != KeyEventKind::Press {
+        return false;
+    }
     match app.screen {
         Screen::Menu => handle_menu_key(app, key),
         Screen::Spectrum => handle_spectrum_key(app, key),
@@ -735,7 +737,11 @@ fn nearest_refresh_rate(value: u16) -> u16 {
 }
 
 fn config_path() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let home = env::var("HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| env::var("USERPROFILE").ok().filter(|value| !value.is_empty()))
+        .unwrap_or_else(|| ".".to_string());
     PathBuf::from(home).join(".config/terb/config.json")
 }
 
@@ -1772,131 +1778,6 @@ impl App {
     }
 }
 
-enum AudioEvent {
-    Samples(u64, AudioSamples),
-    Status(u64, String),
-    Exit(u64, Option<i32>),
-    Error(u64, String),
-}
-
-struct AudioSamples {
-    mono: Vec<f32>,
-    left_level: f32,
-    right_level: f32,
-}
-
-struct AudioProcess {
-    child: Child,
-}
-
-impl AudioProcess {
-    fn spawn(tx: Sender<AudioEvent>, capture_id: u64) -> io::Result<Self> {
-        let helper = helper_path()?;
-        let mut child = Command::new(helper)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("missing helper stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| io::Error::other("missing helper stderr"))?;
-
-        let stdout_tx = tx.clone();
-        thread::spawn(move || read_audio_stdout(stdout, stdout_tx, capture_id));
-
-        let stderr_tx = tx.clone();
-        thread::spawn(move || read_helper_stderr(stderr, stderr_tx, capture_id));
-
-        Ok(Self { child })
-    }
-
-    fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for AudioProcess {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-fn helper_path() -> io::Result<PathBuf> {
-    let adjacent = env::current_exe()?.with_file_name("terb-audio-helper");
-    if adjacent.is_file() {
-        return Ok(adjacent);
-    }
-    option_env!("TERB_AUDIO_HELPER")
-        .map(PathBuf::from)
-        .filter(|path| path.exists())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "macOS audio helper is unavailable; place terb-audio-helper beside terb or rebuild on macOS",
-            )
-        })
-}
-
-fn read_audio_stdout(mut stdout: impl Read, tx: Sender<AudioEvent>, capture_id: u64) {
-    let mut buffer = vec![0_u8; AUDIO_READ_FRAMES * 8];
-    let mut pending = Vec::new();
-    loop {
-        match stdout.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(size) => {
-                pending.extend_from_slice(&buffer[..size]);
-                let frame_count = pending.len() / 8;
-                if frame_count == 0 {
-                    continue;
-                }
-
-                let bytes_to_read = frame_count * 8;
-                let mut mono = Vec::with_capacity(frame_count);
-                let mut left_square_sum = 0.0_f32;
-                let mut right_square_sum = 0.0_f32;
-
-                for chunk in pending[..bytes_to_read].chunks_exact(8) {
-                    let left_sample = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    let right_sample = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-                    left_square_sum += left_sample * left_sample;
-                    right_square_sum += right_sample * right_sample;
-                    mono.push((left_sample + right_sample) * 0.5);
-                }
-
-                pending.drain(0..bytes_to_read);
-                let samples = AudioSamples {
-                    left_level: audio_level_from_square_sum(left_square_sum, frame_count),
-                    right_level: audio_level_from_square_sum(right_square_sum, frame_count),
-                    mono,
-                };
-
-                if tx.send(AudioEvent::Samples(capture_id, samples)).is_err() {
-                    break;
-                }
-            }
-            Err(error) => {
-                let _ = tx.send(AudioEvent::Error(capture_id, error.to_string()));
-                break;
-            }
-        }
-    }
-    let _ = tx.send(AudioEvent::Exit(capture_id, None));
-}
-
-fn read_helper_stderr(stderr: impl Read, tx: Sender<AudioEvent>, capture_id: u64) {
-    let reader = BufReader::new(stderr);
-    for line in reader.lines().map_while(Result::ok) {
-        let _ = tx.send(AudioEvent::Status(capture_id, line));
-    }
-}
-
 struct SpectrumAnalyzer {
     fft_size: usize,
     hop_size: usize,
@@ -2160,15 +2041,6 @@ impl SpectrumAnalyzer {
             *value = (*value * self.adaptive_gain).clamp(0.0, pipeline.ceiling);
         }
     }
-}
-
-fn audio_level_from_square_sum(square_sum: f32, count: usize) -> f32 {
-    if count == 0 {
-        return 0.0;
-    }
-    let rms = (square_sum / count as f32).sqrt();
-    let db = 20.0 * rms.max(0.000_001).log10();
-    ((db + 60.0) / 54.0).clamp(0.0, 1.0).powf(0.85)
 }
 
 #[derive(Clone, Copy)]
@@ -4697,6 +4569,53 @@ fn bar_count_label(app: &App) -> String {
     }
 }
 
+fn permission_needed_text(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Zh => {
+            #[cfg(target_os = "macos")]
+            {
+                "需要 macOS 授权。请在系统设置中允许屏幕与系统音频录制。"
+            }
+            #[cfg(target_os = "windows")]
+            {
+                "无法捕获系统音频。请确认默认播放设备可用，且没有应用独占该设备。"
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                "当前系统不支持系统音频捕获。"
+            }
+        }
+        Lang::En => {
+            #[cfg(target_os = "macos")]
+            {
+                "macOS permission is required. Allow Screen & System Audio Recording in System Settings."
+            }
+            #[cfg(target_os = "windows")]
+            {
+                "System audio capture failed. Check the default playback device, and that no app has exclusive access."
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                "System audio capture is not supported on this platform."
+            }
+        }
+        Lang::Ja => {
+            #[cfg(target_os = "macos")]
+            {
+                "macOS の権限が必要です。システム設定で画面とシステム音声録音を許可してください。"
+            }
+            #[cfg(target_os = "windows")]
+            {
+                "システム音声をキャプチャできません。既定の再生デバイスを確認し、アプリが排他モードでないことを確認してください。"
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                "この環境ではシステム音声キャプチャに対応していません。"
+            }
+        }
+    }
+}
+
 fn tr(lang: Lang, key: &'static str) -> &'static str {
     match (lang, key) {
         (Lang::Zh, "main_menu") => "主菜单",
@@ -4768,7 +4687,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "help_category") => "切换分类",
         (Lang::Zh, "help_confirm") => "确认",
         (Lang::Zh, "help_return") => "返回；菜单 q 退出",
-        (Lang::Zh, "permission_needed") => "需要 macOS 授权。请在系统设置中允许屏幕与系统音频录制。",
+        (Lang::Zh, "permission_needed") => permission_needed_text(Lang::Zh),
         (Lang::Zh, "capture_failed") => "捕获失败。",
         (Lang::Zh, "too_small") => "窗口太小，请放大终端。",
         (Lang::Zh, "theme_spring") => "Spring",
@@ -4882,7 +4801,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "help_category") => "Category",
         (Lang::En, "help_confirm") => "Confirm",
         (Lang::En, "help_return") => "Back; menu q: quit",
-        (Lang::En, "permission_needed") => "macOS permission is required. Allow Screen & System Audio Recording in System Settings.",
+        (Lang::En, "permission_needed") => permission_needed_text(Lang::En),
         (Lang::En, "capture_failed") => "Capture failed.",
         (Lang::En, "too_small") => "Terminal window is too small.",
         (Lang::En, "theme_spring") => "Spring",
@@ -4996,7 +4915,7 @@ fn tr(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Ja, "help_category") => "分類を切替",
         (Lang::Ja, "help_confirm") => "決定",
         (Lang::Ja, "help_return") => "戻る / メニュー q 終了",
-        (Lang::Ja, "permission_needed") => "macOS の権限が必要です。システム設定で画面とシステム音声録音を許可してください。",
+        (Lang::Ja, "permission_needed") => permission_needed_text(Lang::Ja),
         (Lang::Ja, "capture_failed") => "キャプチャに失敗しました。",
         (Lang::Ja, "too_small") => "ターミナルウィンドウが小さすぎます。",
         (Lang::Ja, "theme_spring") => "Spring",
@@ -5087,6 +5006,26 @@ mod tests {
             handle_key(&mut app, key(KeyCode::Char('?')));
             assert!(app.screen == origin);
         }
+    }
+
+    #[test]
+    fn key_release_and_repeat_do_not_toggle_capture() {
+        let mut app = offline_app("en");
+        let event = |kind| {
+            let mut key = KeyEvent::new(KeyCode::Char(' '), crossterm::event::KeyModifiers::NONE);
+            key.kind = kind;
+            key
+        };
+
+        assert!(!handle_key(&mut app, event(KeyEventKind::Release)));
+        assert!(app.audio.is_none());
+        assert!(app.screen == Screen::Menu);
+        assert!(app.capture_state == CaptureState::Idle);
+
+        assert!(!handle_key(&mut app, event(KeyEventKind::Repeat)));
+        assert!(app.audio.is_none());
+        assert!(app.screen == Screen::Menu);
+        assert!(app.capture_state == CaptureState::Idle);
     }
 
     #[test]
